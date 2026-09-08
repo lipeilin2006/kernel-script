@@ -6,65 +6,64 @@ A modular kernel-based scripting framework for Windows, featuring a three-tier a
 
 ```
 ┌───────────────────────────────┐
-│       ks-gui (用户界面)        │  <-- 运行在普通用户权限 (User Session)
-└───────────────┬───────────────┘      egui 渲染 + Lua 脚本管理
-                │  进程间通信 (Named Pipe)
+│         ks-gui (GUI)          │  <-- Runs in User Session
+└───────────────┬───────────────┘      egui rendering + Lua scripting
+                │  IPC (Named Pipe)
 ┌───────────────▼───────────────┐
-│     ks-service (系统服务)     │  <-- 运行在 NT AUTHORITY\SYSTEM 权限
-└───────────────┬───────────────┘      Lua 引擎 + 通信桥梁
-                │  内核通信 (IOCTL)
+│     ks-service (SYSTEM)       │  <-- Runs as NT AUTHORITY\SYSTEM
+└───────────────┬───────────────┘      Service bridge + driver dispatch
+                │  IOCTL
 ┌───────────────▼───────────────┐
-│      ks-driver (内核驱动)      │  <-- Ring 0 最高权限
-└───────────────────────────────┘      内存读写 + 进程管理
+│      ks-driver (Kernel)       │  <-- Ring 0
+└───────────────────────────────┘      Memory read/write + MDL remap
 ```
 
 ## Project Structure
 
 ```
 kernel-script/
-├── Cargo.toml                    # Workspace 配置文件
-├── README.md
+├── Cargo.toml                    # Workspace root
+├── README.md / README_CN.md
+├── document.md / document_CN.md  # Lua API reference
 │
-├── ks-core/                      # [R0/R3 通用] 共享数据结构与通信协议
-│   ├── Cargo.toml
+├── ks-core/                      # [R0/R3] Shared protocol & ABI
 │   └── src/
-│       ├── lib.rs                # 保证 no_std 兼容
-│       ├── protocol.rs           # R3 与 R0 通信的指令结构体
-│       └── memory.rs             # 基础内存操作封装定义
+│       ├── lib.rs                # no_std compatible
+│       ├── protocol.rs           # IOCTL constants, wire messages
+│       └── memory.rs             # Memory operation definitions
 │
-├── ks-driver/                    # [Ring 0] Windows 内核驱动 (no_std)
-│   ├── Cargo.toml
+├── ks-driver/                    # [Ring 0] WDM kernel driver
+│   ├── build.rs                  # WDK link flags
+│   ├── seh_shim.c                # SEH boundary for MmProbeAndLockPages
 │   └── src/
-│       ├── lib.rs
-│       ├── dispatch.rs           # I/O 控制派遣函数
-│       ├── memory/               # 内核内存读写实现
-│       └── utils.rs
+│       ├── dispatch.rs           # IOCTL dispatch
+│       ├── memory/               # Normal + MDL read/write
+│       └── wdm.rs                # FFI declarations
 │
-├── ks-service/                   # [Ring 3 - SYSTEM] 系统服务 + IPC 桥梁
-│   ├── Cargo.toml
+├── ks-service/                   # [Ring 3 - SYSTEM] Service + IPC
 │   └── src/
-│       ├── main.rs               # 服务入口
-│       ├── driver_comm.rs        # 与驱动通信
-│       ├── ipc.rs                # 与 GUI 的 IPC 通信
-│       └── process.rs             # Toolhelp 进程枚举
+│       ├── main.rs               # Service entry / console mode
+│       ├── driver_comm.rs        # DeviceIoControl calls
+│       ├── ipc.rs                # Named Pipe server
+│       └── process.rs            # Toolhelp process enumeration
 │
-├── ks-gui/                       # [Ring 3 - User] egui 用户界面 + Lua runtime
-│   ├── Cargo.toml
+├── ks-gui/                       # [Ring 3 - User] egui + Lua runtime
 │   └── src/
-│       ├── main.rs               # GUI 入口
-│       ├── app.rs                # 主应用逻辑
-│       ├── ipc_client.rs         # 与服务的 IPC 通信
-│       └── views/                # ImGui 面板
-│           ├── console.rs        # Lua 交互式控制台
-│           ├── mem_viewer.rs     # 内存查看器
-│           └── script_mgr.rs     # 脚本管理器
+│       ├── main.rs               # GUI entry
+│       ├── app.rs                # Frame lifecycle
+│       ├── ipc_client.rs         # Named Pipe client
+│       ├── lua_runtime.rs        # Lua VM, scheduler, API bindings
+│       └── views/                # UI panels
 │
-├── scripts/                      # Lua 功能脚本
-│   ├── main.lua                  # 默认初始化脚本
-│   ├── aob_scan.lua              # 特征码扫描示例
-│   └── struct_parser.lua         # 结构体解析示例
+├── ks-installer/                 # Elevated GUI installer (sc.exe only)
+│   └── src/main.rs
 │
-└── build/                        # 编译产物输出
+└── driver-package/               # Deployment (flat layout)
+    ├── ks-driver.sys + .pdb
+    ├── ks-service.exe + .pdb
+    ├── ks-gui.exe + .pdb
+    ├── ks-installer.exe + .pdb
+    └── scripts/
 ```
 
 ## Building
@@ -72,138 +71,96 @@ kernel-script/
 ### Prerequisites
 
 - Rust 1.75+
-- Windows SDK
-- WDK (Windows Driver Kit) for ks-driver
+- Visual Studio 2022+ with C++ workload
+- WDK 10.0.26100.0
 
-### Build Commands
+### Workspace Check
 
-```bash
-# Build all crates
-cargo build
-
-# Build in release mode
-cargo build --release
-
-# Build individual crates
-cargo build -p ks-core
-cargo build -p ks-driver
-cargo build -p ks-service
-cargo build -p ks-gui
-cargo build -p ks-installer
+```powershell
+cargo fmt --all
+cargo test --workspace
+cargo check --workspace
 ```
 
-### Installer
+### WDK Driver Build
 
-Run `ks-installer` from an elevated terminal. By default it uses the directory
-containing the installer executable as the package directory:
+Requires a Visual Studio Developer Command Prompt with WDK environment variables:
 
-```cmd
-ks-installer.exe install
-ks-installer.exe status
-ks-installer.exe uninstall
+```powershell
+$env:KS_DRIVER_WDK = '1'
+$env:WDK_ROOT = 'C:\Program Files (x86)\Windows Kits\10'
+$env:WDK_LIB = 'C:\Program Files (x86)\Windows Kits\10\Lib\10.0.26100.0\km\x64'
+$env:WDK_VERSION = '10.0.26100.0'
+
+$vs = 'C:\Program Files\Microsoft Visual Studio\18\Community\Common7\Tools\VsDevCmd.bat'
+cmd.exe /d /c "call `"$vs`" -arch=x64 -host_arch=x64 >nul && cargo build -p ks-driver --bin ks-driver --features wdk"
 ```
 
-The installer copies itself and the GUI/service binaries to
-`C:\Program Files\KernelScript`, copies the driver through SetupAPI, installs
-both services as `LocalSystem`, enables the `KsService` Service SID, and starts
-the driver before the service. During uninstall, it schedules removal of its
-own installation directory after the installer process exits. It never expects
-or copies a signing private key.
+### Release Build
+
+```powershell
+cargo build --release --workspace
+cargo build --profile gui-release -p ks-gui    # with unwind for catch_unwind
+```
+
+### Deploy to Package Directory
+
+```powershell
+$pkg = 'D:\kernel-script\driver-package'
+Copy-Item D:\kernel-script\ks-driver.sys "$pkg\ks-driver.sys" -Force
+Copy-Item D:\kernel-script\ks-driver.pdb "$pkg\ks-driver.pdb" -Force
+Copy-Item D:\kernel-script\target\release\ks-service.exe "$pkg\ks-service.exe" -Force
+Copy-Item D:\kernel-script\target\release\ks_service.pdb "$pkg\ks-service.pdb" -Force
+Copy-Item D:\kernel-script\target\release\ks-gui.exe "$pkg\ks-gui.exe" -Force
+Copy-Item D:\kernel-script\target\release\ks_gui.pdb "$pkg\ks_gui.pdb" -Force
+Copy-Item D:\kernel-script\target\release\ks-installer.exe "$pkg\ks-installer.exe" -Force
+Copy-Item D:\kernel-script\target\release\ks_installer.pdb "$pkg\ks_installer.pdb" -Force
+```
 
 ## Usage
 
-### 1. Install and Start Service
+### 1. Install Driver and Service
 
-```bash
-# Install the service (requires Administrator)
-ks-service --install
+Run `ks-installer.exe` as Administrator, or manually:
 
-# Start the service
-net start KsService
-
-# Or run in console mode for debugging
-ks-service --console
+```cmd
+sc.exe create ks-driver type= kernel start= demand binPath= C:\path\to\ks-driver.sys
+sc.exe start ks-driver
+ks-service.exe --console
 ```
 
 ### 2. Run GUI
 
-```bash
-ks-gui
+```cmd
+ks-gui.exe
 ```
 
 ### 3. Write Lua Scripts
 
-Create `.lua` files in the `scripts/` directory. `main.lua` is the process
-manager and `memory.lua` is the memory reader/writer.
+Place `.lua` files in `scripts/`. Each script runs in its own Lua VM; all scripts share scalar values through `shared.set/get`.
 
 ```lua
--- Example: Read game memory
-local pid = await_async(memory.async_get_pid("game.exe"))
-local hp = await_async(memory.async_read_i32(pid, 0x1407FFF0))
-print("Current HP: " .. hp)
-
-local image_base = await_async(memory.async_get_process_base(pid))
-print(string.format("Image base: 0x%X", image_base))
-
-local bytes = await_async(memory.async_read_rva(pid, 0x1234, 4))
-await_async(memory.async_write_rva(pid, 0x1234, { 0x15, 0xCD, 0x5B, 0x07 }))
-
--- Process names are matched case-insensitively by the driver.
--- The Windows image-name field is limited to 15 bytes.
-local pid = await_async(memory.async_get_pid("notepad.exe"))
-
--- List all processes. Each item contains `name` and `pid`.
-for _, process in ipairs(await_async(memory.async_list_processes())) do
-    print(process.pid .. " " .. process.name)
-end
-
--- Recommended for memory/process operations from the GUI frame callbacks:
--- the request is sent by a background IPC worker and await_async yields the
--- Lua coroutine without blocking OnUpdate or OnRender.
 start_async(function()
-    local processes = await_async(memory.async_list_processes())
-    for _, process in ipairs(processes) do
-        print(process.pid .. " " .. process.name)
+    local pid = await_async(memory.async_get_pid("notepad.exe"))
+    local hp = await_async(memory.async_read_i32(pid, 0x1407FFF0))
+    print("HP: " .. hp)
+
+    -- MDL write bypasses read-only page protection
+    await_async(memory.async_write_mdl(pid, 0x1407FFF0, { 0xFF, 0x00, 0x00, 0x00 }))
+
+    -- List all processes
+    for _, p in ipairs(await_async(memory.async_list_processes())) do
+        print(p.pid, p.name)
     end
 end)
-
--- await_async yields only the Lua coroutine. It never blocks the ImGui
--- rendering thread. OnRender should only draw cached values.
-
-start_async(function()
-    local value = await_async(memory.async_read_i32(pid, "0x1407FFF0"))
-    print("Current HP: " .. value)
-end)
-
--- Example: Write memory
-await_async(memory.async_write_i32(pid, 0x1407FFF0, 9999))
 ```
 
-## Security Features
+## Security
 
-- **Process Isolation**: GUI runs in user mode, service runs as SYSTEM
-- **Handle Protection**: Driver handle is held by service, not GUI
-- **Code Separation**: Sensitive logic is isolated in service layer
-- **Crash Isolation**: GUI crashes don't affect driver stability
-
-## Development Roadmap
-
-### Phase 1: Basic Communication
-- [x] ks-core protocol definitions
-- [ ] Basic ks-driver with simple read/write
-- [ ] ks-service driver communication
-- [ ] GUI connection to service
-
-### Phase 2: UI Integration
-- [ ] ImGui overlay rendering
-- [ ] Lua engine integration
-- [ ] Console and memory viewer
-
-### Phase 3: Advanced Features
-- [ ] CR3 page table walking
-- [ ] Process hiding/anti-detection
-- [ ] Hot-reload script support
-- [ ] Multi-client support
+- **Process Isolation**: GUI in user mode, service as SYSTEM, driver in Ring 0
+- **Handle Protection**: Driver device handle held only by the service
+- **DACL**: Device object uses `D:P(A;;GA;;;SY)` — SYSTEM-only access
+- **Crash Isolation**: GUI crashes do not affect driver or service stability
 
 ## License
 

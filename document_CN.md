@@ -1,13 +1,12 @@
 # Kernel Script Lua API
 
-This document describes the Lua APIs registered by `ks-gui`. Each `scripts/*.lua`
-script runs in its own Lua VM. All scripts share scalar values through
-`shared.set/get/delete` but do not share Lua tables, functions, threads, or
-userdata.
+本文档描述 `ks-gui` 当前实际注册到 Lua VM 的 API。每个 `scripts/*.lua`
+脚本在独立 Lua VM 中运行；所有脚本共享 `shared` 标量存储，但不共享 Lua
+table、function、thread 或 userdata。
 
 ## Lifecycle
 
-Optional lifecycle functions called by the GUI per frame:
+可选的生命周期函数由 GUI 按帧调用：
 
 ```lua
 function OnStart()
@@ -23,21 +22,21 @@ function OnDestroy()
 end
 ```
 
-Notes:
+说明：
 
-- `OnStart` is called once after the script is loaded.
-- `OnUpdate` is called during the logic tick phase (60 Hz).
-- `OnRender` is called during the GUI render phase.
-- `OnDestroy` is called on hot-reload or GUI exit.
-- Do not wait for IPC inside `OnRender`.
-- Do not call `await_async` or `coroutine.yield` inside a `ui.window` callback.
-- Network and driver requests must run inside a `start_async` coroutine.
+- `OnStart` 在脚本加载后调用一次。
+- `OnUpdate` 在逻辑刷新阶段调用（60 Hz）。
+- `OnRender` 在 GUI 渲染阶段调用。
+- `OnDestroy` 在热重载或 GUI 退出时调用。
+- 不要在 `OnRender` 中等待 IPC。
+- 不要在 `ui.window` 的 callback 中调用 `await_async` 或 `coroutine.yield`。
+- 网络和驱动请求必须在 `start_async` coroutine 中执行。
 
 ## Async Tasks
 
 ### start_async
 
-Starts a Lua coroutine that is automatically resumed by the GUI each frame.
+启动一个 Lua coroutine，并由 GUI 每帧自动恢复。
 
 ```lua
 local co = start_async(function(arg)
@@ -45,18 +44,17 @@ local co = start_async(function(arg)
 end, "hello")
 ```
 
-Returns a coroutine object; direct manipulation is usually unnecessary.
+返回值是 coroutine 对象，通常不需要直接操作。
 
 ### await_async
 
-Waits for an async task to complete. Only suspends the current Lua coroutine
-during the wait; never blocks the GUI thread.
+等待异步任务完成。等待期间只挂起当前 Lua coroutine，不阻塞 GUI 线程。
 
 ```lua
 local value = await_async(memory.async_read_i32(pid, address))
 ```
 
-On failure a Lua error is raised inside the coroutine. Use `pcall` to catch:
+任务失败时会在 coroutine 内抛出 Lua error，应使用 `pcall` 捕获：
 
 ```lua
 start_async(function()
@@ -66,14 +64,14 @@ start_async(function()
     if ok then
         print("value:", result)
     else
-        print("failed:", result)
+        print("request failed:", result)
     end
 end)
 ```
 
 ### memory.poll_async
 
-Non-blocking task result poll. Returns `nil` if the task has not completed.
+非阻塞地查询任务结果。任务未完成时返回 `nil`。
 
 ```lua
 local task_id = memory.async_list_processes()
@@ -87,13 +85,13 @@ if result then
 end
 ```
 
-Success shape:
+成功结果：
 
 ```lua
 { done = true, value = ... }
 ```
 
-Failure shape:
+失败结果：
 
 ```lua
 { done = true, error = "error message" }
@@ -103,7 +101,7 @@ Failure shape:
 
 ### memory.async_list_processes
 
-Asynchronously lists all running processes.
+异步列出所有进程。
 
 ```lua
 local processes = await_async(memory.async_list_processes())
@@ -112,57 +110,56 @@ for _, process in ipairs(processes) do
 end
 ```
 
-Each record contains:
+每个进程记录包含：
 
 ```lua
 { pid = 1234, parent_pid = 1000, thread_count = 12, name = "notepad.exe" }
 ```
 
-Process enumeration is performed by `ks-service` using Windows Toolhelp APIs.
+进程枚举由 `ks-service` 使用 Windows Toolhelp API 完成。
 
 ### memory.async_get_pid
 
-Asynchronously resolves a process name to a PID (case-insensitive comparison).
+根据可执行文件名异步获取 PID，比较时不区分大小写。
 
 ```lua
 local pid = await_async(memory.async_get_pid("notepad.exe"))
 ```
 
-Constraints: non-empty, at most 255 bytes, no NUL bytes.
+进程名要求：非空、最多 255 字节、不包含 NUL 字节。
 
 ### memory.async_get_process_base
 
-Asynchronously retrieves the main module base address for a given PID.
+根据 PID 异步获取进程主模块基地址。
 
 ```lua
 local base = await_async(memory.async_get_process_base(pid))
 print(string.format("base = 0x%X", base))
 ```
 
-Uses `PsGetProcessSectionBaseAddress` inside the driver.
+基地址查询由 driver 完成，使用 `PsGetProcessSectionBaseAddress`。
 
 ## Absolute Memory API
 
-Address parameters accept:
+地址参数支持：
 
-- Lua positive integers.
-- Decimal strings.
-- Hex strings prefixed with `0x` or `0X`.
+- Lua 正整数。
+- 十进制字符串。
+- `0x` 或 `0X` 开头的十六进制字符串。
 
-Examples:
+例如：
 
 ```lua
 local a = "140702365450240"
 local b = "0x7FF812345000"
 ```
 
-Address `0` is forwarded to the service/driver which returns an error; it does
-not throw synchronously in the GUI render callback. Negative addresses and
-unsupported Lua types are rejected at parameter conversion time.
+地址 `0` 会提交给后台请求，最终由 service/driver 返回错误；它不会在 GUI
+渲染回调入口同步抛错。负数地址和不支持的 Lua 类型会在参数转换阶段拒绝。
 
 ### memory.async_read_i32
 
-Reads a 32-bit signed integer.
+异步读取一个 32 位有符号整数。
 
 ```lua
 local value = await_async(memory.async_read_i32(pid, "0x1407FFF0"))
@@ -170,20 +167,20 @@ local value = await_async(memory.async_read_i32(pid, "0x1407FFF0"))
 
 ### memory.async_read_bytes
 
-Reads a byte array.
+异步读取字节数组。
 
 ```lua
 local data = await_async(memory.async_read_bytes(pid, address, 16))
-for i, byte in ipairs(data) do
-    print(i, byte)
+for index, byte in ipairs(data) do
+    print(index, byte)
 end
 ```
 
-Single transfer limit: 256 bytes.
+当前 driver 单次读取上限为 256 字节。
 
 ### memory.async_write_i32
 
-Writes a 32-bit signed integer.
+异步写入一个 32 位有符号整数。
 
 ```lua
 await_async(memory.async_write_i32(pid, address, 123456789))
@@ -191,7 +188,7 @@ await_async(memory.async_write_i32(pid, address, 123456789))
 
 ### memory.async_write_bytes
 
-Writes a Lua byte array.
+异步写入 Lua 字节数组。
 
 ```lua
 await_async(memory.async_write_bytes(pid, address, {
@@ -199,22 +196,21 @@ await_async(memory.async_write_bytes(pid, address, {
 }))
 ```
 
-Each element must be coercible to a byte. Maximum 256 bytes per call.
+每个元素应为可转换为字节的整数，数组最大为 256 字节。
 
 ## RVA Memory API
 
-RVA APIs let the driver compute the absolute address:
+RVA API 的最终地址由 driver 计算：
 
 ```text
 absolute_address = process_image_base + relative_address
 ```
 
-`relative_address` is an unsigned offset. Addition overflow causes the request
-to fail.
+`relative_address` 是无符号相对偏移，地址相加发生溢出时请求失败。
 
 ### memory.async_read_rva
 
-Reads `base + relative_address` after resolving the image base internally.
+根据 PID 自动获取 image base，并读取 `base + relative_address` 处的数据。
 
 ```lua
 local data = await_async(memory.async_read_rva(pid, 0x1234, 4))
@@ -222,7 +218,7 @@ local data = await_async(memory.async_read_rva(pid, 0x1234, 4))
 
 ### memory.async_write_rva
 
-Writes `base + relative_address` after resolving the image base internally.
+根据 PID 自动获取 image base，并写入 `base + relative_address` 处的数据。
 
 ```lua
 await_async(memory.async_write_rva(pid, 0x1234, {
@@ -230,23 +226,22 @@ await_async(memory.async_write_rva(pid, 0x1234, {
 }))
 ```
 
-RVA read/write is also limited to 256 bytes per transfer.
+RVA 读写同样受 256 字节单次 driver 传输限制。
 
 ## MDL Memory API
 
-MDL read/write access target process memory through kernel MDL remapping: the
-driver attaches to the target, locks pages with read-only access, and maps the
-same physical pages into kernel address space. Reads and writes go through the
-kernel mapping, which **bypasses user-mode page protection** (read-only sections,
-code pages).
+MDL 读写通过内核 MDL 重映射访问目标进程内存：附加到目标进程后以只读方式
+锁定页面，再把同一物理页映射到内核地址空间，通过内核映射完成读写。该
+路径绕过用户态页保护，因此可以读取和**修改只读、不可写内存**（例如代码
+段）。
 
-Usage is identical to normal read/write. The only differences:
+用法与普通读写完全一致，区分仅在于：
 
-- `async_read_mdl*` / `async_write_mdl*` are separate APIs; they do not fall
-  back to normal read/write.
-- MDL writes hit shared physical pages: modifying an image code section affects
-  every process mapping that module (copy-on-write pages excepted).
-- Same 256-byte single transfer limit applies.
+- `async_read_mdl*` / `async_write_mdl*` 是独立的 API，与普通
+  `async_read*` / `async_write*` 互不影响。
+- MDL 写入的是共享物理页：修改映像代码段会影响所有映射该模块的进程
+  （写时复制页面除外）。
+- 同样受 256 字节单次传输限制。
 
 ### memory.async_read_mdl
 
@@ -257,7 +252,7 @@ local data = await_async(memory.async_read_mdl(pid, address, 16))
 ### memory.async_write_mdl
 
 ```lua
--- Modify read-only memory / code section
+-- 修改只读内存/代码段
 await_async(memory.async_write_mdl(pid, address, {
     0x90, 0x90, 0x90, 0xC3
 }))
@@ -279,7 +274,7 @@ await_async(memory.async_write_mdl_rva(pid, 0x1234, {
 
 ## Shared Globals
 
-Multiple Lua VMs exchange simple values through Rust-side shared storage.
+多个 Lua VM 通过 Rust 侧共享存储交换简单值。
 
 ### shared.set
 
@@ -289,8 +284,8 @@ shared.set("target_address", "0x7FF812345000")
 shared.set("enabled", true)
 ```
 
-Supported value types: `nil`, boolean, integer, finite number, string.
-Lua tables, functions, threads, and userdata cannot be shared.
+支持的值类型：`nil`、boolean、integer、有限 number、string。
+不支持共享 Lua table、function、thread 或 userdata。
 
 ### shared.get
 
@@ -298,7 +293,7 @@ Lua tables, functions, threads, and userdata cannot be shared.
 local pid = shared.get("selected_pid")
 ```
 
-Returns `nil` for missing keys.
+不存在的 key 返回 `nil`。
 
 ### shared.delete
 
@@ -306,16 +301,16 @@ Returns `nil` for missing keys.
 shared.delete("selected_pid")
 ```
 
-Key limit: 128 bytes.
+共享 key 最大为 128 字节。
 
 ## egui UI API
 
-UI APIs are called inside `OnRender`. The GUI uses `eframe + egui + glow`
-(OpenGL backend).
+Lua UI API 在 `OnRender` 中使用。GUI 当前使用 `eframe + egui + glow`
+OpenGL backend。
 
 ### ui.window
 
-Creates an egui window. Content is drawn through a callback.
+创建一个 egui 窗口。窗口内容通过 callback 绘制。
 
 ```lua
 ui.window("Memory", function()
@@ -323,9 +318,11 @@ ui.window("Memory", function()
 end)
 ```
 
-The callback must return synchronously; do not yield inside it.
+callback 必须在当前调用中同步结束，不得在其中 yield。
 
 ### ui.label
+
+普通文本标签。
 
 ```lua
 ui.label("Kernel Script")
@@ -333,11 +330,11 @@ ui.label("Kernel Script")
 
 ### ui.button
 
-Returns `true` when clicked.
+按钮被点击时返回 `true`。
 
 ```lua
 if ui.button("Read") then
-    -- submit request
+    -- submit async request
 end
 ```
 
@@ -349,7 +346,7 @@ ui.separator()
 
 ### ui.checkbox
 
-Returns the updated value and a changed flag.
+返回更新后的值和 changed 状态。
 
 ```lua
 enabled, changed = ui.checkbox("Enabled", enabled)
@@ -357,9 +354,8 @@ enabled, changed = ui.checkbox("Enabled", enabled)
 
 ### ui.drag_value
 
-Draggable numeric value. `drag_value` accepts `f64`; typed variants
-`drag_value_i8/u8/i16/u16/i32/u32/i64/u64/f32` cover the remaining primitive
-types. Returns the updated value and changed flag.
+可拖动数值。`drag_value` 接受 `f64`；`drag_value_i8/u8/i16/u16/i32/u32/i64/u64/f32`
+提供其余原生数值类型。参数为标签和当前值，返回更新后的值及 changed 状态。
 
 ```lua
 value, changed = ui.drag_value("Scale", value)
@@ -368,8 +364,8 @@ pid, changed = ui.drag_value_u64("PID", pid)
 
 ### ui.text_edit
 
-Generic text editor. Parameters: current text, multiline flag, password flag,
-code mode flag. Returns updated text and changed flag.
+通用文本编辑器。参数依次为当前文本、是否多行、是否密码模式、是否代码
+编辑模式，返回更新后的文本和 changed 状态。
 
 ```lua
 text, changed = ui.text_edit(text, true, false, true)
@@ -378,8 +374,8 @@ password, changed = ui.text_edit(password, false, true, false)
 
 ### ui.color_edit_button_srgba
 
-Color picker. Parameters: R, G, B, A as `0..255` bytes. Returns updated RGBA
-and changed flag.
+颜色选择器。参数为 RGBA 四个 `0..255` 字节，返回更新后的 RGBA 和 changed
+状态。
 
 ```lua
 r, g, b, a, changed = ui.color_edit_button_srgba(40, 120, 220, 255)
@@ -387,14 +383,16 @@ r, g, b, a, changed = ui.color_edit_button_srgba(40, 120, 220, 255)
 
 ### ui.spinner
 
+显示 egui loading spinner。
+
 ```lua
 ui.spinner()
 ```
 
 ### ui.slider_*
 
-Sliders for `i8`, `u8`, `i16`, `u16`, `i32`, `u32`, `i64`, `u64`, `f32`, `f64`.
-Parameters: label, current value, min, max. Returns new value and changed flag.
+滑动条支持 `i8`、`u8`、`i16`、`u16`、`i32`、`u32`、`i64`、`u64`、`f32` 和
+`f64`。参数为标签、当前值、最小值、最大值，返回新值和 changed 状态。
 
 ```lua
 value, changed = ui.slider_i32("Volume", value, 0, 100)
@@ -403,8 +401,8 @@ ratio, changed = ui.slider_f32("Ratio", ratio, 0.0, 1.0)
 
 ### ui.radio
 
-Radio button. Returns whether the button is selected and whether it was clicked
-this frame.
+单选按钮。参数为按钮文本和当前选中的文本，返回该按钮是否处于选中状态
+以及本次是否被点击。
 
 ```lua
 selected, clicked = ui.radio("Easy", selected)
@@ -413,8 +411,7 @@ if clicked then selected = "Easy" end
 
 ### ui.combo_box
 
-Dropdown. Parameters: label, current selection, string array. Returns new
-selection and changed flag.
+下拉框。参数为标签、当前选中项和字符串数组，返回新选中项和 changed 状态。
 
 ```lua
 mode, changed = ui.combo_box("Mode", mode, {"Read", "Write"})
@@ -422,7 +419,7 @@ mode, changed = ui.combo_box("Mode", mode, {"Read", "Write"})
 
 ### ui.progress_bar
 
-`fraction` is clamped to `0.0..=1.0`.
+显示进度条。`fraction` 会被限制在 `0.0..=1.0`。
 
 ```lua
 ui.progress_bar(0.75, "Loading")
@@ -430,7 +427,7 @@ ui.progress_bar(0.75, "Loading")
 
 ### ui.collapsing_header
 
-Collapsible content region.
+可展开/折叠的内容区域。
 
 ```lua
 ui.collapsing_header("Details", function()
@@ -440,7 +437,7 @@ end)
 
 ### ui.scroll_area
 
-Vertical scroll region. First parameter is max height.
+垂直滚动区域。第一个参数是最大高度。
 
 ```lua
 ui.scroll_area(240, function()
@@ -450,8 +447,7 @@ end)
 
 ### ui.selectable_label
 
-Selectable list item. Returns whether it was clicked and the current selection
-state.
+可选列表项。返回本次是否点击和传入的选中状态。
 
 ```lua
 clicked, selected = ui.selectable_label("Process", selected)
@@ -472,6 +468,8 @@ ui.hyperlink_to("Project page", "https://example.com")
 
 ### ui.small / ui.weak / ui.code
 
+分别对应 egui 的小号文本、弱化文本和代码文本。
+
 ```lua
 ui.small("Secondary text")
 ui.weak("Optional detail")
@@ -480,7 +478,7 @@ ui.code("0x140000000")
 
 ### ui.add_space
 
-Vertical spacing.
+插入垂直空白。
 
 ```lua
 ui.add_space(8)
@@ -526,13 +524,12 @@ end
 
 ## Runtime Constraints
 
-- Lua VM is only accessed by the GUI Lua thread.
-- Background Tokio tasks transfer only task IDs and owned plain data.
-- `OnRender` must not perform synchronous network or driver operations.
-- `OnUpdate` must not await futures; use coroutines or `poll_async`.
-- Single memory read/write limit: 256 bytes.
-- Process list is enumerated in user mode by the service.
-- Memory read/write and RVA computation are performed by the driver.
-- Transport uses the `\\.\pipe\KernelScript` Named Pipe.
-- Named Pipe and driver device access are controlled by Windows security
-  descriptors.
+- Lua VM 只在 GUI Lua 线程访问。
+- 后台 Tokio task 只传递 task ID 和 owned plain data。
+- `OnRender` 不得执行同步网络或 driver 操作。
+- `OnUpdate` 不得等待 Future；使用 coroutine 或 `poll_async`。
+- 单次内存读写最多 256 字节。
+- 进程列表由 service 在用户态枚举。
+- 内存读写和 RVA 计算由 driver 执行。
+- 服务传输使用 `\\.\pipe\KernelScript` Named Pipe。
+- Named Pipe 和 driver device 的权限由 Windows 安全描述符控制。
