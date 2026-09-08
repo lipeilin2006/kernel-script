@@ -1,0 +1,13 @@
+[package]
+name = "ks-installer"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "ks-installer"
+path = "src/main.rs"
+
+[dependencies]
+eframe.workspace = true
+encoding_rs = "0.8"

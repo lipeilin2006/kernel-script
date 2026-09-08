@@ -1,0 +1,2 @@
+# The final-link flags are emitted by build.rs only when KS_DRIVER_WDK=1.
+# This keeps ordinary cargo check usable on machines without the WDK.

@@ -1,0 +1,43 @@
+[workspace]
+members = [
+    "ks-core",
+    "ks-driver",
+    "ks-service",
+    "ks-gui",
+    "ks-installer",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+
+[workspace.dependencies]
+ks-core = { path = "ks-core", default-features = false }
+
+eframe = { version = "0.27.2", default-features = false, features = ["default_fonts", "glow"] }
+windows-sys = "0.61.2"
+windows-service = "0.8.1"
+mlua = { version = "0.12.0", features = ["lua54", "vendored", "send"] }
+tokio = "1.53.1"
+bytes = "1.10.1"
+encoding_rs = "0.8"
+tracing = "0.1.44"
+tracing-subscriber = "0.3.20"
+
+notify = "6.1.1"
+rfd = "0.14.1"
+
+[profile.release]
+opt-level = 3
+lto = true
+panic = "unwind"
+
+[profile.dev]
+panic = "abort"
+
+# GUI frame and Lua callback boundaries recover runtime panics.
+[profile.gui-release]
+inherits = "release"
+panic = "unwind"

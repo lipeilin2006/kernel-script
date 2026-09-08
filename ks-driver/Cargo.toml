@@ -1,0 +1,38 @@
+[package]
+name = "ks-driver"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+build = "build.rs"
+
+[lib]
+name = "ks_driver"
+# Keep the default artifact as an rlib. The WDK build uses the MSVC linker
+# flags emitted by build.rs and produces the Native-subsystem image.
+
+[[bin]]
+name = "ks-driver"
+path = "src/driver_bin.rs"
+required-features = ["wdk"]
+
+[features]
+default = []
+alloc = ["ks-core/alloc"]
+wdk = []
+
+[dependencies]
+ks-core.workspace = true
+windows-sys = { workspace = true, features = [
+    "Wdk_Foundation",
+    "Wdk_Storage_FileSystem",
+    "Wdk_System_SystemServices",
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_IO",
+    "Win32_System_Ioctl",
+    "Win32_System_Kernel",
+    "Win32_System_Power",
+] }
+
+[build-dependencies]
+cc = "1.2"

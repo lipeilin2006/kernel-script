@@ -1,0 +1,26 @@
+[package]
+name = "ks-service"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+ks-core = { workspace = true, features = ["alloc"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "net", "signal", "io-util", "time"] }
+bytes.workspace = true
+windows-service.workspace = true
+windows-sys = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_System_WindowsProgramming",
+    "Win32_System_IO",
+    "Win32_System_Ioctl",
+    "Win32_System_SystemServices",
+    "Win32_System_Services",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Pipes",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_Security_Authorization",
+] }
+tracing.workspace = true
+tracing-subscriber.workspace = true

@@ -1,0 +1,50 @@
+[Version]
+Signature   = "$WINDOWS NT$"
+Class       = System
+ClassGuid   = {4D36E97D-E325-11CE-BFC1-08002BE10318}
+Provider    = %ProviderName%
+DriverVer   = 08/30/2026,0.1.0.0
+CatalogFile = ks_driver.cat
+
+[DestinationDirs]
+DefaultDestDir = 12
+
+[SourceDisksNames]
+1 = %DiskName%,,,
+
+[SourceDisksFiles]
+ks-driver.sys = 1
+
+[DefaultInstall.NTamd64]
+CopyFiles = DriverCopyFiles
+
+[DefaultInstall.NTamd64.Services]
+AddService = ks-driver,0x00000002,ServiceInstall
+
+[Manufacturer]
+%ProviderName% = Standard,NTamd64
+
+[Standard.NTamd64]
+%DeviceDescription% = DriverInstall,ROOT\KS_DRIVER
+
+[DriverInstall]
+CopyFiles = DriverCopyFiles
+
+[DriverInstall.Services]
+AddService = ks-driver,0x00000002,ServiceInstall
+
+[DriverCopyFiles]
+ks-driver.sys
+
+[ServiceInstall]
+DisplayName   = %ServiceDisplayName%
+ServiceType   = 1
+StartType     = 3
+ErrorControl  = 1
+ServiceBinary = %12%\ks-driver.sys
+
+[Strings]
+ProviderName        = "ks-driver project"
+DeviceDescription   = "ks-driver performance analysis driver"
+ServiceDisplayName  = "ks-driver"
+DiskName            = "ks-driver installation media"

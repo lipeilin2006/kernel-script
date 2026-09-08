@@ -1,0 +1,36 @@
+# Rust
+target/
+
+# Build outputs
+*.sys
+*.pdb
+*.dll
+*.lib
+*.exp
+*.ilk
+*.obj
+*.iobj
+*.ipdb
+*.zip
+
+# Deployment package
+driver-package/
+
+# Sub-crate git links (orphaned from before workspace consolidation)
+ks-core/.git
+ks-driver/.git
+ks-gui/.git
+ks-service/.git
+
+# OS
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# IDE
+.vs/
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
