@@ -1547,23 +1547,22 @@ fn register_memory_api(lua: &Lua, async_scheduler: AsyncScheduler) -> mlua::Resu
         )?;
     }
 
-    {
-        let scheduler = async_scheduler.clone();
-        module.set(
-            "async_get_window_rect",
-            lua.create_function(move |_, process_name: String| {
-                let name = process_name.trim().to_owned();
-                if name.is_empty() || name.len() > 255 || name.bytes().any(|byte| byte == 0) {
-                    return Err(mlua::Error::runtime(
-                        "process name must be 1..255 bytes and contain no NUL",
-                    ));
-                }
-                scheduler
-                    .submit(AsyncRequest::GetWindowRect { process_name: name })
-                    .map_err(mlua::Error::external)
-            })?,
-        )?;
-    }
+    module.set(
+        "get_window_rect",
+        lua.create_function(|lua, pid: u64| -> mlua::Result<Option<mlua::Table>> {
+            let pid32 = u32::try_from(pid).map_err(|_| mlua::Error::runtime("PID too large"))?;
+            let (x, y, w, h) = match crate::window_util::get_window_rect_by_pid(pid32) {
+                Some(rect) => rect,
+                None => return Ok(None),
+            };
+            let t = lua.create_table()?;
+            t.set("x", x)?;
+            t.set("y", y)?;
+            t.set("width", w)?;
+            t.set("height", h)?;
+            Ok(Some(t))
+        })?,
+    )?;
 
     {
         let scheduler = async_scheduler.clone();
