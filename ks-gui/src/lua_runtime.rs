@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime};
@@ -11,6 +11,12 @@ use mlua::debug::HookTriggers;
 use mlua::{FromLua, Function, IntoLuaMulti, Lua, Table, Value, VmState};
 
 use crate::ipc_client::IpcClient;
+
+static CONTENT_SCALE: AtomicU32 = AtomicU32::new(100);
+
+pub fn set_content_scale(scale: f32) {
+    CONTENT_SCALE.store((scale * 100.0) as u32, Ordering::Relaxed);
+}
 
 #[derive(Clone, Debug)]
 pub enum DrawCommand {
@@ -1555,11 +1561,12 @@ fn register_memory_api(lua: &Lua, async_scheduler: AsyncScheduler) -> mlua::Resu
                 Some(rect) => rect,
                 None => return Ok(None),
             };
+            let scale = CONTENT_SCALE.load(Ordering::Relaxed) as f32 / 100.0;
             let t = lua.create_table()?;
-            t.set("x", x)?;
-            t.set("y", y)?;
-            t.set("width", w)?;
-            t.set("height", h)?;
+            t.set("x", x as f32 / scale)?;
+            t.set("y", y as f32 / scale)?;
+            t.set("width", w as f32 / scale)?;
+            t.set("height", h as f32 / scale)?;
             Ok(Some(t))
         })?,
     )?;

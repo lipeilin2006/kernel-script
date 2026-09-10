@@ -164,6 +164,12 @@ pub fn run() -> Result<(), Box<dyn Error>> {
     glfw_backend.window.set_size(w as i32, h as i32);
     glfw_backend.window.set_pos(0, 0);
 
+    {
+        let (sx, _sy) = glfw_backend.window.get_content_scale();
+        crate::lua_runtime::set_content_scale(sx);
+        tracing::info!(content_scale = sx, "content scale set");
+    }
+
     #[cfg(target_os = "windows")]
     unsafe {
         use glfw_passthrough::glfw::ffi::glfwGetWin32Window;
