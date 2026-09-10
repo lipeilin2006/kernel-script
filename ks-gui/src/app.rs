@@ -124,7 +124,16 @@ impl EguiOverlay for KernelScriptApp {
 }
 
 pub fn run() -> Result<(), Box<dyn Error>> {
-    let _ = tracing_subscriber::fmt().with_target(false).try_init();
+    let _ = tracing_subscriber::fmt()
+        .with_target(false)
+        .with_writer(std::fs::File::create("ks-gui.log").unwrap_or_else(|_| {
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open("ks-gui.log")
+                .unwrap()
+        }))
+        .try_init();
 
     let monitor_size: Rc<Cell<[u32; 2]>> = Rc::new(Cell::new([1920, 1080]));
     let monitor_size_clone = monitor_size.clone();
