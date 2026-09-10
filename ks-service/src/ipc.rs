@@ -295,6 +295,17 @@ async fn dispatch(
                 data: data.to_vec(),
             }
         }
+        Request::GetWindowRect { name } => {
+            let Ok(name) = core::str::from_utf8(name) else {
+                return encode_response(Response::Error(1));
+            };
+            if name.is_empty() || name.len() > 255 || name.bytes().any(|byte| byte == 0) {
+                return encode_response(Response::Error(1));
+            }
+            OwnedRequest::GetWindowRect {
+                name: name.to_owned(),
+            }
+        }
     };
     let driver = Arc::clone(driver);
     tokio::task::spawn_blocking(move || {
@@ -435,6 +446,18 @@ async fn dispatch(
                     }
                 }
             }
+            OwnedRequest::GetWindowRect { name } => match process::get_window_rect(&name) {
+                Ok(rect) => encode_response(Response::WindowRect {
+                    x: rect.0,
+                    y: rect.1,
+                    width: rect.2,
+                    height: rect.3,
+                }),
+                Err(error) => {
+                    tracing::warn!(window = %name, %error, "window rect lookup failed");
+                    encode_response(Response::Error(11))
+                }
+            },
         }
     })
     .await
@@ -503,6 +526,9 @@ enum OwnedRequest {
         pid: u64,
         target_address: u64,
         data: Vec<u8>,
+    },
+    GetWindowRect {
+        name: String,
     },
 }
 

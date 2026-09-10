@@ -20,6 +20,7 @@ enum OwnedResponse {
     WriteComplete,
     Error(u32),
     ErrorDetail(String),
+    WindowRect(i32, i32, i32, i32),
 }
 
 #[derive(Clone, Debug)]
@@ -102,6 +103,12 @@ impl IpcClient {
             Response::ErrorDetail(detail) => Ok(OwnedResponse::ErrorDetail(
                 String::from_utf8_lossy(detail).into_owned(),
             )),
+            Response::WindowRect {
+                x,
+                y,
+                width,
+                height,
+            } => Ok(OwnedResponse::WindowRect(x, y, width, height)),
         }
     }
 
@@ -293,6 +300,27 @@ impl IpcClient {
             .await?
         {
             OwnedResponse::ProcessId(pid) if pid != 0 => Ok(pid),
+            OwnedResponse::Error(code) => Err(format!("service error: {code}")),
+            OwnedResponse::ErrorDetail(detail) => Err(detail),
+            _ => Err("unexpected response".into()),
+        }
+    }
+
+    pub async fn get_window_rect(
+        &self,
+        process_name: &str,
+    ) -> Result<(i32, i32, i32, i32), String> {
+        let name = process_name.trim();
+        if name.is_empty() || name.len() > 255 || name.bytes().any(|byte| byte == 0) {
+            return Err("process name must be 1..255 bytes and contain no NUL".into());
+        }
+        match self
+            .send_request(&Request::GetWindowRect {
+                name: name.as_bytes(),
+            })
+            .await?
+        {
+            OwnedResponse::WindowRect(x, y, w, h) => Ok((x, y, w, h)),
             OwnedResponse::Error(code) => Err(format!("service error: {code}")),
             OwnedResponse::ErrorDetail(detail) => Err(detail),
             _ => Err("unexpected response".into()),

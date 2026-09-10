@@ -90,6 +90,8 @@ pub enum MessageType {
     WriteMemoryMdl = 16,
     ReadMemoryMdlRva = 17,
     WriteMemoryMdlRva = 18,
+    GetWindowRect = 19,
+    GetWindowRectResponse = 20,
     GetProcessId = 7,
     GetProcessIdResponse = 8,
     Error = 0xFFFF,
@@ -113,6 +115,8 @@ impl MessageType {
             16 => Ok(Self::WriteMemoryMdl),
             17 => Ok(Self::ReadMemoryMdlRva),
             18 => Ok(Self::WriteMemoryMdlRva),
+            19 => Ok(Self::GetWindowRect),
+            20 => Ok(Self::GetWindowRectResponse),
             7 => Ok(Self::GetProcessId),
             8 => Ok(Self::GetProcessIdResponse),
             0xFFFF => Ok(Self::Error),
@@ -331,6 +335,9 @@ pub enum Request<'a> {
         target_address: u64,
         data: &'a [u8],
     },
+    GetWindowRect {
+        name: &'a [u8],
+    },
 }
 
 #[cfg(feature = "alloc")]
@@ -343,6 +350,12 @@ pub enum Response<'a> {
     ErrorDetail(&'a [u8]),
     ProcessId(u64),
     ProcessBase(u64),
+    WindowRect {
+        x: i32,
+        y: i32,
+        width: i32,
+        height: i32,
+    },
 }
 
 #[cfg(feature = "alloc")]
@@ -445,6 +458,7 @@ impl<'a> WireEncode for Request<'a> {
             Self::WriteMemoryMdlRva { .. } => MessageType::WriteMemoryMdlRva,
             Self::ReadProcessMemory(_) => MessageType::ReadProcessMemory,
             Self::WriteProcessMemory { .. } => MessageType::WriteProcessMemory,
+            Self::GetWindowRect { .. } => MessageType::GetWindowRect,
         }
     }
     fn encoded_len(&self) -> Result<usize, ProtocolError> {
@@ -469,6 +483,9 @@ impl<'a> WireEncode for Request<'a> {
             Self::ReadProcessMemory(_) => 24,
             Self::WriteProcessMemory { data, .. } => 20usize
                 .checked_add(data.len())
+                .ok_or(ProtocolError::TooLarge)?,
+            Self::GetWindowRect { name } => 4usize
+                .checked_add(name.len())
                 .ok_or(ProtocolError::TooLarge)?,
         };
         if n > MAX_FRAME_SIZE - HEADER_SIZE {
@@ -560,6 +577,10 @@ impl<'a> WireEncode for Request<'a> {
                 out[26..30].copy_from_slice(&(data.len() as u32).to_le_bytes());
                 out[30..total].copy_from_slice(data);
             }
+            Self::GetWindowRect { name } => {
+                out[10..14].copy_from_slice(&(name.len() as u32).to_le_bytes());
+                out[14..total].copy_from_slice(name);
+            }
         }
         Ok(total)
     }
@@ -648,6 +669,13 @@ impl<'a> WireDecode<'a> for Request<'a> {
                     data: &p[20..],
                 })
             }
+            MessageType::GetWindowRect if p.len() >= 4 => {
+                let len = u32::from_le_bytes(p[..4].try_into().unwrap()) as usize;
+                if len != p.len() - 4 || len == 0 || len > 255 {
+                    return Err(ProtocolError::InvalidPayload);
+                }
+                Ok(Self::GetWindowRect { name: &p[4..] })
+            }
             _ => Err(ProtocolError::InvalidPayload),
         }
     }
@@ -664,6 +692,7 @@ impl<'a> WireEncode for Response<'a> {
             Self::ErrorDetail(_) => MessageType::ErrorDetail,
             Self::ProcessId(_) => MessageType::GetProcessIdResponse,
             Self::ProcessBase(_) => MessageType::GetProcessBaseResponse,
+            Self::WindowRect { .. } => MessageType::GetWindowRectResponse,
         }
     }
     fn encoded_len(&self) -> Result<usize, ProtocolError> {
@@ -675,6 +704,7 @@ impl<'a> WireEncode for Response<'a> {
             Self::ErrorDetail(v) => v.len(),
             Self::ProcessId(_) => 8,
             Self::ProcessBase(_) => 8,
+            Self::WindowRect { .. } => 16,
         };
         let total = HEADER_SIZE
             .checked_add(payload_len)
@@ -701,6 +731,17 @@ impl<'a> WireEncode for Response<'a> {
             Self::ErrorDetail(v) => out[10..total].copy_from_slice(v),
             Self::ProcessId(pid) => out[10..18].copy_from_slice(&pid.to_le_bytes()),
             Self::ProcessBase(base) => out[10..18].copy_from_slice(&base.to_le_bytes()),
+            Self::WindowRect {
+                x,
+                y,
+                width,
+                height,
+            } => {
+                out[10..14].copy_from_slice(&x.to_le_bytes());
+                out[14..18].copy_from_slice(&y.to_le_bytes());
+                out[18..22].copy_from_slice(&width.to_le_bytes());
+                out[22..26].copy_from_slice(&height.to_le_bytes());
+            }
         }
         Ok(total)
     }
@@ -725,6 +766,12 @@ impl<'a> WireDecode<'a> for Response<'a> {
             MessageType::GetProcessBaseResponse if payload.len() == 8 => Ok(Self::ProcessBase(
                 u64::from_le_bytes(payload.try_into().unwrap()),
             )),
+            MessageType::GetWindowRectResponse if payload.len() == 16 => Ok(Self::WindowRect {
+                x: i32::from_le_bytes(payload[..4].try_into().unwrap()),
+                y: i32::from_le_bytes(payload[4..8].try_into().unwrap()),
+                width: i32::from_le_bytes(payload[8..12].try_into().unwrap()),
+                height: i32::from_le_bytes(payload[12..16].try_into().unwrap()),
+            }),
             _ => Err(ProtocolError::InvalidPayload),
         }
     }

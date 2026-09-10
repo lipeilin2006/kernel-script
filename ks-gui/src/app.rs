@@ -10,7 +10,7 @@ use egui_overlay::egui_render_three_d::{ThreeDConfig, ThreeDBackend};
 use egui_overlay::egui_window_glfw_passthrough::{self as glfw_passthrough, GlfwBackend, GlfwConfig};
 use egui_overlay::EguiOverlay;
 
-use crate::lua_runtime::LuaRuntimeManager;
+use crate::lua_runtime::{DrawCommand, LuaRuntimeManager};
 
 #[cfg(target_os = "windows")]
 mod win32 {
@@ -83,6 +83,43 @@ impl EguiOverlay for KernelScriptApp {
         }
         let wants_input = ctx.is_pointer_over_area();
         glfw_backend.set_passthrough(!wants_input);
+
+        let commands = self.runtime.take_draw_commands();
+        if !commands.is_empty() {
+            let painter = ctx.layer_painter(egui::LayerId::new(
+                egui::Order::Foreground,
+                egui::Id::new("draw_overlay"),
+            ));
+            for cmd in commands {
+                match cmd {
+                    DrawCommand::Line { x1, y1, x2, y2, color, thickness } => {
+                        let c = egui::Color32::from_rgba_unmultiplied(color[0], color[1], color[2], color[3]);
+                        painter.line_segment([egui::pos2(x1, y1), egui::pos2(x2, y2)], egui::Stroke::new(thickness, c));
+                    }
+                    DrawCommand::Rect { x, y, w, h, color, thickness } => {
+                        let c = egui::Color32::from_rgba_unmultiplied(color[0], color[1], color[2], color[3]);
+                        painter.rect_stroke(egui::Rect::from_min_size(egui::pos2(x, y), egui::vec2(w, h)), 0.0, egui::Stroke::new(thickness, c));
+                    }
+                    DrawCommand::FilledRect { x, y, w, h, color } => {
+                        let c = egui::Color32::from_rgba_unmultiplied(color[0], color[1], color[2], color[3]);
+                        painter.rect_filled(egui::Rect::from_min_size(egui::pos2(x, y), egui::vec2(w, h)), 0.0, c);
+                    }
+                    DrawCommand::Circle { x, y, radius, color, thickness } => {
+                        let c = egui::Color32::from_rgba_unmultiplied(color[0], color[1], color[2], color[3]);
+                        painter.circle_stroke(egui::pos2(x, y), radius, egui::Stroke::new(thickness, c));
+                    }
+                    DrawCommand::FilledCircle { x, y, radius, color } => {
+                        let c = egui::Color32::from_rgba_unmultiplied(color[0], color[1], color[2], color[3]);
+                        painter.circle_filled(egui::pos2(x, y), radius, c);
+                    }
+                    DrawCommand::Text { x, y, text, color, size } => {
+                        let c = egui::Color32::from_rgba_unmultiplied(color[0], color[1], color[2], color[3]);
+                        let galley = ctx.fonts(|f| f.layout_no_wrap(text, egui::FontId::proportional(size), c));
+                        painter.galley(egui::pos2(x, y), galley, egui::Color32::TRANSPARENT);
+                    }
+                }
+            }
+        }
     }
 }
 

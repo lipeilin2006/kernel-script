@@ -13,6 +13,55 @@ use mlua::{FromLua, Function, IntoLuaMulti, Lua, Table, Value, VmState};
 use crate::ipc_client::IpcClient;
 
 #[derive(Clone, Debug)]
+pub enum DrawCommand {
+    Line {
+        x1: f32,
+        y1: f32,
+        x2: f32,
+        y2: f32,
+        color: [u8; 4],
+        thickness: f32,
+    },
+    Rect {
+        x: f32,
+        y: f32,
+        w: f32,
+        h: f32,
+        color: [u8; 4],
+        thickness: f32,
+    },
+    FilledRect {
+        x: f32,
+        y: f32,
+        w: f32,
+        h: f32,
+        color: [u8; 4],
+    },
+    Circle {
+        x: f32,
+        y: f32,
+        radius: f32,
+        color: [u8; 4],
+        thickness: f32,
+    },
+    FilledCircle {
+        x: f32,
+        y: f32,
+        radius: f32,
+        color: [u8; 4],
+    },
+    Text {
+        x: f32,
+        y: f32,
+        text: String,
+        color: [u8; 4],
+        size: f32,
+    },
+}
+
+pub type DrawCommands = Arc<Mutex<Vec<DrawCommand>>>;
+
+#[derive(Clone, Debug)]
 enum SharedValue {
     Nil,
     Boolean(bool),
@@ -152,6 +201,9 @@ enum AsyncRequest {
         data: Vec<u8>,
     },
     ListProcesses,
+    GetWindowRect {
+        process_name: String,
+    },
 }
 
 enum AsyncValue {
@@ -159,6 +211,7 @@ enum AsyncValue {
     Bytes(Vec<u8>),
     Pid(u64),
     Processes(Vec<crate::ipc_client::ProcessInfo>),
+    WindowRect(i32, i32, i32, i32),
     Unit,
 }
 
@@ -262,6 +315,10 @@ impl AsyncScheduler {
                 .await
                 .map(|()| AsyncValue::Unit),
             AsyncRequest::ListProcesses => client.list_processes().await.map(AsyncValue::Processes),
+            AsyncRequest::GetWindowRect { process_name } => client
+                .get_window_rect(&process_name)
+                .await
+                .map(|(x, y, w, h)| AsyncValue::WindowRect(x, y, w, h)),
         }
     }
 
@@ -317,15 +374,18 @@ pub struct LuaRuntime {
     update_thread: Option<JoinHandle<()>>,
     async_scheduler: AsyncScheduler,
     shared_globals: SharedGlobals,
+    draw_commands: DrawCommands,
 }
 
 pub struct LuaRuntimeManager {
     runtimes: Vec<LuaRuntime>,
+    draw_commands: DrawCommands,
 }
 
 impl LuaRuntimeManager {
     pub fn new(script_directory: PathBuf) -> mlua::Result<Self> {
         let shared_globals = Arc::new(Mutex::new(HashMap::new()));
+        let draw_commands: DrawCommands = Arc::new(Mutex::new(Vec::new()));
         let mut paths = fs::read_dir(&script_directory)
             .map_err(mlua::Error::external)?
             .filter_map(Result::ok)
@@ -341,12 +401,19 @@ impl LuaRuntimeManager {
         }
         let runtimes = paths
             .into_iter()
-            .map(|path| LuaRuntime::new(path, Arc::clone(&shared_globals)))
+            .map(|path| {
+                LuaRuntime::new(
+                    path,
+                    Arc::clone(&shared_globals),
+                    Arc::clone(&draw_commands),
+                )
+            })
             .collect::<mlua::Result<Vec<_>>>()?;
-        Ok(Self { runtimes })
+        Ok(Self { runtimes, draw_commands })
     }
 
     pub fn frame(&mut self, ctx: &egui::Context, now: Instant) {
+        self.draw_commands.lock().unwrap().clear();
         for runtime in &mut self.runtimes {
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 runtime.frame(ctx, now);
@@ -362,10 +429,18 @@ impl LuaRuntimeManager {
             runtime.set_error(error.clone());
         }
     }
+
+    pub fn take_draw_commands(&self) -> Vec<DrawCommand> {
+        self.draw_commands.lock().unwrap().drain(..).collect()
+    }
 }
 
 impl LuaRuntime {
-    fn new(script_path: PathBuf, shared_globals: SharedGlobals) -> mlua::Result<Self> {
+    fn new(
+        script_path: PathBuf,
+        shared_globals: SharedGlobals,
+        draw_commands: DrawCommands,
+    ) -> mlua::Result<Self> {
         let control = Arc::new(RuntimeControl::default());
         let async_scheduler = AsyncScheduler::new();
         let (lua, deadline) = Self::build_vm(
@@ -373,6 +448,7 @@ impl LuaRuntime {
             Arc::clone(&control),
             async_scheduler.clone(),
             Arc::clone(&shared_globals),
+            Arc::clone(&draw_commands),
         )?;
         let now = Instant::now();
         let update_stop = Arc::new(AtomicBool::new(false));
@@ -391,6 +467,7 @@ impl LuaRuntime {
             update_thread: Some(update_thread),
             async_scheduler,
             shared_globals,
+            draw_commands,
             script_path,
             control,
             deadline,
@@ -423,6 +500,7 @@ impl LuaRuntime {
         control: Arc<RuntimeControl>,
         async_scheduler: AsyncScheduler,
         shared_globals: SharedGlobals,
+        draw_commands: DrawCommands,
     ) -> mlua::Result<(Lua, Arc<Mutex<Option<Instant>>>)> {
         let lua = Lua::new();
         lua.set_memory_limit(LUA_MEMORY_LIMIT)?;
@@ -434,6 +512,7 @@ impl LuaRuntime {
         register_engine_api(&lua, control)?;
         register_memory_api(&lua, async_scheduler)?;
         register_shared_api(&lua, shared_globals)?;
+        register_draw_api(&lua, draw_commands)?;
         install_async_helpers(&lua)?;
 
         let source = fs::read_to_string(script_path).map_err(mlua::Error::external)?;
@@ -529,6 +608,7 @@ impl LuaRuntime {
             Arc::clone(&self.control),
             self.async_scheduler.clone(),
             Arc::clone(&self.shared_globals),
+            Arc::clone(&self.draw_commands),
         ) {
             Ok((new_lua, new_deadline)) => {
                 if let Err(error) = call_optional_budgeted(
@@ -1466,6 +1546,24 @@ fn register_memory_api(lua: &Lua, async_scheduler: AsyncScheduler) -> mlua::Resu
     {
         let scheduler = async_scheduler.clone();
         module.set(
+            "async_get_window_rect",
+            lua.create_function(move |_, process_name: String| {
+                let name = process_name.trim().to_owned();
+                if name.is_empty() || name.len() > 255 || name.bytes().any(|byte| byte == 0) {
+                    return Err(mlua::Error::runtime(
+                        "process name must be 1..255 bytes and contain no NUL",
+                    ));
+                }
+                scheduler
+                    .submit(AsyncRequest::GetWindowRect { process_name: name })
+                    .map_err(mlua::Error::external)
+            })?,
+        )?;
+    }
+
+    {
+        let scheduler = async_scheduler.clone();
+        module.set(
             "poll_async",
             lua.create_function(move |lua, id: u64| -> mlua::Result<Option<mlua::Table>> {
                 let Some(result) = scheduler.poll_id(id) else {
@@ -1493,6 +1591,14 @@ fn register_memory_api(lua: &Lua, async_scheduler: AsyncScheduler) -> mlua::Resu
                             processes.set(index + 1, process)?;
                         }
                         output.set("value", processes)?;
+                    }
+                    Ok(AsyncValue::WindowRect(x, y, w, h)) => {
+                        let rect = lua.create_table()?;
+                        rect.set("x", x)?;
+                        rect.set("y", y)?;
+                        rect.set("width", w)?;
+                        rect.set("height", h)?;
+                        output.set("value", rect)?;
                     }
                     Ok(AsyncValue::Unit) => {}
                     Err(error) => {
@@ -1555,6 +1661,162 @@ fn register_shared_api(lua: &Lua, shared: SharedGlobals) -> mlua::Result<()> {
         )?;
     }
     lua.globals().set("shared", module)
+}
+
+fn register_draw_api(lua: &Lua, draw_commands: DrawCommands) -> mlua::Result<()> {
+    let module = lua.create_table()?;
+
+    {
+        let dc = Arc::clone(&draw_commands);
+        module.set(
+            "line",
+            lua.create_function(
+                move |_,
+                      (x1, y1, x2, y2, r, g, b, a, thickness): (
+                    f32,
+                    f32,
+                    f32,
+                    f32,
+                    u8,
+                    u8,
+                    u8,
+                    u8,
+                    f32,
+                )| {
+                    dc.lock()
+                        .map_err(|_| mlua::Error::runtime("draw lock poisoned"))?
+                        .push(DrawCommand::Line {
+                            x1,
+                            y1,
+                            x2,
+                            y2,
+                            color: [r, g, b, a],
+                            thickness,
+                        });
+                    Ok(())
+                },
+            )?,
+        )?;
+    }
+
+    {
+        let dc = Arc::clone(&draw_commands);
+        module.set(
+            "rect",
+            lua.create_function(
+                move |_,
+                      (x, y, w, h, r, g, b, a, thickness): (
+                    f32,
+                    f32,
+                    f32,
+                    f32,
+                    u8,
+                    u8,
+                    u8,
+                    u8,
+                    f32,
+                )| {
+                    dc.lock()
+                        .map_err(|_| mlua::Error::runtime("draw lock poisoned"))?
+                        .push(DrawCommand::Rect {
+                            x,
+                            y,
+                            w,
+                            h,
+                            color: [r, g, b, a],
+                            thickness,
+                        });
+                    Ok(())
+                },
+            )?,
+        )?;
+    }
+
+    {
+        let dc = Arc::clone(&draw_commands);
+        module.set(
+            "filled_rect",
+            lua.create_function(
+                move |_,
+                      (x, y, w, h, r, g, b, a): (f32, f32, f32, f32, u8, u8, u8, u8)| {
+                    dc.lock()
+                        .map_err(|_| mlua::Error::runtime("draw lock poisoned"))?
+                        .push(DrawCommand::FilledRect {
+                            x,
+                            y,
+                            w,
+                            h,
+                            color: [r, g, b, a],
+                        });
+                    Ok(())
+                },
+            )?,
+        )?;
+    }
+
+    {
+        let dc = Arc::clone(&draw_commands);
+        module.set(
+            "circle",
+            lua.create_function(
+                move |_, (x, y, radius, r, g, b, a, thickness): (f32, f32, f32, u8, u8, u8, u8, f32)| {
+                    dc.lock()
+                        .map_err(|_| mlua::Error::runtime("draw lock poisoned"))?
+                        .push(DrawCommand::Circle {
+                            x,
+                            y,
+                            radius,
+                            color: [r, g, b, a],
+                            thickness,
+                        });
+                    Ok(())
+                },
+            )?,
+        )?;
+    }
+
+    {
+        let dc = Arc::clone(&draw_commands);
+        module.set(
+            "filled_circle",
+            lua.create_function(
+                move |_, (x, y, radius, r, g, b, a): (f32, f32, f32, u8, u8, u8, u8)| {
+                    dc.lock()
+                        .map_err(|_| mlua::Error::runtime("draw lock poisoned"))?
+                        .push(DrawCommand::FilledCircle {
+                            x,
+                            y,
+                            radius,
+                            color: [r, g, b, a],
+                        });
+                    Ok(())
+                },
+            )?,
+        )?;
+    }
+
+    {
+        let dc = Arc::clone(&draw_commands);
+        module.set(
+            "text",
+            lua.create_function(
+                move |_, (x, y, text, r, g, b, a, size): (f32, f32, String, u8, u8, u8, u8, f32)| {
+                    dc.lock()
+                        .map_err(|_| mlua::Error::runtime("draw lock poisoned"))?
+                        .push(DrawCommand::Text {
+                            x,
+                            y,
+                            text,
+                            color: [r, g, b, a],
+                            size,
+                        });
+                    Ok(())
+                },
+            )?,
+        )?;
+    }
+
+    lua.globals().set("draw", module)
 }
 
 // Coroutine suspension happens entirely on the Lua thread. The IPC worker
