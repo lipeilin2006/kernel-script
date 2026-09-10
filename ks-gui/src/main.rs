@@ -1,3 +1,5 @@
+#![windows_subsystem = "windows"]
+
 mod app;
 mod ipc_client;
 mod lua_runtime;
