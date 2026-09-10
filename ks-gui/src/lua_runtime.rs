@@ -1556,6 +1556,20 @@ fn register_memory_api(lua: &Lua, async_scheduler: AsyncScheduler) -> mlua::Resu
     {
         let scheduler = async_scheduler.clone();
         module.set(
+            "async_get_window_rect",
+            lua.create_function(move |_, name: String| {
+                scheduler
+                    .submit(AsyncRequest::GetWindowRect {
+                        process_name: name,
+                    })
+                    .map_err(mlua::Error::external)
+            })?,
+        )?;
+    }
+
+    {
+        let scheduler = async_scheduler.clone();
+        module.set(
             "poll_async",
             lua.create_function(move |lua, id: u64| -> mlua::Result<Option<mlua::Table>> {
                 let Some(result) = scheduler.poll_id(id) else {
