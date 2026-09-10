@@ -37,7 +37,7 @@ impl EguiOverlay for KernelScriptApp {
                 if let Some(monitor) = monitor {
                     if let Some(mode) = monitor.get_video_mode() {
                         glfw_backend.window.set_monitor(
-                            egui_overlay::egui_window_glfw_passthrough::glfw::WindowMode::FullScreen(monitor),
+                            egui_overlay::egui_window_glfw_passthrough::glfw::WindowMode::Windowed,
                             0,
                             0,
                             mode.width as u32,
