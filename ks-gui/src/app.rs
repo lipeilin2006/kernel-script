@@ -1,6 +1,8 @@
+use std::cell::Cell;
 use std::error::Error;
 use std::fs;
 use std::path::Path;
+use std::rc::Rc;
 use std::time::Instant;
 
 use egui::FontFamily;
@@ -55,21 +57,33 @@ impl EguiOverlay for KernelScriptApp {
 pub fn run() -> Result<(), Box<dyn Error>> {
     let _ = tracing_subscriber::fmt().with_target(false).try_init();
 
+    let monitor_size: Rc<Cell<[u32; 2]>> = Rc::new(Cell::new([1920, 1080]));
+    let monitor_size_clone = monitor_size.clone();
+
     let mut glfw_backend = GlfwBackend::new(GlfwConfig {
-        size: [1920, 1080],
         transparent_window: Some(true),
         opengl_window: Some(true),
-        glfw_callback: Box::new(|gtx| {
+        glfw_callback: Box::new(move |gtx| {
             (glfw_passthrough::GlfwConfig::default().glfw_callback)(gtx);
             gtx.window_hint(glfw_passthrough::glfw::WindowHint::ScaleToMonitor(true));
+            gtx.with_primary_monitor(|_, monitor| {
+                if let Some(monitor) = monitor {
+                    if let Some(video_mode) = monitor.get_video_mode() {
+                        monitor_size_clone.set([video_mode.width, video_mode.height]);
+                    }
+                }
+            });
         }),
         window_callback: Box::new(|window: &mut glfw_passthrough::glfw::Window| {
             window.set_floating(true);
             window.set_decorated(false);
-            window.set_pos(0, 0);
         }),
         ..Default::default()
     });
+
+    let [w, h] = monitor_size.get();
+    glfw_backend.window.set_size(w as i32, h as i32);
+    glfw_backend.window.set_pos(0, 0);
 
     let fb_size = glfw_backend.window.get_framebuffer_size();
     let latest_size = [fb_size.0 as _, fb_size.1 as _];
