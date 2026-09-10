@@ -120,5 +120,29 @@ fn init_logging() {
     let _ = tracing_subscriber::fmt()
         .with_target(false)
         .with_thread_ids(true)
+        .with_writer(std::fs::File::create("ks-service.log").unwrap_or_else(|_| {
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open("ks-service.log")
+                .unwrap()
+        }))
         .try_init();
+    std::panic::set_hook(Box::new(|info| {
+        let thread = std::thread::current();
+        let name = thread.name().unwrap_or("<unnamed>");
+        let payload = if let Some(s) = info.payload().downcast_ref::<&str>() {
+            s.to_string()
+        } else if let Some(s) = info.payload().downcast_ref::<String>() {
+            s.clone()
+        } else {
+            "Box<dyn Any>".to_string()
+        };
+        let loc = info
+            .location()
+            .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
+            .unwrap_or_else(|| "<unknown>".to_string());
+        tracing::error!(thread = name, %payload, location = %loc, "PANIC");
+        eprintln!("PANIC on thread '{name}': {payload} at {loc}");
+    }));
 }

@@ -139,6 +139,7 @@ async fn handle_client(
     driver: SharedDriver,
     mut shutdown: broadcast::Receiver<()>,
 ) {
+    tracing::info!("handle_client: new client connected");
     let mut decoder = BytesFrameDecoder::new();
     let mut read_buffer = [0u8; 16 * 1024];
     loop {
@@ -166,7 +167,11 @@ async fn handle_client(
                         }
                     };
                     let output = dispatch(frame.message_type, frame.payload, &driver).await;
-                    if socket.write_all(&output).await.is_err() { return; }
+                    tracing::info!(response_len = output.len(), "sending response");
+                    if socket.write_all(&output).await.is_err() {
+                        tracing::warn!("client write failed, disconnecting");
+                        return;
+                    }
                 }
             }
             _ = shutdown.recv() => return,
@@ -179,6 +184,7 @@ async fn dispatch(
     payload: &[u8],
     driver: &SharedDriver,
 ) -> Vec<u8> {
+    tracing::info!(?message_type, payload_len = payload.len(), "dispatching request");
     let request = match Request::decode(message_type, payload) {
         Ok(request) => request,
         Err(error) => {
