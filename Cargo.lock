@@ -1318,6 +1318,7 @@ version = "0.1.0"
 dependencies = [
  "egui 0.29.1",
  "egui_overlay",
+ "glow",
  "ks-core",
  "mlua",
  "notify",

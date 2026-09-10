@@ -29,7 +29,7 @@ impl EguiOverlay for KernelScriptApp {
     fn gui_run(
         &mut self,
         ctx: &egui::Context,
-        _default_gfx_backend: &mut egui_overlay::egui_render_three_d::ThreeDBackend,
+        default_gfx_backend: &mut egui_overlay::egui_render_three_d::ThreeDBackend,
         glfw_backend: &mut GlfwBackend,
     ) {
         if !self.fullscreen_set {
@@ -51,7 +51,17 @@ impl EguiOverlay for KernelScriptApp {
         }
         if !self.fonts_installed {
             let _ = install_chinese_font(ctx);
+            // Make egui windows and panels transparent so the overlay shows through.
+            let mut style = (*ctx.style()).clone();
+            style.visuals.window_fill = egui::Color32::from_rgba_premultiplied(20, 20, 20, 200);
+            style.visuals.panel_fill = egui::Color32::from_rgba_premultiplied(20, 20, 20, 200);
+            ctx.set_style(style);
             self.fonts_installed = true;
+        }
+        // Set clear color to transparent black so the overlay background is invisible.
+        unsafe {
+            use glow::HasContext;
+            default_gfx_backend.glow_backend.glow_context.clear_color(0.0, 0.0, 0.0, 0.0);
         }
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             self.runtime.frame(ctx, Instant::now());
