@@ -28,7 +28,7 @@ impl EguiOverlay for KernelScriptApp {
     fn gui_run(
         &mut self,
         ctx: &egui::Context,
-        _default_gfx_backend: &mut ThreeDBackend,
+        default_gfx_backend: &mut ThreeDBackend,
         _glfw_backend: &mut GlfwBackend,
     ) {
         if !self.fonts_installed {
@@ -38,6 +38,14 @@ impl EguiOverlay for KernelScriptApp {
             style.visuals.panel_fill = egui::Color32::from_rgba_premultiplied(20, 20, 20, 200);
             ctx.set_style(style);
             self.fonts_installed = true;
+        }
+        // Transparent clear color so the overlay background is invisible.
+        unsafe {
+            use glow::HasContext;
+            default_gfx_backend
+                .glow_backend
+                .glow_context
+                .clear_color(0.0, 0.0, 0.0, 0.0);
         }
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             self.runtime.frame(ctx, Instant::now());
