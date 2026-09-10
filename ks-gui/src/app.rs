@@ -1,28 +1,39 @@
 use std::error::Error;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::Instant;
 
-use eframe::egui;
 use egui::FontFamily;
+use egui_overlay::egui_window_glfw_passthrough::GlfwBackend;
+use egui_overlay::EguiOverlay;
 
 use crate::lua_runtime::LuaRuntimeManager;
 
 struct KernelScriptApp {
     runtime: LuaRuntimeManager,
+    fonts_installed: bool,
 }
 
 impl KernelScriptApp {
-    fn new(cc: &eframe::CreationContext<'_>) -> Result<Self, Box<dyn Error>> {
-        install_chinese_font(&cc.egui_ctx)?;
+    fn new() -> Result<Self, Box<dyn Error>> {
         Ok(Self {
-            runtime: LuaRuntimeManager::new(PathBuf::from("scripts"))?,
+            runtime: LuaRuntimeManager::new(std::path::PathBuf::from("scripts"))?,
+            fonts_installed: false,
         })
     }
 }
 
-impl eframe::App for KernelScriptApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+impl EguiOverlay for KernelScriptApp {
+    fn gui_run(
+        &mut self,
+        ctx: &egui::Context,
+        _default_gfx_backend: &mut egui_overlay::egui_render_three_d::ThreeDBackend,
+        _glfw_backend: &mut GlfwBackend,
+    ) {
+        if !self.fonts_installed {
+            let _ = install_chinese_font(ctx);
+            self.fonts_installed = true;
+        }
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             self.runtime.frame(ctx, Instant::now());
         }));
@@ -31,28 +42,13 @@ impl eframe::App for KernelScriptApp {
             self.runtime
                 .set_error("GUI frame callback panicked".to_owned());
         }
-        ctx.request_repaint();
     }
 }
 
 pub fn run() -> Result<(), Box<dyn Error>> {
     let _ = tracing_subscriber::fmt().with_target(false).try_init();
-    let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_title("Kernel Script")
-            .with_inner_size([1200.0, 800.0]),
-        ..Default::default()
-    };
-    eframe::run_native(
-        "Kernel Script",
-        options,
-        Box::new(|creation_context| {
-            Box::new(
-                KernelScriptApp::new(creation_context)
-                    .expect("failed to initialize Kernel Script GUI"),
-            )
-        }),
-    )?;
+    let app = KernelScriptApp::new()?;
+    egui_overlay::start(app);
     Ok(())
 }
 

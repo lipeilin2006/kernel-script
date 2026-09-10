@@ -16,6 +16,8 @@ rust-version = "1.85"
 [workspace.dependencies]
 ks-core = { path = "ks-core", default-features = false }
 
+egui_overlay = { version = "0.9.0", default-features = false, features = ["egui_default", "glfw_default", "three_d"] }
+egui = { version = "0.29", default-features = false }
 eframe = { version = "0.27.2", default-features = false, features = ["default_fonts", "glow"] }
 windows-sys = "0.61.2"
 windows-service = "0.8.1"
@@ -32,7 +34,7 @@ rfd = "0.14.1"
 [profile.release]
 opt-level = 3
 lto = true
-panic = "unwind"
+panic = "abort"
 
 [profile.dev]
 panic = "abort"

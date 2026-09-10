@@ -6,7 +6,7 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime};
 
-use eframe::egui;
+use egui;
 use mlua::debug::HookTriggers;
 use mlua::{FromLua, Function, IntoLuaMulti, Lua, Table, Value, VmState};
 

@@ -6,7 +6,8 @@ rust-version.workspace = true
 
 [dependencies]
 ks-core = { workspace = true, features = ["alloc"] }
-eframe.workspace = true
+egui_overlay.workspace = true
+egui.workspace = true
 mlua.workspace = true
 notify.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "net", "io-util", "sync", "time"] }
