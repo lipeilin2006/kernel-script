@@ -308,10 +308,97 @@ shared.delete("selected_pid")
 
 Key limit: 128 bytes.
 
+## Window Rect API
+
+### memory.get_window_rect
+
+Synchronously queries all visible windows belonging to a given PID. Returns a
+Lua table (list of window rects) or `nil` if no windows are found.
+
+Each window rect contains:
+
+```lua
+{ x = 100, y = 50, width = 800, height = 600 }
+```
+
+Coordinates are in egui logical points (physical pixels divided by
+`content_scale`). Use this for overlay rendering with `draw.*`.
+
+```lua
+local rects = memory.get_window_rect(pid)
+if rects then
+    for i, r in ipairs(rects) do
+        print(r.x, r.y, r.width, r.height)
+    end
+end
+```
+
+Implementation: runs `EnumWindows` in the GUI process (user session), then
+uses `DwmGetWindowAttribute(DWMWA_EXTENDED_FRAME_BOUNDS)` for accurate
+rects with fallback to `GetWindowRect`.
+
+Constraints: requires `pid` as a positive integer.
+
+## Draw API
+
+Draw commands render on the transparent fullscreen overlay window. All draw
+calls must be made inside `OnRender`. Coordinates are in egui logical points
+(physical pixels divided by `content_scale`).
+
+Colors are RGBA bytes (`0..255`).
+
+### draw.line
+
+Draws a line segment.
+
+```lua
+draw.line(x1, y1, x2, y2, r, g, b, a, thickness)
+```
+
+### draw.rect
+
+Draws a rectangle outline.
+
+```lua
+draw.rect(x, y, width, height, r, g, b, a, thickness)
+```
+
+### draw.filled_rect
+
+Draws a filled rectangle.
+
+```lua
+draw.filled_rect(x, y, width, height, r, g, b, a)
+```
+
+### draw.circle
+
+Draws a circle outline.
+
+```lua
+draw.circle(x, y, radius, r, g, b, a, thickness)
+```
+
+### draw.filled_circle
+
+Draws a filled circle.
+
+```lua
+draw.filled_circle(x, y, radius, r, g, b, a)
+```
+
+### draw.text
+
+Draws text at a position. `size` is font size in logical points.
+
+```lua
+draw.text(x, y, "Hello", r, g, b, a, size)
+```
+
 ## egui UI API
 
-UI APIs are called inside `OnRender`. The GUI uses `eframe + egui + glow`
-(OpenGL backend).
+UI APIs are called inside `OnRender`. The GUI uses `egui_overlay` with GLFW
+window and `glow` OpenGL backend for transparent fullscreen overlay rendering.
 
 ### ui.window
 
@@ -488,39 +575,67 @@ ui.add_space(8)
 
 ## Complete Example
 
+### Poll Pattern (Recommended)
+
 ```lua
 local state = {
     process_name = "notepad.exe",
     pid = 0,
-    address = "0x1407FFF0",
-    value = nil,
-    status = "Ready"
+    pid_task = nil,
+    base = 0,
+    base_task = nil,
+    rects = nil,
+    status = "Ready",
 }
 
-start_async(function()
-    local ok, result = pcall(function()
-        state.pid = await_async(memory.async_get_pid(state.process_name))
-        shared.set("selected_pid", state.pid)
-        state.value = await_async(
-            memory.async_read_i32(state.pid, state.address)
-        )
-        state.status = "Read completed"
-    end)
-    if not ok then
-        state.status = "Failed: " .. tostring(result)
+function OnUpdate(dt)
+    if state.pid_task then
+        local result = memory.poll_async(state.pid_task)
+        if result then
+            state.pid_task = nil
+            if result.error then
+                state.status = "Failed: " .. result.error
+            else
+                state.pid = result.value
+                shared.set("selected_pid", state.pid)
+                state.base_task = memory.async_get_process_base(state.pid)
+            end
+        end
     end
-end)
+
+    if state.base_task then
+        local result = memory.poll_async(state.base_task)
+        if result then
+            state.base_task = nil
+            if result.error then
+                state.status = "Base failed: " .. result.error
+            else
+                state.base = result.value
+                state.status = string.format("Attached 0x%X", state.base)
+                state.rects = memory.get_window_rect(state.pid)
+            end
+        end
+    end
+end
 
 function OnRender()
     ui.window("Kernel Script", function()
+        if ui.button("Attach") and not state.pid_task then
+            state.pid_task = memory.async_get_pid(state.process_name)
+            state.status = "Looking up " .. state.process_name .. "..."
+        end
         state.process_name = select(
             1, ui.text_edit(state.process_name, false, false, false)
         )
-        state.pid = select(1, ui.drag_value_u64("PID", state.pid))
-        state.address = select(1, ui.text_edit(state.address, false, false, false))
-        ui.label("Value: " .. tostring(state.value))
         ui.label("Status: " .. state.status)
+        ui.monospace(string.format("pid=%s base=0x%X", tostring(state.pid), state.base))
     end)
+
+    if state.rects then
+        for _, r in ipairs(state.rects) do
+            draw.rect(r.x - 2, r.y - 2, r.width + 4, r.height + 4, 255, 0, 0, 200, 3.0)
+        end
+    end
 end
 ```
 
@@ -533,6 +648,10 @@ end
 - Single memory read/write limit: 256 bytes.
 - Process list is enumerated in user mode by the service.
 - Memory read/write and RVA computation are performed by the driver.
+- Window rect enumeration runs in the GUI process (user session).
+- Draw commands must be called inside `OnRender`.
+- Coordinates are in egui logical points; divide physical pixels by
+  `content_scale` for correct overlay alignment.
 - Transport uses the `\\.\pipe\KernelScript` Named Pipe.
 - Named Pipe and driver device access are controlled by Windows security
   descriptors.

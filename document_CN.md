@@ -303,10 +303,96 @@ shared.delete("selected_pid")
 
 共享 key 最大为 128 字节。
 
+## 窗口查询 API
+
+### memory.get_window_rect
+
+同步查询指定 PID 的所有可见窗口。返回 Lua 表（窗口矩形列表），找不到
+窗口时返回 `nil`。
+
+每个窗口矩形包含：
+
+```lua
+{ x = 100, y = 50, width = 800, height = 600 }
+```
+
+坐标单位为 egui 逻辑点（物理像素除以 `content_scale`）。用于 `draw.*`
+覆盖层渲染。
+
+```lua
+local rects = memory.get_window_rect(pid)
+if rects then
+    for i, r in ipairs(rects) do
+        print(r.x, r.y, r.width, r.height)
+    end
+end
+```
+
+实现方式：在 GUI 进程（用户会话）中运行 `EnumWindows`，使用
+`DwmGetWindowAttribute(DWMWA_EXTENDED_FRAME_BOUNDS)` 获取精确窗口位置，
+失败时回退到 `GetWindowRect`。
+
+约束：`pid` 必须为正整数。
+
+## Draw API
+
+Draw 命令在透明全屏覆盖窗口上渲染。所有 draw 调用必须在 `OnRender` 中
+执行。坐标单位为 egui 逻辑点（物理像素除以 `content_scale`）。
+
+颜色为 RGBA 字节（`0..255`）。
+
+### draw.line
+
+绘制线段。
+
+```lua
+draw.line(x1, y1, x2, y2, r, g, b, a, thickness)
+```
+
+### draw.rect
+
+绘制矩形边框。
+
+```lua
+draw.rect(x, y, width, height, r, g, b, a, thickness)
+```
+
+### draw.filled_rect
+
+绘制填充矩形。
+
+```lua
+draw.filled_rect(x, y, width, height, r, g, b, a)
+```
+
+### draw.circle
+
+绘制圆形边框。
+
+```lua
+draw.circle(x, y, radius, r, g, b, a, thickness)
+```
+
+### draw.filled_circle
+
+绘制填充圆形。
+
+```lua
+draw.filled_circle(x, y, radius, r, g, b, a)
+```
+
+### draw.text
+
+在指定位置绘制文字。`size` 为逻辑点字体大小。
+
+```lua
+draw.text(x, y, "你好", r, g, b, a, size)
+```
+
 ## egui UI API
 
-Lua UI API 在 `OnRender` 中使用。GUI 当前使用 `eframe + egui + glow`
-OpenGL backend。
+Lua UI API 在 `OnRender` 中使用。GUI 当前使用 `egui_overlay` + GLFW 窗口 +
+`glow` OpenGL backend 实现透明全屏覆盖层渲染。
 
 ### ui.window
 
@@ -486,39 +572,67 @@ ui.add_space(8)
 
 ## Complete Example
 
+### 轮询模式（推荐）
+
 ```lua
 local state = {
     process_name = "notepad.exe",
     pid = 0,
-    address = "0x1407FFF0",
-    value = nil,
-    status = "Ready"
+    pid_task = nil,
+    base = 0,
+    base_task = nil,
+    rects = nil,
+    status = "就绪",
 }
 
-start_async(function()
-    local ok, result = pcall(function()
-        state.pid = await_async(memory.async_get_pid(state.process_name))
-        shared.set("selected_pid", state.pid)
-        state.value = await_async(
-            memory.async_read_i32(state.pid, state.address)
-        )
-        state.status = "Read completed"
-    end)
-    if not ok then
-        state.status = "Failed: " .. tostring(result)
+function OnUpdate(dt)
+    if state.pid_task then
+        local result = memory.poll_async(state.pid_task)
+        if result then
+            state.pid_task = nil
+            if result.error then
+                state.status = "失败: " .. result.error
+            else
+                state.pid = result.value
+                shared.set("selected_pid", state.pid)
+                state.base_task = memory.async_get_process_base(state.pid)
+            end
+        end
     end
-end)
+
+    if state.base_task then
+        local result = memory.poll_async(state.base_task)
+        if result then
+            state.base_task = nil
+            if result.error then
+                state.status = "基址失败: " .. result.error
+            else
+                state.base = result.value
+                state.status = string.format("已附加 0x%X", state.base)
+                state.rects = memory.get_window_rect(state.pid)
+            end
+        end
+    end
+end
 
 function OnRender()
     ui.window("Kernel Script", function()
+        if ui.button("附加") and not state.pid_task then
+            state.pid_task = memory.async_get_pid(state.process_name)
+            state.status = "正在查找 " .. state.process_name .. "..."
+        end
         state.process_name = select(
             1, ui.text_edit(state.process_name, false, false, false)
         )
-        state.pid = select(1, ui.drag_value_u64("PID", state.pid))
-        state.address = select(1, ui.text_edit(state.address, false, false, false))
-        ui.label("Value: " .. tostring(state.value))
-        ui.label("Status: " .. state.status)
+        ui.label("状态: " .. state.status)
+        ui.monospace(string.format("pid=%s base=0x%X", tostring(state.pid), state.base))
     end)
+
+    if state.rects then
+        for _, r in ipairs(state.rects) do
+            draw.rect(r.x - 2, r.y - 2, r.width + 4, r.height + 4, 255, 0, 0, 200, 3.0)
+        end
+    end
 end
 ```
 
@@ -531,5 +645,8 @@ end
 - 单次内存读写最多 256 字节。
 - 进程列表由 service 在用户态枚举。
 - 内存读写和 RVA 计算由 driver 执行。
+- 窗口枚举在 GUI 进程（用户会话）中执行。
+- Draw 命令必须在 `OnRender` 中调用。
+- 坐标单位为 egui 逻辑点；物理像素需除以 `content_scale` 才能正确对齐。
 - 服务传输使用 `\\.\pipe\KernelScript` Named Pipe。
 - Named Pipe 和 driver device 的权限由 Windows 安全描述符控制。
