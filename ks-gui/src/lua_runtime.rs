@@ -207,9 +207,6 @@ enum AsyncRequest {
         data: Vec<u8>,
     },
     ListProcesses,
-    GetWindowRect {
-        process_name: String,
-    },
 }
 
 enum AsyncValue {
@@ -217,7 +214,6 @@ enum AsyncValue {
     Bytes(Vec<u8>),
     Pid(u64),
     Processes(Vec<crate::ipc_client::ProcessInfo>),
-    WindowRectList(Vec<(i32, i32, i32, i32)>),
     Unit,
 }
 
@@ -321,10 +317,6 @@ impl AsyncScheduler {
                 .await
                 .map(|()| AsyncValue::Unit),
             AsyncRequest::ListProcesses => client.list_processes().await.map(AsyncValue::Processes),
-            AsyncRequest::GetWindowRect { process_name } => client
-                .get_window_rect(&process_name)
-                .await
-                .map(AsyncValue::WindowRectList),
         }
     }
 
@@ -1553,19 +1545,27 @@ fn register_memory_api(lua: &Lua, async_scheduler: AsyncScheduler) -> mlua::Resu
         )?;
     }
 
-    {
-        let scheduler = async_scheduler.clone();
-        module.set(
-            "async_get_window_rect",
-            lua.create_function(move |_, name: String| {
-                scheduler
-                    .submit(AsyncRequest::GetWindowRect {
-                        process_name: name,
-                    })
-                    .map_err(mlua::Error::external)
-            })?,
-        )?;
-    }
+    module.set(
+        "get_window_rect",
+        lua.create_function(|lua, pid: u64| -> mlua::Result<Option<mlua::Table>> {
+            let pid32 = u32::try_from(pid).map_err(|_| mlua::Error::runtime("PID too large"))?;
+            let rects = crate::window_util::get_window_rects_by_pid(pid32);
+            if rects.is_empty() {
+                return Ok(None);
+            }
+            let scale = CONTENT_SCALE.load(Ordering::Relaxed) as f32 / 100.0;
+            let list = lua.create_table()?;
+            for (i, r) in rects.into_iter().enumerate() {
+                let t = lua.create_table()?;
+                t.set("x", r.x as f32 / scale)?;
+                t.set("y", r.y as f32 / scale)?;
+                t.set("width", r.width as f32 / scale)?;
+                t.set("height", r.height as f32 / scale)?;
+                list.set(i + 1, t)?;
+            }
+            Ok(Some(list))
+        })?,
+    )?;
 
     {
         let scheduler = async_scheduler.clone();
@@ -1597,19 +1597,6 @@ fn register_memory_api(lua: &Lua, async_scheduler: AsyncScheduler) -> mlua::Resu
                             processes.set(index + 1, process)?;
                         }
                         output.set("value", processes)?;
-                    }
-                    Ok(AsyncValue::WindowRectList(rects)) => {
-                        let scale = CONTENT_SCALE.load(Ordering::Relaxed) as f32 / 100.0;
-                        let list = lua.create_table()?;
-                        for (i, (x, y, w, h)) in rects.into_iter().enumerate() {
-                            let rect = lua.create_table()?;
-                            rect.set("x", x as f32 / scale)?;
-                            rect.set("y", y as f32 / scale)?;
-                            rect.set("width", w as f32 / scale)?;
-                            rect.set("height", h as f32 / scale)?;
-                            list.set(i + 1, rect)?;
-                        }
-                        output.set("value", list)?;
                     }
                     Ok(AsyncValue::Unit) => {}
                     Err(error) => {

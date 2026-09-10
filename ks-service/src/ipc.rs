@@ -301,17 +301,6 @@ async fn dispatch(
                 data: data.to_vec(),
             }
         }
-        Request::GetWindowRect { name } => {
-            let Ok(name) = core::str::from_utf8(name) else {
-                return encode_response(Response::Error(1));
-            };
-            if name.is_empty() || name.len() > 255 || name.bytes().any(|byte| byte == 0) {
-                return encode_response(Response::Error(1));
-            }
-            OwnedRequest::GetWindowRect {
-                name: name.to_owned(),
-            }
-        }
     };
     let driver = Arc::clone(driver);
     tokio::task::spawn_blocking(move || {
@@ -452,24 +441,6 @@ async fn dispatch(
                     }
                 }
             }
-            OwnedRequest::GetWindowRect { name } => match process::get_window_rects(&name) {
-                Ok(rects) => {
-                    let mut payload =
-                        Vec::with_capacity(4 + rects.len() * 16);
-                    payload.extend_from_slice(&(rects.len() as u32).to_le_bytes());
-                    for r in &rects {
-                        payload.extend_from_slice(&r.x.to_le_bytes());
-                        payload.extend_from_slice(&r.y.to_le_bytes());
-                        payload.extend_from_slice(&r.width.to_le_bytes());
-                        payload.extend_from_slice(&r.height.to_le_bytes());
-                    }
-                    encode_response(Response::WindowRectList(&payload))
-                }
-                Err(error) => {
-                    tracing::warn!(window = %name, %error, "window rect lookup failed");
-                    encode_response(Response::Error(11))
-                }
-            },
         }
     })
     .await
@@ -538,9 +509,6 @@ enum OwnedRequest {
         pid: u64,
         target_address: u64,
         data: Vec<u8>,
-    },
-    GetWindowRect {
-        name: String,
     },
 }
 
