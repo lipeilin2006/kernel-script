@@ -12,6 +12,34 @@ use egui_overlay::EguiOverlay;
 
 use crate::lua_runtime::LuaRuntimeManager;
 
+#[cfg(target_os = "windows")]
+mod win32 {
+    use std::ffi::c_void;
+
+    #[repr(C)]
+    pub struct MARGINS {
+        pub cx_left_width: i32,
+        pub cx_right_width: i32,
+        pub cy_top_height: i32,
+        pub cy_bottom_height: i32,
+    }
+
+    #[link(name = "dwmapi")]
+    extern "system" {
+        pub fn DwmExtendFrameIntoClientArea(hwnd: *mut c_void, margins: *const MARGINS) -> i32;
+    }
+
+    pub unsafe fn enable_dwm_transparency(hwnd: *mut c_void) {
+        let margins = MARGINS {
+            cx_left_width: -1,
+            cx_right_width: -1,
+            cy_top_height: -1,
+            cy_bottom_height: -1,
+        };
+        DwmExtendFrameIntoClientArea(hwnd, &margins);
+    }
+}
+
 struct KernelScriptApp {
     runtime: LuaRuntimeManager,
     fonts_installed: bool,
@@ -86,8 +114,16 @@ pub fn run() -> Result<(), Box<dyn Error>> {
     });
 
     let [w, h] = monitor_size.get();
+    let h = h - 10;
     glfw_backend.window.set_size(w as i32, h as i32);
     glfw_backend.window.set_pos(0, 0);
+
+    #[cfg(target_os = "windows")]
+    unsafe {
+        use glfw_passthrough::glfw::ffi::glfwGetWin32Window;
+        let hwnd = glfwGetWin32Window(&mut glfw_backend.window as *mut _ as *mut _);
+        win32::enable_dwm_transparency(hwnd as *mut _);
+    }
 
     let fb_size = glfw_backend.window.get_framebuffer_size();
     let latest_size = [fb_size.0 as _, fb_size.1 as _];
