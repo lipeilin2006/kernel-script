@@ -12,6 +12,7 @@ use crate::lua_runtime::LuaRuntimeManager;
 struct KernelScriptApp {
     runtime: LuaRuntimeManager,
     fonts_installed: bool,
+    fullscreen_set: bool,
 }
 
 impl KernelScriptApp {
@@ -19,6 +20,7 @@ impl KernelScriptApp {
         Ok(Self {
             runtime: LuaRuntimeManager::new(std::path::PathBuf::from("scripts"))?,
             fonts_installed: false,
+            fullscreen_set: false,
         })
     }
 }
@@ -28,8 +30,25 @@ impl EguiOverlay for KernelScriptApp {
         &mut self,
         ctx: &egui::Context,
         _default_gfx_backend: &mut egui_overlay::egui_render_three_d::ThreeDBackend,
-        _glfw_backend: &mut GlfwBackend,
+        glfw_backend: &mut GlfwBackend,
     ) {
+        if !self.fullscreen_set {
+            glfw_backend.glfw.with_primary_monitor(|_, monitor| {
+                if let Some(monitor) = monitor {
+                    if let Some(mode) = monitor.get_video_mode() {
+                        glfw_backend.window.set_monitor(
+                            egui_overlay::egui_window_glfw_passthrough::glfw::WindowMode::FullScreen(monitor),
+                            0,
+                            0,
+                            mode.width as u32,
+                            mode.height as u32,
+                            Some(mode.refresh_rate),
+                        );
+                    }
+                }
+            });
+            self.fullscreen_set = true;
+        }
         if !self.fonts_installed {
             let _ = install_chinese_font(ctx);
             self.fonts_installed = true;
