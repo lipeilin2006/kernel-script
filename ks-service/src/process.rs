@@ -1,11 +1,14 @@
+use std::ffi::c_void;
 use std::fmt;
+use std::mem::size_of;
 
 use windows_sys::Win32::Foundation::{CloseHandle, HWND, INVALID_HANDLE_VALUE, RECT};
+use windows_sys::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_EXTENDED_FRAME_BOUNDS};
 use windows_sys::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    EnumWindows, GetWindowThreadProcessId, IsWindowVisible,
+    EnumWindows, GetWindowLongW, GetWindowThreadProcessId, IsWindowVisible, GWL_STYLE, WS_VISIBLE,
 };
 
 #[derive(Clone, Debug)]
@@ -14,6 +17,14 @@ pub struct ProcessInfo {
     pub parent_pid: u32,
     pub thread_count: u32,
     pub name: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct WindowRect {
+    pub x: i32,
+    pub y: i32,
+    pub width: i32,
+    pub height: i32,
 }
 
 #[derive(Debug)]
@@ -98,70 +109,63 @@ fn last_error() -> u32 {
 
 struct EnumCtx {
     target_pid: u32,
-    found_hwnd: HWND,
-    found_any_hwnd: HWND,
+    hwnds: Vec<HWND>,
 }
 
-pub fn get_window_rect(process_name: &str) -> Result<(i32, i32, i32, i32), ProcessError> {
+pub fn get_window_rects(process_name: &str) -> Result<Vec<WindowRect>, ProcessError> {
     let pid = find_pid(process_name)?;
-    tracing::info!(pid, "get_window_rect: searching for windows");
     let mut ctx = EnumCtx {
         target_pid: pid as u32,
-        found_hwnd: std::ptr::null_mut(),
-        found_any_hwnd: std::ptr::null_mut(),
+        hwnds: Vec::new(),
     };
-    let ok = unsafe {
-        EnumWindows(Some(enum_windows_callback), &mut ctx as *mut EnumCtx as isize)
-    };
-    if ok == 0 {
-        tracing::warn!("EnumWindows failed, GetLastError={}", last_error());
+    unsafe {
+        EnumWindows(Some(enum_windows_callback), &mut ctx as *mut EnumCtx as isize);
     }
-    let hwnd = if !ctx.found_hwnd.is_null() {
-        tracing::info!("found visible window");
-        ctx.found_hwnd
-    } else if !ctx.found_any_hwnd.is_null() {
-        tracing::info!("no visible window, using first window found");
-        ctx.found_any_hwnd
-    } else {
-        tracing::warn!("no window found at all for pid={}", pid);
-        return Err(ProcessError::WindowNotFound);
-    };
-    let mut rect = RECT {
-        left: 0,
-        top: 0,
-        right: 0,
-        bottom: 0,
-    };
-    let ok = unsafe {
-        windows_sys::Win32::UI::WindowsAndMessaging::GetWindowRect(hwnd, &mut rect)
-    };
-    if ok == 0 {
-        tracing::warn!("GetWindowRect failed");
+    if ctx.hwnds.is_empty() {
         return Err(ProcessError::WindowNotFound);
     }
-    Ok((
-        rect.left,
-        rect.top,
-        rect.right - rect.left,
-        rect.bottom - rect.top,
-    ))
+    let mut rects = Vec::with_capacity(ctx.hwnds.len());
+    for hwnd in ctx.hwnds {
+        if let Some(rect) = unsafe { get_accurate_rect(hwnd) } {
+            rects.push(rect);
+        }
+    }
+    if rects.is_empty() {
+        return Err(ProcessError::WindowNotFound);
+    }
+    Ok(rects)
 }
 
 unsafe extern "system" fn enum_windows_callback(hwnd: HWND, lparam: isize) -> i32 {
     let ctx = &mut *(lparam as *mut EnumCtx);
     let mut window_pid = 0u32;
     GetWindowThreadProcessId(hwnd, &mut window_pid);
-    if window_pid == ctx.target_pid {
-        if ctx.found_any_hwnd.is_null() {
-            ctx.found_any_hwnd = hwnd;
-        }
-        if !ctx.found_hwnd.is_null() {
-            return 1;
-        }
-        if IsWindowVisible(hwnd) != 0 {
-            ctx.found_hwnd = hwnd;
-            return 0;
+    if window_pid == ctx.target_pid && IsWindowVisible(hwnd) != 0 {
+        let style = GetWindowLongW(hwnd, GWL_STYLE) as u32;
+        if (style & WS_VISIBLE) != 0 {
+            ctx.hwnds.push(hwnd);
         }
     }
     1
+}
+
+unsafe fn get_accurate_rect(hwnd: HWND) -> Option<WindowRect> {
+    let mut rect: RECT = std::mem::zeroed();
+    let hr = DwmGetWindowAttribute(
+        hwnd,
+        DWMWA_EXTENDED_FRAME_BOUNDS as u32,
+        &mut rect as *mut RECT as *mut c_void,
+        size_of::<RECT>() as u32,
+    );
+    if hr != 0 {
+        if windows_sys::Win32::UI::WindowsAndMessaging::GetWindowRect(hwnd, &mut rect) == 0 {
+            return None;
+        }
+    }
+    Some(WindowRect {
+        x: rect.left,
+        y: rect.top,
+        width: rect.right - rect.left,
+        height: rect.bottom - rect.top,
+    })
 }

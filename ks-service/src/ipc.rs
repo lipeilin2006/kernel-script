@@ -452,13 +452,19 @@ async fn dispatch(
                     }
                 }
             }
-            OwnedRequest::GetWindowRect { name } => match process::get_window_rect(&name) {
-                Ok(rect) => encode_response(Response::WindowRect {
-                    x: rect.0,
-                    y: rect.1,
-                    width: rect.2,
-                    height: rect.3,
-                }),
+            OwnedRequest::GetWindowRect { name } => match process::get_window_rects(&name) {
+                Ok(rects) => {
+                    let mut payload =
+                        Vec::with_capacity(4 + rects.len() * 16);
+                    payload.extend_from_slice(&(rects.len() as u32).to_le_bytes());
+                    for r in &rects {
+                        payload.extend_from_slice(&r.x.to_le_bytes());
+                        payload.extend_from_slice(&r.y.to_le_bytes());
+                        payload.extend_from_slice(&r.width.to_le_bytes());
+                        payload.extend_from_slice(&r.height.to_le_bytes());
+                    }
+                    encode_response(Response::WindowRectList(&payload))
+                }
                 Err(error) => {
                     tracing::warn!(window = %name, %error, "window rect lookup failed");
                     encode_response(Response::Error(11))

@@ -20,7 +20,7 @@ enum OwnedResponse {
     WriteComplete,
     Error(u32),
     ErrorDetail(String),
-    WindowRect(i32, i32, i32, i32),
+    WindowRectList(Vec<(i32, i32, i32, i32)>),
 }
 
 #[derive(Clone, Debug)]
@@ -103,12 +103,22 @@ impl IpcClient {
             Response::ErrorDetail(detail) => Ok(OwnedResponse::ErrorDetail(
                 String::from_utf8_lossy(detail).into_owned(),
             )),
-            Response::WindowRect {
-                x,
-                y,
-                width,
-                height,
-            } => Ok(OwnedResponse::WindowRect(x, y, width, height)),
+            Response::WindowRectList(payload) => {
+                if payload.len() < 4 || (payload.len() - 4) % 16 != 0 {
+                    return Err("invalid WindowRectList payload".into());
+                }
+                let count = u32::from_le_bytes(payload[..4].try_into().unwrap()) as usize;
+                let mut rects = Vec::with_capacity(count);
+                for i in 0..count {
+                    let base = 4 + i * 16;
+                    let x = i32::from_le_bytes(payload[base..base + 4].try_into().unwrap());
+                    let y = i32::from_le_bytes(payload[base + 4..base + 8].try_into().unwrap());
+                    let w = i32::from_le_bytes(payload[base + 8..base + 12].try_into().unwrap());
+                    let h = i32::from_le_bytes(payload[base + 12..base + 16].try_into().unwrap());
+                    rects.push((x, y, w, h));
+                }
+                Ok(OwnedResponse::WindowRectList(rects))
+            }
         }
     }
 
@@ -309,7 +319,7 @@ impl IpcClient {
     pub async fn get_window_rect(
         &self,
         process_name: &str,
-    ) -> Result<(i32, i32, i32, i32), String> {
+    ) -> Result<Vec<(i32, i32, i32, i32)>, String> {
         let name = process_name.trim();
         if name.is_empty() || name.len() > 255 || name.bytes().any(|byte| byte == 0) {
             return Err("process name must be 1..255 bytes and contain no NUL".into());
@@ -320,7 +330,7 @@ impl IpcClient {
             })
             .await?
         {
-            OwnedResponse::WindowRect(x, y, w, h) => Ok((x, y, w, h)),
+            OwnedResponse::WindowRectList(rects) => Ok(rects),
             OwnedResponse::Error(code) => Err(format!("service error: {code}")),
             OwnedResponse::ErrorDetail(detail) => Err(detail),
             _ => Err("unexpected response".into()),

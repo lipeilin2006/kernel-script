@@ -11,6 +11,7 @@ bytes.workspace = true
 windows-service.workspace = true
 windows-sys = { workspace = true, features = [
     "Win32_Foundation",
+    "Win32_Graphics_Dwm",
     "Win32_System_WindowsProgramming",
     "Win32_System_IO",
     "Win32_System_Ioctl",
@@ -21,6 +22,7 @@ windows-sys = { workspace = true, features = [
     "Win32_System_Pipes",
     "Win32_System_Diagnostics_ToolHelp",
     "Win32_Security_Authorization",
+    "Win32_UI_WindowsAndMessaging",
 ] }
 tracing.workspace = true
 tracing-subscriber.workspace = true
