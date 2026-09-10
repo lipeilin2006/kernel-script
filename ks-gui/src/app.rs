@@ -4,7 +4,8 @@ use std::path::Path;
 use std::time::Instant;
 
 use egui::FontFamily;
-use egui_overlay::egui_window_glfw_passthrough::GlfwBackend;
+use egui_overlay::egui_render_three_d::{ThreeDConfig, ThreeDBackend};
+use egui_overlay::egui_window_glfw_passthrough::{self as glfw_passthrough, GlfwBackend, GlfwConfig};
 use egui_overlay::EguiOverlay;
 
 use crate::lua_runtime::LuaRuntimeManager;
@@ -12,7 +13,6 @@ use crate::lua_runtime::LuaRuntimeManager;
 struct KernelScriptApp {
     runtime: LuaRuntimeManager,
     fonts_installed: bool,
-    fullscreen_set: bool,
 }
 
 impl KernelScriptApp {
@@ -20,7 +20,6 @@ impl KernelScriptApp {
         Ok(Self {
             runtime: LuaRuntimeManager::new(std::path::PathBuf::from("scripts"))?,
             fonts_installed: false,
-            fullscreen_set: false,
         })
     }
 }
@@ -29,39 +28,16 @@ impl EguiOverlay for KernelScriptApp {
     fn gui_run(
         &mut self,
         ctx: &egui::Context,
-        default_gfx_backend: &mut egui_overlay::egui_render_three_d::ThreeDBackend,
-        glfw_backend: &mut GlfwBackend,
+        _default_gfx_backend: &mut ThreeDBackend,
+        _glfw_backend: &mut GlfwBackend,
     ) {
-        if !self.fullscreen_set {
-            glfw_backend.glfw.with_primary_monitor(|_, monitor| {
-                if let Some(monitor) = monitor {
-                    if let Some(mode) = monitor.get_video_mode() {
-                        glfw_backend.window.set_monitor(
-                            egui_overlay::egui_window_glfw_passthrough::glfw::WindowMode::Windowed,
-                            0,
-                            0,
-                            mode.width as u32,
-                            mode.height as u32,
-                            Some(mode.refresh_rate),
-                        );
-                    }
-                }
-            });
-            self.fullscreen_set = true;
-        }
         if !self.fonts_installed {
             let _ = install_chinese_font(ctx);
-            // Make egui windows and panels transparent so the overlay shows through.
             let mut style = (*ctx.style()).clone();
             style.visuals.window_fill = egui::Color32::from_rgba_premultiplied(20, 20, 20, 200);
             style.visuals.panel_fill = egui::Color32::from_rgba_premultiplied(20, 20, 20, 200);
             ctx.set_style(style);
             self.fonts_installed = true;
-        }
-        // Set clear color to transparent black so the overlay background is invisible.
-        unsafe {
-            use glow::HasContext;
-            default_gfx_backend.glow_backend.glow_context.clear_color(0.0, 0.0, 0.0, 0.0);
         }
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             self.runtime.frame(ctx, Instant::now());
@@ -76,8 +52,40 @@ impl EguiOverlay for KernelScriptApp {
 
 pub fn run() -> Result<(), Box<dyn Error>> {
     let _ = tracing_subscriber::fmt().with_target(false).try_init();
+
+    let mut glfw_backend = GlfwBackend::new(GlfwConfig {
+        size: [1920, 1080],
+        transparent_window: Some(true),
+        opengl_window: Some(true),
+        glfw_callback: Box::new(|gtx| {
+            (glfw_passthrough::GlfwConfig::default().glfw_callback)(gtx);
+            gtx.window_hint(glfw_passthrough::glfw::WindowHint::ScaleToMonitor(true));
+        }),
+        window_callback: Box::new(|window: &mut glfw_passthrough::glfw::Window| {
+            window.set_floating(true);
+            window.set_decorated(false);
+            window.set_pos(0, 0);
+        }),
+        ..Default::default()
+    });
+
+    let fb_size = glfw_backend.window.get_framebuffer_size();
+    let latest_size = [fb_size.0 as _, fb_size.1 as _];
+
+    let default_gfx_backend = ThreeDBackend::new(
+        ThreeDConfig::default(),
+        |s| glfw_backend.get_proc_address(s),
+        latest_size,
+    );
+
     let app = KernelScriptApp::new()?;
-    egui_overlay::start(app);
+    let overlap_app = egui_overlay::OverlayApp {
+        user_data: app,
+        egui_context: Default::default(),
+        default_gfx_backend,
+        glfw_backend,
+    };
+    overlap_app.enter_event_loop();
     Ok(())
 }
 
