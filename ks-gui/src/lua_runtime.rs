@@ -1582,6 +1582,22 @@ fn register_memory_api(lua: &Lua, async_scheduler: AsyncScheduler) -> mlua::Resu
     }
 
     module.set(
+        "batch_offset",
+        lua.create_function(|lua, sizes: mlua::Table| -> mlua::Result<mlua::Table> {
+            let count = sizes.len()? as usize;
+            let offsets = lua.create_table()?;
+            let mut acc = 0u64;
+            for i in 1..=count {
+                offsets.set(i, acc)?;
+                let size: u64 = sizes.get(i)?;
+                acc += size;
+            }
+            offsets.set("total", acc)?;
+            Ok(offsets)
+        })?,
+    )?;
+
+    module.set(
         "get_window_rect",
         lua.create_function(|lua, pid: u64| -> mlua::Result<Option<mlua::Table>> {
             let pid32 = u32::try_from(pid).map_err(|_| mlua::Error::runtime("PID too large"))?;

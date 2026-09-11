@@ -515,7 +515,7 @@ pub fn batch_read_memory(
     }
 
     let mut bytes_returned = 0u32;
-    let output_size = entries.iter().map(|&(_, s)| 4 + s as usize).sum::<usize>();
+    let output_size = entries.iter().map(|&(_, s)| s as usize).sum::<usize>();
     let mut output = vec![0u8; output_size];
 
     let result = unsafe {
