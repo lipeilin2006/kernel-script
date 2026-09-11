@@ -639,6 +639,23 @@ function OnRender()
 end
 ```
 
+## IPC Batch Pipeline
+
+The GUI-to-service IPC uses a batch pipeline for high throughput:
+
+1. **GUI side**: The `connection_task` drains all pending requests from the
+   `mpsc` channel and writes them all to the pipe in one burst.
+2. **Service side**: `handle_client` reads all available frames from the pipe
+   decoder, spawns each as a `spawn_blocking` task. All tasks run concurrently
+   on Tokio's blocking pool. Results are collected in order and written back to
+   the pipe in one burst.
+3. **Zero-mutex IOCTL**: The driver handle is shared as `Arc<DriverHandle>`.
+   Each blocking task calls `DeviceIoControl` directly without acquiring a
+   mutex. Windows I/O manager serializes IRPs internally.
+
+This means 30 concurrent reads cost ~1 pipe round-trip instead of 30 sequential
+round-trips, enabling real-time linked-list traversal and entity scanning.
+
 ## Runtime Constraints
 
 - Lua VM is only accessed by the GUI Lua thread.

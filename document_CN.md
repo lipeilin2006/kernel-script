@@ -636,6 +636,17 @@ function OnRender()
 end
 ```
 
+## IPC 批量流水线
+
+GUI 到 service 的 IPC 使用批量流水线实现高吞吐：
+
+1. **GUI 侧**：`connection_task` 从 `mpsc` channel 一次性拉取所有 pending 请求，批量写入管道。
+2. **Service 侧**：`handle_client` 从管道 decoder 读取所有可用帧，每帧 `spawn_blocking` 并发执行。所有 task 在 Tokio blocking pool 上并行运行。结果按顺序收集后批量写回管道。
+3. **零锁 IOCTL**：驱动 handle 以 `Arc<DriverHandle>` 共享。每个 blocking task 直接调用 `DeviceIoControl`，无需获取 mutex。Windows I/O manager 内部序列化 IRP。
+
+这意味着 30 个并发读取只需要 ~1 次管道往返，而非 30 次串行往返，
+从而实现实时链表遍历和实体扫描。
+
 ## Runtime Constraints
 
 - Lua VM 只在 GUI Lua 线程访问。
