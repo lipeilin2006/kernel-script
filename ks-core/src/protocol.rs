@@ -584,7 +584,8 @@ impl<'a> WireEncode for Request<'a> {
             }
             Self::BatchReadMemory { pid, entries } => {
                 out[10..18].copy_from_slice(&pid.to_le_bytes());
-                out[18..22].copy_from_slice(&(entries.len() as u32).to_le_bytes());
+                let count = (entries.len() / BATCH_READ_ENTRY_WIRE_SIZE) as u32;
+                out[18..22].copy_from_slice(&count.to_le_bytes());
                 out[22..total].copy_from_slice(entries);
             }
         }
