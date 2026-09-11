@@ -22,6 +22,7 @@ A modular kernel-based scripting framework for Windows, featuring a three-tier a
 
 - **Lua Scripting**: Hot-reloadable Lua scripts with coroutine-based async IPC
 - **Memory Read/Write**: Normal and MDL-based (bypasses page protection), up to 4096 bytes per transfer
+- **Batch Read**: Single IOCTL reads multiple memory regions — one IPC round-trip for N entities
 - **RVA API**: Driver-side address calculation from image base + offset
 - **Draw API**: Overlay rendering (lines, rectangles, circles, text) on transparent fullscreen window
 - **Window Rect**: Query target process window positions via DWM

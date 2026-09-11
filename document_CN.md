@@ -272,6 +272,67 @@ await_async(memory.async_write_mdl_rva(pid, 0x1234, {
 }))
 ```
 
+## Batch Read API（批量读取）
+
+批量读取在单次 IPC 往返中执行多次内存读取。驱动只做一次进程查找 + N 次
+`ks_copy_process_memory`，返回**无 size 前缀**的平铺字节缓冲区。消除逐次
+IPC 开销，避免 Lua Table 分配。
+
+**最大条目数**：每次调用最多 64 个。**总传输限制**：4096 字节。
+
+### memory.async_batch_read
+
+从目标进程读取多个内存区域，返回单个平铺字节缓冲区，各条目数据紧密排列。
+
+```lua
+local raw = await_async(memory.async_batch_read(pid, {
+    { address = 0x1407FFF0, size = 256 },
+    { address = 0x14080000, size = 256 },
+}))
+```
+
+### memory.batch_offset
+
+根据尺寸数组计算平铺缓冲区中各条目的字节偏移。返回的表中索引 `i` 是
+第 `i` 个条目的字节偏移，`total` 是总字节数。
+
+```lua
+local sizes = { 0x100, 0x100, 0x100 }
+local offsets = memory.batch_offset(sizes)
+-- offsets[1] = 0, offsets[2] = 256, offsets[3] = 512, offsets.total = 768
+```
+
+### 示例：零分配实体扫描
+
+```lua
+local ENTITY_SIZE = 0x100
+local FIELD_HP_OFFSET = 0x40
+local FIELD_POS_OFFSET = 0x4C
+local ENTITY_COUNT = 30
+
+local entities = {}  -- 地址列表，一次性构建
+local sizes = {}
+for i = 1, ENTITY_COUNT do sizes[i] = ENTITY_SIZE end
+local offsets = memory.batch_offset(sizes)
+
+start_async(function()
+    local entries = {}
+    for i, addr in ipairs(entities) do
+        entries[i] = { address = addr, size = ENTITY_SIZE }
+    end
+    local raw = await_async(memory.async_batch_read(pid, entries))
+    for i = 1, ENTITY_COUNT do
+        local base = offsets[i]
+        local hp = string.unpack("<i4", raw, base + FIELD_HP_OFFSET)
+        local x, y, z = string.unpack("<fff", raw, base + FIELD_POS_OFFSET)
+        -- ... 绘制逻辑（每个字段无 Table 分配）
+    end
+end)
+```
+
+响应是单个 Lua byte string。`string.unpack` 直接在缓冲区上按偏移读取字段
+——零中间 Table 分配，GC 压力极低。
+
 ## Shared Globals
 
 多个 Lua VM 通过 Rust 侧共享存储交换简单值。
@@ -654,6 +715,7 @@ GUI 到 service 的 IPC 使用批量流水线实现高吞吐：
 - `OnRender` 不得执行同步网络或 driver 操作。
 - `OnUpdate` 不得等待 Future；使用 coroutine 或 `poll_async`。
 - 单次内存读写最多 4096 字节。
+- 批量读取限制：最多 64 个条目，总计 4096 字节。
 - 进程列表由 service 在用户态枚举。
 - 内存读写和 RVA 计算由 driver 执行。
 - 窗口枚举在 GUI 进程（用户会话）中执行。

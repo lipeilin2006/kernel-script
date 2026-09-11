@@ -277,6 +277,70 @@ await_async(memory.async_write_mdl_rva(pid, 0x1234, {
 }))
 ```
 
+## Batch Read API
+
+Batch read performs multiple memory reads in a single IPC round-trip. The driver
+does one process lookup and N copies, returning a flat byte buffer with no size
+prefixes. This eliminates per-read IPC overhead and avoids Lua Table allocation.
+
+**Maximum entries**: 64 per call. **Total transfer limit**: 4096 bytes.
+
+### memory.async_batch_read
+
+Reads multiple memory regions from a target process. Returns a single flat byte
+buffer where each entry's data is packed contiguously.
+
+```lua
+local raw = await_async(memory.async_batch_read(pid, {
+    { address = 0x1407FFF0, size = 256 },
+    { address = 0x14080000, size = 256 },
+}))
+```
+
+### memory.batch_offset
+
+Calculates byte offsets into a flat buffer from an array of sizes. Returns a
+table where index `i` is the byte offset of the `i`-th entry, and `total` is
+the total byte count.
+
+```lua
+local sizes = { 0x100, 0x100, 0x100 }
+local offsets = memory.batch_offset(sizes)
+-- offsets[1] = 0, offsets[2] = 256, offsets[3] = 512, offsets.total = 768
+```
+
+### Example: Zero-Allocation Entity Scan
+
+```lua
+local ENTITY_SIZE = 0x100
+local FIELD_HP_OFFSET = 0x40
+local FIELD_POS_OFFSET = 0x4C
+local ENTITY_COUNT = 30
+
+local entities = {}  -- address list, built once
+local sizes = {}
+for i = 1, ENTITY_COUNT do sizes[i] = ENTITY_SIZE end
+local offsets = memory.batch_offset(sizes)
+
+start_async(function()
+    local entries = {}
+    for i, addr in ipairs(entities) do
+        entries[i] = { address = addr, size = ENTITY_SIZE }
+    end
+    local raw = await_async(memory.async_batch_read(pid, entries))
+    for i = 1, ENTITY_COUNT do
+        local base = offsets[i]
+        local hp = string.unpack("<i4", raw, base + FIELD_HP_OFFSET)
+        local x, y, z = string.unpack("<fff", raw, base + FIELD_POS_OFFSET)
+        -- ... draw logic (no Table allocation per field)
+    end
+end)
+```
+
+The response is a single Lua byte string. `string.unpack` reads fields at
+calculated offsets directly — zero intermediate Table allocation, minimal GC
+pressure.
+
 ## Shared Globals
 
 Multiple Lua VMs exchange simple values through Rust-side shared storage.
@@ -663,6 +727,7 @@ round-trips, enabling real-time linked-list traversal and entity scanning.
 - `OnRender` must not perform synchronous network or driver operations.
 - `OnUpdate` must not await futures; use coroutines or `poll_async`.
 - Single memory read/write limit: 4096 bytes.
+- Batch read limit: 64 entries, 4096 bytes total.
 - Process list is enumerated in user mode by the service.
 - Memory read/write and RVA computation are performed by the driver.
 - Window rect enumeration runs in the GUI process (user session).
