@@ -4,6 +4,7 @@ use std::{ffi::c_void, ptr};
 use bytes::{Bytes, BytesMut};
 use ks_core::protocol::{
     Frame, ProcessList, ProtocolError, HEADER_SIZE, MAGIC, MAX_DRIVER_TRANSFER_SIZE, MAX_FRAME_SIZE,
+    BATCH_READ_ENTRY_WIRE_SIZE,
 };
 use ks_core::protocol::{Request, Response, WireDecode, WireEncode};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -307,6 +308,17 @@ fn dispatch_sync(
                 data: data.to_vec(),
             }
         }
+        Request::BatchReadMemory { pid, entries } => {
+            let count = entries.len() / BATCH_READ_ENTRY_WIRE_SIZE;
+            let mut parsed = Vec::with_capacity(count);
+            for i in 0..count {
+                let off = i * BATCH_READ_ENTRY_WIRE_SIZE;
+                let addr = u64::from_le_bytes(entries[off..off + 8].try_into().unwrap());
+                let size = u32::from_le_bytes(entries[off + 8..off + 12].try_into().unwrap());
+                parsed.push((addr, size));
+            }
+            OwnedRequest::BatchRead { pid, entries: parsed }
+        }
     };
 
     match request {
@@ -405,6 +417,15 @@ fn dispatch_sync(
                 }
             }
         }
+        OwnedRequest::BatchRead { pid, entries } => {
+            match driver_comm::batch_read_memory(handle, pid, &entries) {
+                Ok(data) => encode_response(Response::BatchReadMemory(&data)),
+                Err(error) => {
+                    tracing::error!(pid, entries = entries.len(), %error, "driver batch read failed");
+                    encode_error_detail(&error)
+                }
+            }
+        }
     }
 }
 
@@ -467,6 +488,10 @@ enum OwnedRequest {
         pid: u64,
         target_address: u64,
         data: Vec<u8>,
+    },
+    BatchRead {
+        pid: u64,
+        entries: Vec<(u64, u32)>,
     },
 }
 

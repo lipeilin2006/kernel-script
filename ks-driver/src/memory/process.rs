@@ -172,3 +172,53 @@ pub fn write_process_memory(process_id: u64, address: u64, data: &[u8]) -> Resul
         Err(status)
     }
 }
+
+/// Batch-read multiple memory regions from a target process with a single
+/// process lookup. Each entry reads `size` bytes from `address` into the
+/// output buffer at the current offset, prefixed by a 4-byte LE size.
+///
+/// Output layout per entry: `[size: u32 LE][data: [u8; size]]`
+///
+/// Returns the total number of bytes written to `output`, or the first
+/// failing NTSTATUS.
+pub fn batch_read_process_memory(
+    process_id: u64,
+    entries: &[(u64, u32)],
+    output: &mut [u8],
+) -> Result<usize, NTSTATUS> {
+    if entries.is_empty() || process_id == 0 {
+        return Err(STATUS_INVALID_PARAMETER);
+    }
+    let process = lookup(process_id)?;
+    let mut out_off = 0usize;
+    for &(address, size) in entries {
+        if address == 0 || size == 0 || size > MAX_DRIVER_TRANSFER_SIZE as u32 {
+            return Err(STATUS_INVALID_PARAMETER);
+        }
+        let need = 4 + size as usize;
+        if out_off + need > output.len() {
+            return Err(STATUS_BUFFER_TOO_SMALL);
+        }
+        let size_bytes = size.to_le_bytes();
+        output[out_off..out_off + 4].copy_from_slice(&size_bytes);
+        let data_slice = &mut output[out_off + 4..out_off + 4 + size as usize];
+        let mut copied = 0usize;
+        let status = unsafe {
+            ks_copy_process_memory(
+                process.0,
+                address as Pvoid,
+                data_slice.as_mut_ptr() as Pvoid,
+                size as usize,
+                &mut copied,
+            )
+        };
+        if nt_success(status) && copied == size as usize {
+            out_off += need;
+        } else if nt_success(status) {
+            return Err(STATUS_ACCESS_VIOLATION);
+        } else {
+            return Err(status);
+        }
+    }
+    Ok(out_off)
+}

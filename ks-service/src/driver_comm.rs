@@ -2,7 +2,8 @@ use std::fmt;
 use std::sync::Arc;
 
 use ks_core::protocol::{
-    MemoryReadRequest, MemoryWriteRequest, IOCTL_PING, IOCTL_READ_MEMORY, IOCTL_WRITE_MEMORY,
+    MemoryReadRequest, MemoryWriteRequest, IOCTL_BATCH_READ_MEMORY, IOCTL_PING,
+    IOCTL_READ_MEMORY, IOCTL_WRITE_MEMORY, MAX_BATCH_ENTRIES, BATCH_READ_ENTRY_WIRE_SIZE,
     MAX_DRIVER_TRANSFER_SIZE,
 };
 
@@ -493,4 +494,46 @@ fn write_memory_via(
         return Err(DriverError::IoctlFailed(err));
     }
     Ok(())
+}
+
+pub fn batch_read_memory(
+    handle: &DriverHandle,
+    process_id: u64,
+    entries: &[(u64, u32)],
+) -> Result<Vec<u8>, DriverError> {
+    if process_id == 0 || entries.is_empty() || entries.len() > MAX_BATCH_ENTRIES {
+        return Err(DriverError::ResponseParseFailed);
+    }
+    let input_size = 12 + entries.len() * BATCH_READ_ENTRY_WIRE_SIZE;
+    let mut input = vec![0u8; input_size];
+    input[..8].copy_from_slice(&process_id.to_le_bytes());
+    input[8..12].copy_from_slice(&(entries.len() as u32).to_le_bytes());
+    for (i, &(addr, size)) in entries.iter().enumerate() {
+        let off = 12 + i * BATCH_READ_ENTRY_WIRE_SIZE;
+        input[off..off + 8].copy_from_slice(&addr.to_le_bytes());
+        input[off + 8..off + 12].copy_from_slice(&size.to_le_bytes());
+    }
+
+    let mut bytes_returned = 0u32;
+    let output_size = entries.iter().map(|&(_, s)| 4 + s as usize).sum::<usize>();
+    let mut output = vec![0u8; output_size];
+
+    let result = unsafe {
+        windows_sys::Win32::System::IO::DeviceIoControl(
+            handle.0,
+            IOCTL_BATCH_READ_MEMORY,
+            input.as_ptr() as *const _,
+            input_size as u32,
+            output.as_mut_ptr() as *mut _,
+            output.len() as u32,
+            &mut bytes_returned,
+            core::ptr::null_mut(),
+        )
+    };
+    if result == 0 {
+        let err = unsafe { windows_sys::Win32::Foundation::GetLastError() };
+        return Err(DriverError::IoctlFailed(err));
+    }
+    output.truncate(bytes_returned as usize);
+    Ok(output)
 }

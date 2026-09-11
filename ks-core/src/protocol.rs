@@ -15,6 +15,7 @@ pub const IOCTL_READ_MEMORY_MDL: u32 = 0x0022_2024;
 pub const IOCTL_WRITE_MEMORY_MDL: u32 = 0x0022_2028;
 pub const IOCTL_READ_MEMORY_MDL_RVA: u32 = 0x0022_202C;
 pub const IOCTL_WRITE_MEMORY_MDL_RVA: u32 = 0x0022_2030;
+pub const IOCTL_BATCH_READ_MEMORY: u32 = 0x0022_2034;
 
 #[repr(C)]
 pub struct MemoryReadRequest {
@@ -72,6 +73,8 @@ pub const PROCESS_RECORD_HEADER_SIZE: usize = 26;
 pub const MAX_PROCESS_LIST_SIZE: usize =
     4 + MAX_PROCESS_LIST_ENTRIES * (PROCESS_RECORD_HEADER_SIZE + MAX_PROCESS_NAME_BYTES);
 pub const MAX_WRITE_SIZE: usize = MAX_FRAME_SIZE - HEADER_SIZE - 20;
+pub const MAX_BATCH_ENTRIES: usize = 64;
+pub const BATCH_READ_ENTRY_WIRE_SIZE: usize = 12; // address:8 + size:4
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u16)]
@@ -92,6 +95,8 @@ pub enum MessageType {
     WriteMemoryMdlRva = 18,
     GetProcessId = 7,
     GetProcessIdResponse = 8,
+    BatchReadMemory = 19,
+    BatchReadMemoryResponse = 20,
     Error = 0xFFFF,
     ErrorDetail = 0xFFFE,
 }
@@ -115,6 +120,8 @@ impl MessageType {
             18 => Ok(Self::WriteMemoryMdlRva),
             7 => Ok(Self::GetProcessId),
             8 => Ok(Self::GetProcessIdResponse),
+            19 => Ok(Self::BatchReadMemory),
+            20 => Ok(Self::BatchReadMemoryResponse),
             0xFFFF => Ok(Self::Error),
             0xFFFE => Ok(Self::ErrorDetail),
             _ => Err(ProtocolError::UnknownMessageType),
@@ -282,6 +289,12 @@ pub struct ReadProcessMemory {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BatchReadEntry {
+    pub address: u64,
+    pub size: u32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ProcessRecord<'a> {
     pub pid: u64,
     pub parent_pid: u64,
@@ -331,6 +344,10 @@ pub enum Request<'a> {
         target_address: u64,
         data: &'a [u8],
     },
+    BatchReadMemory {
+        pid: u64,
+        entries: &'a [u8],
+    },
 }
 
 #[cfg(feature = "alloc")]
@@ -343,6 +360,7 @@ pub enum Response<'a> {
     ErrorDetail(&'a [u8]),
     ProcessId(u64),
     ProcessBase(u64),
+    BatchReadMemory(&'a [u8]),
 }
 
 #[cfg(feature = "alloc")]
@@ -445,6 +463,7 @@ impl<'a> WireEncode for Request<'a> {
             Self::WriteMemoryMdlRva { .. } => MessageType::WriteMemoryMdlRva,
             Self::ReadProcessMemory(_) => MessageType::ReadProcessMemory,
             Self::WriteProcessMemory { .. } => MessageType::WriteProcessMemory,
+            Self::BatchReadMemory { .. } => MessageType::BatchReadMemory,
         }
     }
     fn encoded_len(&self) -> Result<usize, ProtocolError> {
@@ -470,6 +489,9 @@ impl<'a> WireEncode for Request<'a> {
             Self::WriteProcessMemory { data, .. } => 20usize
                 .checked_add(data.len())
                 .ok_or(ProtocolError::TooLarge)?,
+            Self::BatchReadMemory { entries, .. } => {
+                12 + entries.len()
+            }
         };
         if n > MAX_FRAME_SIZE - HEADER_SIZE {
             Err(ProtocolError::TooLarge)
@@ -560,6 +582,11 @@ impl<'a> WireEncode for Request<'a> {
                 out[26..30].copy_from_slice(&(data.len() as u32).to_le_bytes());
                 out[30..total].copy_from_slice(data);
             }
+            Self::BatchReadMemory { pid, entries } => {
+                out[10..18].copy_from_slice(&pid.to_le_bytes());
+                out[18..22].copy_from_slice(&(entries.len() as u32).to_le_bytes());
+                out[22..total].copy_from_slice(entries);
+            }
         }
         Ok(total)
     }
@@ -648,6 +675,18 @@ impl<'a> WireDecode<'a> for Request<'a> {
                     data: &p[20..],
                 })
             }
+            MessageType::BatchReadMemory if p.len() >= 12 => {
+                let pid = u64::from_le_bytes(p[..8].try_into().unwrap());
+                let count = u32::from_le_bytes(p[8..12].try_into().unwrap()) as usize;
+                let expected = 12 + count * BATCH_READ_ENTRY_WIRE_SIZE;
+                if p.len() != expected || count > MAX_BATCH_ENTRIES {
+                    return Err(ProtocolError::InvalidPayload);
+                }
+                Ok(Self::BatchReadMemory {
+                    pid,
+                    entries: &p[12..],
+                })
+            }
             _ => Err(ProtocolError::InvalidPayload),
         }
     }
@@ -664,6 +703,7 @@ impl<'a> WireEncode for Response<'a> {
             Self::ErrorDetail(_) => MessageType::ErrorDetail,
             Self::ProcessId(_) => MessageType::GetProcessIdResponse,
             Self::ProcessBase(_) => MessageType::GetProcessBaseResponse,
+            Self::BatchReadMemory(_) => MessageType::BatchReadMemoryResponse,
         }
     }
     fn encoded_len(&self) -> Result<usize, ProtocolError> {
@@ -675,6 +715,7 @@ impl<'a> WireEncode for Response<'a> {
             Self::ErrorDetail(v) => v.len(),
             Self::ProcessId(_) => 8,
             Self::ProcessBase(_) => 8,
+            Self::BatchReadMemory(v) => v.len(),
         };
         let total = HEADER_SIZE
             .checked_add(payload_len)
@@ -701,6 +742,7 @@ impl<'a> WireEncode for Response<'a> {
             Self::ErrorDetail(v) => out[10..total].copy_from_slice(v),
             Self::ProcessId(pid) => out[10..18].copy_from_slice(&pid.to_le_bytes()),
             Self::ProcessBase(base) => out[10..18].copy_from_slice(&base.to_le_bytes()),
+            Self::BatchReadMemory(v) => out[10..total].copy_from_slice(v),
         }
         Ok(total)
     }
@@ -725,6 +767,7 @@ impl<'a> WireDecode<'a> for Response<'a> {
             MessageType::GetProcessBaseResponse if payload.len() == 8 => Ok(Self::ProcessBase(
                 u64::from_le_bytes(payload.try_into().unwrap()),
             )),
+            MessageType::BatchReadMemoryResponse => Ok(Self::BatchReadMemory(payload)),
             _ => Err(ProtocolError::InvalidPayload),
         }
     }

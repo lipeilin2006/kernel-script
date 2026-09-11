@@ -2,7 +2,10 @@ use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
 
-use ks_core::protocol::{Frame, ReadProcessMemory, Request, Response, WireDecode, WireEncode};
+use ks_core::protocol::{
+    BatchReadEntry, Frame, ReadProcessMemory, Request, Response, WireDecode, WireEncode,
+    BATCH_READ_ENTRY_WIRE_SIZE,
+};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::windows::named_pipe::{ClientOptions, NamedPipeClient};
 
@@ -26,6 +29,7 @@ enum OwnedResponse {
     ProcessList(Vec<ProcessInfo>),
     ProcessId(u64),
     WriteComplete,
+    BatchReadMemory(Vec<u8>),
     Error(u32),
     ErrorDetail(String),
 }
@@ -111,6 +115,7 @@ impl IpcClient {
                     .collect(),
             )),
             Response::WriteComplete => Ok(OwnedResponse::WriteComplete),
+            Response::BatchReadMemory(data) => Ok(OwnedResponse::BatchReadMemory(data.to_vec())),
             Response::Error(code) => Ok(OwnedResponse::Error(code)),
             Response::ErrorDetail(detail) => Ok(OwnedResponse::ErrorDetail(
                 String::from_utf8_lossy(detail).into_owned(),
@@ -314,6 +319,32 @@ impl IpcClient {
             .await?
         {
             OwnedResponse::ProcessBase(base) => Ok(base),
+            OwnedResponse::Error(code) => Err(format!("service error: {code}")),
+            OwnedResponse::ErrorDetail(detail) => Err(detail),
+            _ => Err("unexpected response".into()),
+        }
+    }
+
+    pub async fn batch_read_memory(
+        &self,
+        pid: u64,
+        entries: &[BatchReadEntry],
+    ) -> Result<Vec<u8>, String> {
+        let mut payload = Vec::with_capacity(12 + entries.len() * BATCH_READ_ENTRY_WIRE_SIZE);
+        payload.extend_from_slice(&pid.to_le_bytes());
+        payload.extend_from_slice(&(entries.len() as u32).to_le_bytes());
+        for e in entries {
+            payload.extend_from_slice(&e.address.to_le_bytes());
+            payload.extend_from_slice(&e.size.to_le_bytes());
+        }
+        match self
+            .send_request(&Request::BatchReadMemory {
+                pid,
+                entries: &payload[12..],
+            })
+            .await?
+        {
+            OwnedResponse::BatchReadMemory(data) => Ok(data),
             OwnedResponse::Error(code) => Err(format!("service error: {code}")),
             OwnedResponse::ErrorDetail(detail) => Err(detail),
             _ => Err("unexpected response".into()),

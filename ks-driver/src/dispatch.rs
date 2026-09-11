@@ -4,7 +4,8 @@ use crate::memory;
 use crate::wdm::*;
 use ks_core::protocol::{
     MemoryReadRequest, MemoryRvaReadRequest, MemoryRvaWriteRequest, MemoryWriteRequest,
-    ProcessBaseRequest, MAX_DRIVER_TRANSFER_SIZE,
+    ProcessBaseRequest, MAX_DRIVER_TRANSFER_SIZE, MAX_BATCH_ENTRIES, BATCH_READ_ENTRY_WIRE_SIZE,
+    IOCTL_BATCH_READ_MEMORY,
 };
 
 const READ_RESPONSE_SIZE: usize = 4 + 1 + 3 + MAX_DRIVER_TRANSFER_SIZE + 4;
@@ -326,6 +327,37 @@ unsafe extern "system" fn dispatch_device_control(
                         write_rva_ioctl(request, |pid, address, data| {
                             memory::write_process_memory_mdl(pid, address, data)
                         })
+                    }
+                }
+            }
+            IOCTL_BATCH_READ_MEMORY => {
+                if input_length < 12 {
+                    (STATUS_BUFFER_TOO_SMALL, 0)
+                } else {
+                    let pid = ptr::read_unaligned(system as *const u64);
+                    let count = ptr::read_unaligned(system.add(8) as *const u32) as usize;
+                    if pid == 0
+                        || count == 0
+                        || count > MAX_BATCH_ENTRIES
+                        || input_length < (12 + count * BATCH_READ_ENTRY_WIRE_SIZE) as u32
+                    {
+                        (STATUS_INVALID_PARAMETER, 0)
+                    } else {
+                        let mut entries = [(0u64, 0u32); MAX_BATCH_ENTRIES];
+                        for i in 0..count {
+                            let base = 12 + i * BATCH_READ_ENTRY_WIRE_SIZE;
+                            let addr = ptr::read_unaligned(system.add(base) as *const u64);
+                            let size = ptr::read_unaligned(system.add(base + 8) as *const u32);
+                            entries[i] = (addr, size);
+                        }
+                        match memory::batch_read_process_memory(
+                            pid,
+                            &entries[..count],
+                            core::slice::from_raw_parts_mut(system, output_length as usize),
+                        ) {
+                            Ok(bytes_written) => (STATUS_SUCCESS, bytes_written),
+                            Err(status) => (status, 0),
+                        }
                     }
                 }
             }
