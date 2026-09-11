@@ -179,7 +179,7 @@ for i, byte in ipairs(data) do
 end
 ```
 
-Single transfer limit: 256 bytes.
+Single transfer limit: 4096 bytes.
 
 ### memory.async_write_i32
 
@@ -199,7 +199,7 @@ await_async(memory.async_write_bytes(pid, address, {
 }))
 ```
 
-Each element must be coercible to a byte. Maximum 256 bytes per call.
+Each element must be coercible to a byte. Maximum 4096 bytes per call.
 
 ## RVA Memory API
 
@@ -230,7 +230,7 @@ await_async(memory.async_write_rva(pid, 0x1234, {
 }))
 ```
 
-RVA read/write is also limited to 256 bytes per transfer.
+RVA read/write is also limited to 4096 bytes per transfer.
 
 ## MDL Memory API
 
@@ -246,7 +246,7 @@ Usage is identical to normal read/write. The only differences:
   back to normal read/write.
 - MDL writes hit shared physical pages: modifying an image code section affects
   every process mapping that module (copy-on-write pages excepted).
-- Same 256-byte single transfer limit applies.
+- Same 4096-byte single transfer limit applies.
 
 ### memory.async_read_mdl
 
@@ -645,7 +645,7 @@ end
 - Background Tokio tasks transfer only task IDs and owned plain data.
 - `OnRender` must not perform synchronous network or driver operations.
 - `OnUpdate` must not await futures; use coroutines or `poll_async`.
-- Single memory read/write limit: 256 bytes.
+- Single memory read/write limit: 4096 bytes.
 - Process list is enumerated in user mode by the service.
 - Memory read/write and RVA computation are performed by the driver.
 - Window rect enumeration runs in the GUI process (user session).

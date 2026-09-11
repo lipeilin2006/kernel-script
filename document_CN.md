@@ -176,7 +176,7 @@ for index, byte in ipairs(data) do
 end
 ```
 
-当前 driver 单次读取上限为 256 字节。
+当前 driver 单次读取上限为 4096 字节。
 
 ### memory.async_write_i32
 
@@ -196,7 +196,7 @@ await_async(memory.async_write_bytes(pid, address, {
 }))
 ```
 
-每个元素应为可转换为字节的整数，数组最大为 256 字节。
+每个元素应为可转换为字节的整数，数组最大为 4096 字节。
 
 ## RVA Memory API
 
@@ -226,7 +226,7 @@ await_async(memory.async_write_rva(pid, 0x1234, {
 }))
 ```
 
-RVA 读写同样受 256 字节单次 driver 传输限制。
+RVA 读写同样受 4096 字节单次 driver 传输限制。
 
 ## MDL Memory API
 
@@ -241,7 +241,7 @@ MDL 读写通过内核 MDL 重映射访问目标进程内存：附加到目标�
   `async_read*` / `async_write*` 互不影响。
 - MDL 写入的是共享物理页：修改映像代码段会影响所有映射该模块的进程
   （写时复制页面除外）。
-- 同样受 256 字节单次传输限制。
+- 同样受 4096 字节单次传输限制。
 
 ### memory.async_read_mdl
 
@@ -642,7 +642,7 @@ end
 - 后台 Tokio task 只传递 task ID 和 owned plain data。
 - `OnRender` 不得执行同步网络或 driver 操作。
 - `OnUpdate` 不得等待 Future；使用 coroutine 或 `poll_async`。
-- 单次内存读写最多 256 字节。
+- 单次内存读写最多 4096 字节。
 - 进程列表由 service 在用户态枚举。
 - 内存读写和 RVA 计算由 driver 执行。
 - 窗口枚举在 GUI 进程（用户会话）中执行。

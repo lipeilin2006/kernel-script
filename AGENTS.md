@@ -115,7 +115,7 @@ The GUI-to-service transport is the local Windows Named Pipe `\\.\pipe\KernelScr
 - Process enumeration uses Windows Toolhelp APIs in `ks-service/src/process.rs`.
 - The current process list wire response exposes `pid` and `name`. The service's internal Toolhelp record also collects `parent_pid` and `thread_count`; extend the wire format before exposing those fields to clients.
 
-The current driver ABI limits one memory read or write to `256` bytes. Keep GUI and service validation aligned with the driver limit.
+The current driver ABI limits one memory read or write to `4096` bytes. Keep GUI and service validation aligned with the driver limit.
 
 ## Driver Build
 

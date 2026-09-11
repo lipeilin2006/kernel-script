@@ -21,13 +21,14 @@ A modular kernel-based scripting framework for Windows, featuring a three-tier a
 ## Features
 
 - **Lua Scripting**: Hot-reloadable Lua scripts with coroutine-based async IPC
-- **Memory Read/Write**: Normal and MDL-based (bypasses page protection)
+- **Memory Read/Write**: Normal and MDL-based (bypasses page protection), up to 4096 bytes per transfer
 - **RVA API**: Driver-side address calculation from image base + offset
 - **Draw API**: Overlay rendering (lines, rectangles, circles, text) on transparent fullscreen window
 - **Window Rect**: Query target process window positions via DWM
 - **Multi-Window**: Handles processes with multiple windows
 - **Transparent Overlay**: GLFW + DWM transparency with mouse passthrough
 - **Chinese Font Support**: Auto-loads `msyh.ttc` / `simhei.ttf` / `simsun.ttc`
+- **High-Performance IPC**: Channel-based proxy with persistent connections, zero-copy frame handling
 
 ## Project Structure
 
