@@ -444,16 +444,14 @@ unsafe fn read_ioctl(
     output_len: usize,
     reader: impl FnOnce(u64, u64, &mut [u8]) -> Result<(), NTSTATUS>,
 ) -> (NTSTATUS, usize) {
-    // Keep the IOCTL response byte-oriented. Rust bool layout must not be part
-    // of the kernel/user ABI.
-    let mut data = [0u8; MAX_DRIVER_TRANSFER_SIZE];
+    // Write directly into the I/O manager system buffer to avoid a 4 KB
+    // stack allocation. The output buffer is already allocated for the IRP.
+    // Layout: [4-byte magic][1-byte success][3-byte pad][data up to 4096][4-byte error]
     let mut success = false;
     let mut error_code = 0u32;
-    match reader(
-        request.process_id,
-        request.address,
-        &mut data[..request.size as usize],
-    ) {
+    let data_slice =
+        core::slice::from_raw_parts_mut(output.add(8), request.size as usize);
+    match reader(request.process_id, request.address, data_slice) {
         Ok(()) => {
             success = true;
         }
@@ -463,7 +461,6 @@ unsafe fn read_ioctl(
     }
     ptr::write_unaligned(output as *mut u32, 0x4B53_5231);
     *output.add(4) = success as u8;
-    ptr::copy_nonoverlapping(data.as_ptr(), output.add(8), request.size as usize);
     ptr::write_unaligned(
         output.add(4 + 1 + 3 + MAX_DRIVER_TRANSFER_SIZE) as *mut u32,
         error_code,

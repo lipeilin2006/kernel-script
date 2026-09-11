@@ -341,21 +341,22 @@ impl AsyncScheduler {
         self.results.lock().ok()?.try_recv().ok()
     }
 
+    pub fn drain_pending(&self) {
+        let mut completed = match self.completed.lock() {
+            Ok(c) => c,
+            Err(_) => return,
+        };
+        while let Some((id, result)) = self.poll() {
+            completed.insert(id, result);
+        }
+    }
+
     fn poll_id(&self, id: u64) -> Option<AsyncResult> {
         if let Ok(mut completed) = self.completed.lock() {
-            if let Some(result) = completed.remove(&id) {
-                return Some(result);
-            }
+            completed.remove(&id)
+        } else {
+            None
         }
-        while let Some((completed_id, result)) = self.poll() {
-            if completed_id == id {
-                return Some(result);
-            }
-            if let Ok(mut completed) = self.completed.lock() {
-                completed.insert(completed_id, result);
-            }
-        }
-        None
     }
 }
 
@@ -1567,6 +1568,17 @@ fn register_memory_api(lua: &Lua, async_scheduler: AsyncScheduler) -> mlua::Resu
     {
         let scheduler = async_scheduler.clone();
         module.set(
+            "drain_pending",
+            lua.create_function(move |_, ()| -> mlua::Result<()> {
+                scheduler.drain_pending();
+                Ok(())
+            })?,
+        )?;
+    }
+
+    {
+        let scheduler = async_scheduler.clone();
+        module.set(
             "poll_async",
             lua.create_function(move |lua, id: u64| -> mlua::Result<Option<mlua::Table>> {
                 let Some(result) = scheduler.poll_id(id) else {
@@ -1843,6 +1855,7 @@ fn install_async_helpers(lua: &Lua) -> mlua::Result<()> {
         end
 
         function __pump_async_tasks()
+            memory.drain_pending()
             local finished = {}
             for co in pairs(__async_tasks) do
                 local ok, err = coroutine.resume(co)
