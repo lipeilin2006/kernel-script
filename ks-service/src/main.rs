@@ -6,7 +6,7 @@ use std::ffi::OsString;
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::sync::{broadcast, Mutex};
+use tokio::sync::broadcast;
 use windows_service::define_windows_service;
 use windows_service::service::{
     ServiceControl, ServiceControlAccept, ServiceExitCode, ServiceState, ServiceStatus, ServiceType,
@@ -101,19 +101,22 @@ fn run_runtime(stop_rx: broadcast::Receiver<()>) {
 
 async fn run_runtime_async(stop_rx: broadcast::Receiver<()>) {
     tracing::info!("connecting to driver");
-    let driver = Arc::new(Mutex::new(DriverComm::new()));
-    {
-        let mut driver = driver.lock().await;
-        match driver.connect() {
-            Ok(()) => tracing::info!("driver connected"),
-            Err(error) => tracing::error!(%error, "driver connection failed"),
+    let mut comm = DriverComm::new();
+    let handle = match comm.connect() {
+        Ok(()) => {
+            tracing::info!("driver connected");
+            comm.handle().expect("just connected")
         }
-    }
-    let ipc = tokio::spawn(ipc::start_server(Arc::clone(&driver), stop_rx));
+        Err(error) => {
+            tracing::error!(%error, "driver connection failed");
+            return;
+        }
+    };
+    let ipc = tokio::spawn(ipc::start_server(handle, stop_rx));
     if let Err(error) = ipc.await {
         tracing::error!(%error, "IPC server task failed");
     }
-    driver.lock().await.disconnect();
+    comm.disconnect();
 }
 
 fn init_logging() {

@@ -352,53 +352,75 @@ async fn connection_task(
         }
     };
 
-    while let Some((id, request_bytes)) = req_rx.recv().await {
-        if let Err(e) = stream.write_all(&request_bytes).await {
-            tracing::warn!("write failed: {e}, reconnecting");
-            stream = match reconnect_or_die(&responses, id, &e).await {
-                Some(s) => s,
-                None => return,
-            };
-            // Retry the failed request once.
-            if let Err(e) = stream.write_all(&request_bytes).await {
-                tracing::error!("retry write also failed: {e}");
-                respond_error(&responses, id, "write failed".into()).await;
-                continue;
+    while let Some((first_id, first_bytes)) = req_rx.recv().await {
+        let mut batch: Vec<(u64, Vec<u8>)> = vec![(first_id, first_bytes)];
+        while let Ok((id, bytes)) = req_rx.try_recv() {
+            batch.push((id, bytes));
+        }
+
+        let mut write_ok = true;
+        for (_, bytes) in &batch {
+            if let Err(e) = stream.write_all(bytes).await {
+                tracing::warn!("write failed ({} requests in batch): {e}", batch.len());
+                write_ok = false;
+                break;
             }
         }
 
-        let mut header = [0u8; ks_core::protocol::HEADER_SIZE];
-        if let Err(e) = stream.read_exact(&mut header).await {
-            tracing::warn!("header read failed: {e}, reconnecting");
-            stream = match reconnect_or_die(&responses, id, &e).await {
+        if !write_ok {
+            for (id, _) in &batch {
+                respond_error(&responses, *id, "write failed".into()).await;
+            }
+            stream = match reconnect_or_die(&responses, batch[0].0, &std::io::Error::new(std::io::ErrorKind::BrokenPipe, "write failed")).await {
                 Some(s) => s,
                 None => return,
             };
-            respond_error(&responses, id, "read header failed".into()).await;
             continue;
         }
 
-        let payload_len = u32::from_le_bytes(header[6..10].try_into().unwrap()) as usize;
-        if payload_len > MAX_MESSAGE_SIZE - HEADER_SIZE {
-            respond_error(&responses, id, "response too large".into()).await;
-            continue;
+        let mut response_ok = true;
+        for (id, _) in &batch {
+            let mut header = [0u8; ks_core::protocol::HEADER_SIZE];
+            if let Err(e) = stream.read_exact(&mut header).await {
+                tracing::warn!("header read failed: {e}, reconnecting");
+                respond_error(&responses, *id, "read header failed".into()).await;
+                stream = match reconnect_or_die(&responses, *id, &e).await {
+                    Some(s) => s,
+                    None => return,
+                };
+                response_ok = false;
+                break;
+            }
+
+            let payload_len = u32::from_le_bytes(header[6..10].try_into().unwrap()) as usize;
+            if payload_len > MAX_MESSAGE_SIZE - HEADER_SIZE {
+                respond_error(&responses, *id, "response too large".into()).await;
+                continue;
+            }
+
+            let mut response = vec![0u8; HEADER_SIZE + payload_len];
+            response[..HEADER_SIZE].copy_from_slice(&header);
+            if let Err(e) = stream.read_exact(&mut response[HEADER_SIZE..]).await {
+                tracing::warn!("payload read failed: {e}, reconnecting");
+                respond_error(&responses, *id, "read payload failed".into()).await;
+                stream = match reconnect_or_die(&responses, *id, &e).await {
+                    Some(s) => s,
+                    None => return,
+                };
+                response_ok = false;
+                break;
+            }
+
+            let mut map = responses.lock().await;
+            if let Some(tx) = map.remove(id) {
+                let _ = tx.send(Ok(response));
+            }
         }
 
-        let mut response = vec![0u8; HEADER_SIZE + payload_len];
-        response[..HEADER_SIZE].copy_from_slice(&header);
-        if let Err(e) = stream.read_exact(&mut response[HEADER_SIZE..]).await {
-            tracing::warn!("payload read failed: {e}, reconnecting");
-            stream = match reconnect_or_die(&responses, id, &e).await {
-                Some(s) => s,
-                None => return,
-            };
-            respond_error(&responses, id, "read payload failed".into()).await;
-            continue;
-        }
-
-        let mut map = responses.lock().await;
-        if let Some(tx) = map.remove(&id) {
-            let _ = tx.send(Ok(response));
+        if !response_ok {
+            for (id, _) in batch.iter().skip(1) {
+                respond_error(&responses, *id, "connection lost".into()).await;
+            }
         }
     }
 }

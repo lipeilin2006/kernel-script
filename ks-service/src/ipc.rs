@@ -8,14 +8,14 @@ use ks_core::protocol::{
 use ks_core::protocol::{Request, Response, WireDecode, WireEncode};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::windows::named_pipe::{NamedPipeServer, ServerOptions};
-use tokio::sync::{broadcast, Mutex};
+use tokio::sync::broadcast;
 use windows_sys::Win32::Foundation::LocalFree;
 use windows_sys::Win32::Security::Authorization::{
     ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
 };
 use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
 
-use crate::driver_comm::DriverComm;
+use crate::driver_comm::{self, DriverHandle};
 use crate::process;
 
 const PIPE_NAME: &str = r"\\.\pipe\KernelScript";
@@ -25,7 +25,6 @@ const PIPE_SDDL: &[u16] = &[
     'A' as u16, ';' as u16, ';' as u16, 'G' as u16, 'R' as u16, 'G' as u16, 'W' as u16, ';' as u16,
     ';' as u16, ';' as u16, 'I' as u16, 'U' as u16, ')' as u16, 0,
 ];
-pub type SharedDriver = Arc<Mutex<DriverComm>>;
 
 // split_to transfers complete frames without copying their payload.
 struct BytesFrameDecoder {
@@ -79,7 +78,7 @@ impl BytesFrameDecoder {
 }
 
 pub async fn start_server(
-    driver: SharedDriver,
+    handle: Arc<DriverHandle>,
     mut shutdown: broadcast::Receiver<()>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut server = create_pipe_server()?;
@@ -91,9 +90,9 @@ pub async fn start_server(
                 tracing::info!(pipe = PIPE_NAME, "IPC named pipe client connected");
                 let connected = server;
                 server = create_pipe_server()?;
-                let driver = Arc::clone(&driver);
+                let handle = Arc::clone(&handle);
                 let stop = shutdown.resubscribe();
-                tokio::spawn(async move { handle_client(connected, driver, stop).await; });
+                tokio::spawn(async move { handle_client(connected, handle, stop).await; });
             }
             _ = shutdown.recv() => break,
         }
@@ -136,7 +135,7 @@ fn create_pipe_server() -> Result<NamedPipeServer, Box<dyn std::error::Error + S
 
 async fn handle_client(
     mut socket: NamedPipeServer,
-    driver: SharedDriver,
+    handle: Arc<DriverHandle>,
     mut shutdown: broadcast::Receiver<()>,
 ) {
     tracing::info!("handle_client: new client connected");
@@ -150,24 +149,35 @@ async fn handle_client(
                     tracing::warn!(?error, "invalid IPC input");
                     return;
                 }
-                loop {
-                    let frame_bytes = match decoder.next() {
-                        Ok(Some(frame)) => frame,
-                        Ok(None) => break,
-                        Err(error) => {
-                            tracing::warn!(?error, "invalid IPC frame");
-                            return;
-                        }
-                    };
+                let mut handles: Vec<tokio::task::JoinHandle<Vec<u8>>> = Vec::new();
+                while let Some(frame_bytes) = match decoder.next() {
+                    Ok(Some(f)) => Some(f),
+                    Ok(None) => None,
+                    Err(error) => {
+                        tracing::warn!(?error, "invalid IPC frame");
+                        return;
+                    }
+                } {
                     let frame = match Frame::parse(&frame_bytes) {
-                        Ok(frame) => frame,
+                        Ok(f) => f,
                         Err(error) => {
                             tracing::warn!(?error, "invalid IPC frame header");
                             return;
                         }
                     };
-                    let output = dispatch(frame.message_type, frame.payload, &driver).await;
-                    if socket.write_all(&output).await.is_err() {
+                    let msg_type = frame.message_type;
+                    let payload = frame.payload.to_vec();
+                    let handle = Arc::clone(&handle);
+                    handles.push(tokio::task::spawn_blocking(move || {
+                        dispatch_sync(msg_type, &payload, &handle)
+                    }));
+                }
+                for handle in handles {
+                    let response = handle.await.unwrap_or_else(|e| {
+                        tracing::error!(%e, "blocking task failed");
+                        encode_response(Response::Error(7))
+                    });
+                    if socket.write_all(&response).await.is_err() {
                         tracing::warn!("client write failed, disconnecting");
                         return;
                     }
@@ -178,10 +188,10 @@ async fn handle_client(
     }
 }
 
-async fn dispatch(
+fn dispatch_sync(
     message_type: ks_core::protocol::MessageType,
     payload: &[u8],
-    driver: &SharedDriver,
+    handle: &Arc<DriverHandle>,
 ) -> Vec<u8> {
     let request = match Request::decode(message_type, payload) {
         Ok(request) => request,
@@ -197,8 +207,6 @@ async fn dispatch(
             return encode_response(Response::Error(6));
         }
     }
-    // DeviceIoControl is synchronous. Move it to the blocking pool so one
-    // slow driver call cannot occupy a Tokio worker thread.
     let request = match request {
         Request::FetchProcessList => OwnedRequest::GetProcessList,
         Request::GetProcessId { name } => {
@@ -300,152 +308,104 @@ async fn dispatch(
             }
         }
     };
-    let driver = Arc::clone(driver);
-    tokio::task::spawn_blocking(move || {
-        match request {
-            OwnedRequest::GetProcessList => match process::list() {
-                Ok(processes) => encode_process_list(&processes),
-                Err(error) => {
-                    tracing::error!(%error, "process list query failed");
-                    encode_response(Response::Error(9))
-                }
-            },
-            OwnedRequest::GetProcessId { name } => match process::find_pid(&name) {
-                Ok(pid) => encode_response(Response::ProcessId(pid)),
-                Err(error) => {
-                    tracing::warn!(process = %name, %error, "process lookup failed");
-                    encode_response(Response::Error(8))
-                }
-            },
-            OwnedRequest::GetProcessBase { pid } => match driver
-                .blocking_lock()
-                .get_process_base(pid)
-            {
+
+    match request {
+        OwnedRequest::GetProcessList => match process::list() {
+            Ok(processes) => encode_process_list(&processes),
+            Err(error) => {
+                tracing::error!(%error, "process list query failed");
+                encode_response(Response::Error(9))
+            }
+        },
+        OwnedRequest::GetProcessId { name } => match process::find_pid(&name) {
+            Ok(pid) => encode_response(Response::ProcessId(pid)),
+            Err(error) => {
+                tracing::warn!(process = %name, %error, "process lookup failed");
+                encode_response(Response::Error(8))
+            }
+        },
+        OwnedRequest::GetProcessBase { pid } => {
+            match driver_comm::get_process_base(handle, pid) {
                 Ok(base) => encode_response(Response::ProcessBase(base)),
                 Err(error) => {
                     tracing::warn!(pid, %error, "process base lookup failed");
                     encode_response(Response::Error(10))
                 }
-            },
-            OwnedRequest::ReadRva { pid, relative_address, size } => {
-                let mut driver = driver.blocking_lock();
-                if !driver.is_connected() && driver.try_reconnect().is_err() {
-                    encode_response(Response::Error(2))
-                } else {
-                    match driver.read_memory_rva(pid, relative_address, size) {
-                        Ok(data) => encode_response(Response::Memory(&data)),
-                        Err(error) => {
-                            tracing::error!(pid, relative_address, size, %error, "driver RVA read failed");
-                            encode_error_detail(&error)
-                        }
-                    }
-                }
             }
-            OwnedRequest::WriteRva { pid, relative_address, data } => {
-                let mut driver = driver.blocking_lock();
-                if !driver.is_connected() && driver.try_reconnect().is_err() {
-                    encode_response(Response::Error(2))
-                } else {
-                    match driver.write_memory_rva(pid, relative_address, &data) {
-                        Ok(()) => encode_response(Response::WriteComplete),
-                        Err(error) => {
-                            tracing::error!(pid, relative_address, size = data.len(), %error, "driver RVA write failed");
-                            encode_error_detail(&error)
-                        }
-                    }
-                }
-            }
-            OwnedRequest::Read(value) => {
-                let mut driver = driver.blocking_lock();
-                if !driver.is_connected() && driver.try_reconnect().is_err() {
-                    encode_response(Response::Error(2))
-                } else {
-                    match driver.read_memory(value.pid, value.target_address, value.size) {
-                        Ok(data) => encode_response(Response::Memory(&data)),
-                        Err(error) => {
-                            tracing::error!(pid = value.pid, address = format_args!("0x{:X}", value.target_address), size = value.size, %error, "driver read failed");
-                            encode_error_detail(&error)
-                        }
-                    }
-                }
-            }
-            OwnedRequest::ReadMdl(value) => {
-                let mut driver = driver.blocking_lock();
-                if !driver.is_connected() && driver.try_reconnect().is_err() {
-                    encode_response(Response::Error(2))
-                } else {
-                    match driver.read_memory_mdl(value.pid, value.target_address, value.size) {
-                        Ok(data) => encode_response(Response::Memory(&data)),
-                        Err(error) => {
-                            tracing::error!(pid = value.pid, address = format_args!("0x{:X}", value.target_address), size = value.size, %error, "driver MDL read failed");
-                            encode_error_detail(&error)
-                        }
-                    }
-                }
-            }
-            OwnedRequest::ReadMdlRva { pid, relative_address, size } => {
-                let mut driver = driver.blocking_lock();
-                if !driver.is_connected() && driver.try_reconnect().is_err() {
-                    encode_response(Response::Error(2))
-                } else {
-                    match driver.read_memory_mdl_rva(pid, relative_address, size) {
-                        Ok(data) => encode_response(Response::Memory(&data)),
-                        Err(error) => {
-                            tracing::error!(pid, relative_address, size, %error, "driver MDL RVA read failed");
-                            encode_error_detail(&error)
-                        }
-                    }
-                }
-            }
-            OwnedRequest::WriteMdl { pid, target_address, data } => {
-                let mut driver = driver.blocking_lock();
-                if !driver.is_connected() && driver.try_reconnect().is_err() {
-                    encode_response(Response::Error(2))
-                } else {
-                    match driver.write_memory_mdl(pid, target_address, &data) {
-                        Ok(()) => encode_response(Response::WriteComplete),
-                        Err(error) => {
-                            tracing::error!(pid, address = format_args!("0x{:X}", target_address), size = data.len(), %error, "driver MDL write failed");
-                            encode_error_detail(&error)
-                        }
-                    }
-                }
-            }
-            OwnedRequest::WriteMdlRva { pid, relative_address, data } => {
-                let mut driver = driver.blocking_lock();
-                if !driver.is_connected() && driver.try_reconnect().is_err() {
-                    encode_response(Response::Error(2))
-                } else {
-                    match driver.write_memory_mdl_rva(pid, relative_address, &data) {
-                        Ok(()) => encode_response(Response::WriteComplete),
-                        Err(error) => {
-                            tracing::error!(pid, relative_address, size = data.len(), %error, "driver MDL RVA write failed");
-                            encode_error_detail(&error)
-                        }
-                    }
-                }
-            }
-            OwnedRequest::Write { pid, target_address, data } => {
-                let mut driver = driver.blocking_lock();
-                if !driver.is_connected() && driver.try_reconnect().is_err() {
-                    encode_response(Response::Error(2))
-                } else {
-                    match driver.write_memory(pid, target_address, &data) {
-                        Ok(()) => encode_response(Response::WriteComplete),
-                        Err(error) => {
-                            tracing::error!(pid, address = format_args!("0x{:X}", target_address), size = data.len(), %error, "driver write failed");
-                            encode_error_detail(&error)
-                        }
-                    }
+        }
+        OwnedRequest::ReadRva { pid, relative_address, size } => {
+            match driver_comm::read_memory_rva(handle, pid, relative_address, size) {
+                Ok(data) => encode_response(Response::Memory(&data)),
+                Err(error) => {
+                    tracing::error!(pid, relative_address, size, %error, "driver RVA read failed");
+                    encode_error_detail(&error)
                 }
             }
         }
-    })
-    .await
-    .unwrap_or_else(|error| {
-        tracing::error!(%error, "driver blocking task failed");
-        encode_response(Response::Error(7))
-    })
+        OwnedRequest::WriteRva { pid, relative_address, data } => {
+            match driver_comm::write_memory_rva(handle, pid, relative_address, &data) {
+                Ok(()) => encode_response(Response::WriteComplete),
+                Err(error) => {
+                    tracing::error!(pid, relative_address, size = data.len(), %error, "driver RVA write failed");
+                    encode_error_detail(&error)
+                }
+            }
+        }
+        OwnedRequest::Read(value) => {
+            match driver_comm::read_memory(handle, value.pid, value.target_address, value.size) {
+                Ok(data) => encode_response(Response::Memory(&data)),
+                Err(error) => {
+                    tracing::error!(pid = value.pid, address = format_args!("0x{:X}", value.target_address), size = value.size, %error, "driver read failed");
+                    encode_error_detail(&error)
+                }
+            }
+        }
+        OwnedRequest::ReadMdl(value) => {
+            match driver_comm::read_memory_mdl(handle, value.pid, value.target_address, value.size) {
+                Ok(data) => encode_response(Response::Memory(&data)),
+                Err(error) => {
+                    tracing::error!(pid = value.pid, address = format_args!("0x{:X}", value.target_address), size = value.size, %error, "driver MDL read failed");
+                    encode_error_detail(&error)
+                }
+            }
+        }
+        OwnedRequest::ReadMdlRva { pid, relative_address, size } => {
+            match driver_comm::read_memory_mdl_rva(handle, pid, relative_address, size) {
+                Ok(data) => encode_response(Response::Memory(&data)),
+                Err(error) => {
+                    tracing::error!(pid, relative_address, size, %error, "driver MDL RVA read failed");
+                    encode_error_detail(&error)
+                }
+            }
+        }
+        OwnedRequest::WriteMdl { pid, target_address, data } => {
+            match driver_comm::write_memory_mdl(handle, pid, target_address, &data) {
+                Ok(()) => encode_response(Response::WriteComplete),
+                Err(error) => {
+                    tracing::error!(pid, address = format_args!("0x{:X}", target_address), size = data.len(), %error, "driver MDL write failed");
+                    encode_error_detail(&error)
+                }
+            }
+        }
+        OwnedRequest::WriteMdlRva { pid, relative_address, data } => {
+            match driver_comm::write_memory_mdl_rva(handle, pid, relative_address, &data) {
+                Ok(()) => encode_response(Response::WriteComplete),
+                Err(error) => {
+                    tracing::error!(pid, relative_address, size = data.len(), %error, "driver MDL RVA write failed");
+                    encode_error_detail(&error)
+                }
+            }
+        }
+        OwnedRequest::Write { pid, target_address, data } => {
+            match driver_comm::write_memory(handle, pid, target_address, &data) {
+                Ok(()) => encode_response(Response::WriteComplete),
+                Err(error) => {
+                    tracing::error!(pid, address = format_args!("0x{:X}", target_address), size = data.len(), %error, "driver write failed");
+                    encode_error_detail(&error)
+                }
+            }
+        }
+    }
 }
 
 fn encode_process_list(processes: &[process::ProcessInfo]) -> Vec<u8> {
