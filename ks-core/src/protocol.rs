@@ -28,7 +28,7 @@ pub struct MemoryWriteRequest {
     pub process_id: u64,
     pub address: u64,
     pub size: u64,
-    pub data: [u8; 256],
+    pub data: [u8; 4096],
 }
 
 #[repr(C)]
@@ -48,13 +48,13 @@ pub struct MemoryRvaWriteRequest {
     pub process_id: u64,
     pub relative_address: u64,
     pub size: u64,
-    pub data: [u8; 256],
+    pub data: [u8; 4096],
 }
 
 #[repr(C)]
 pub struct MemoryResponse {
     pub success: bool,
-    pub data: [u8; 256],
+    pub data: [u8; 4096],
     pub error_code: u32,
 }
 
@@ -64,8 +64,8 @@ use alloc::vec::Vec;
 pub const MAGIC: u32 = 0x4B53_4352; // "KSCR"
 pub const HEADER_SIZE: usize = 10;
 pub const MAX_FRAME_SIZE: usize = 1024 * 1024;
-// The current Windows driver ABI uses a fixed 256-byte data area.
-pub const MAX_DRIVER_TRANSFER_SIZE: usize = 256;
+// The Windows driver ABI uses a fixed 4096-byte data area.
+pub const MAX_DRIVER_TRANSFER_SIZE: usize = 4096;
 pub const MAX_PROCESS_LIST_ENTRIES: usize = 4096;
 pub const MAX_PROCESS_NAME_BYTES: usize = 260;
 pub const PROCESS_RECORD_HEADER_SIZE: usize = 26;

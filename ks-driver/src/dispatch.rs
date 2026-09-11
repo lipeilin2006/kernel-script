@@ -4,8 +4,10 @@ use crate::memory;
 use crate::wdm::*;
 use ks_core::protocol::{
     MemoryReadRequest, MemoryRvaReadRequest, MemoryRvaWriteRequest, MemoryWriteRequest,
-    ProcessBaseRequest,
+    ProcessBaseRequest, MAX_DRIVER_TRANSFER_SIZE,
 };
+
+const READ_RESPONSE_SIZE: usize = 4 + 1 + 3 + MAX_DRIVER_TRANSFER_SIZE + 4;
 
 const DEVICE_NAME: &[u16] = &[
     b'\\' as u16,
@@ -159,7 +161,7 @@ unsafe extern "system" fn dispatch_device_control(
         }
         let (status, information) = match ioctl_code {
             IOCTL_READ_MEMORY => {
-                if input_length < mem::size_of::<MemoryReadRequest>() as u32 || output_length < 268
+                if input_length < mem::size_of::<MemoryReadRequest>() as u32 || output_length < READ_RESPONSE_SIZE as u32
                 {
                     (STATUS_BUFFER_TOO_SMALL, 0)
                 } else {
@@ -167,7 +169,7 @@ unsafe extern "system" fn dispatch_device_control(
                     if request.process_id == 0
                         || request.address == 0
                         || request.size == 0
-                        || request.size > 256
+                        || request.size > MAX_DRIVER_TRANSFER_SIZE as u64
                     {
                         (STATUS_INVALID_PARAMETER, 0)
                     } else {
@@ -181,7 +183,7 @@ unsafe extern "system" fn dispatch_device_control(
                 }
             }
             IOCTL_READ_MEMORY_MDL => {
-                if input_length < mem::size_of::<MemoryReadRequest>() as u32 || output_length < 268
+                if input_length < mem::size_of::<MemoryReadRequest>() as u32 || output_length < READ_RESPONSE_SIZE as u32
                 {
                     (STATUS_BUFFER_TOO_SMALL, 0)
                 } else {
@@ -189,7 +191,7 @@ unsafe extern "system" fn dispatch_device_control(
                     if request.process_id == 0
                         || request.address == 0
                         || request.size == 0
-                        || request.size > 256
+                        || request.size > MAX_DRIVER_TRANSFER_SIZE as u64
                     {
                         (STATUS_INVALID_PARAMETER, 0)
                     } else {
@@ -212,7 +214,7 @@ unsafe extern "system" fn dispatch_device_control(
                     if request.process_id == 0
                         || request.address == 0
                         || request.size == 0
-                        || request.size > 256
+                        || request.size > MAX_DRIVER_TRANSFER_SIZE as u64
                     {
                         (STATUS_INVALID_PARAMETER, 0)
                     } else {
@@ -236,7 +238,7 @@ unsafe extern "system" fn dispatch_device_control(
                     if request.process_id == 0
                         || request.address == 0
                         || request.size == 0
-                        || request.size > 256
+                        || request.size > MAX_DRIVER_TRANSFER_SIZE as u64
                     {
                         (STATUS_INVALID_PARAMETER, 0)
                     } else {
@@ -261,12 +263,12 @@ unsafe extern "system" fn dispatch_device_control(
             }
             IOCTL_READ_MEMORY_RVA => {
                 if input_length < mem::size_of::<MemoryRvaReadRequest>() as u32
-                    || output_length < 268
+                    || output_length < READ_RESPONSE_SIZE as u32
                 {
                     (STATUS_BUFFER_TOO_SMALL, 0)
                 } else {
                     let request = &*(system as *const MemoryRvaReadRequest);
-                    if request.process_id == 0 || request.size == 0 || request.size > 256 {
+                    if request.process_id == 0 || request.size == 0 || request.size > MAX_DRIVER_TRANSFER_SIZE as u64 {
                         (STATUS_INVALID_PARAMETER, 0)
                     } else {
                         read_rva_ioctl(
@@ -280,12 +282,12 @@ unsafe extern "system" fn dispatch_device_control(
             }
             IOCTL_READ_MEMORY_MDL_RVA => {
                 if input_length < mem::size_of::<MemoryRvaReadRequest>() as u32
-                    || output_length < 268
+                    || output_length < READ_RESPONSE_SIZE as u32
                 {
                     (STATUS_BUFFER_TOO_SMALL, 0)
                 } else {
                     let request = &*(system as *const MemoryRvaReadRequest);
-                    if request.process_id == 0 || request.size == 0 || request.size > 256 {
+                    if request.process_id == 0 || request.size == 0 || request.size > MAX_DRIVER_TRANSFER_SIZE as u64 {
                         (STATUS_INVALID_PARAMETER, 0)
                     } else {
                         read_rva_ioctl(
@@ -304,7 +306,7 @@ unsafe extern "system" fn dispatch_device_control(
                     (STATUS_BUFFER_TOO_SMALL, 0)
                 } else {
                     let request = &*(system as *const MemoryRvaWriteRequest);
-                    if request.process_id == 0 || request.size == 0 || request.size > 256 {
+                    if request.process_id == 0 || request.size == 0 || request.size > MAX_DRIVER_TRANSFER_SIZE as u64 {
                         (STATUS_INVALID_PARAMETER, 0)
                     } else {
                         write_rva_ioctl(request, |pid, address, data| {
@@ -318,7 +320,7 @@ unsafe extern "system" fn dispatch_device_control(
                     (STATUS_BUFFER_TOO_SMALL, 0)
                 } else {
                     let request = &*(system as *const MemoryRvaWriteRequest);
-                    if request.process_id == 0 || request.size == 0 || request.size > 256 {
+                    if request.process_id == 0 || request.size == 0 || request.size > MAX_DRIVER_TRANSFER_SIZE as u64 {
                         (STATUS_INVALID_PARAMETER, 0)
                     } else {
                         write_rva_ioctl(request, |pid, address, data| {
@@ -444,7 +446,7 @@ unsafe fn read_ioctl(
 ) -> (NTSTATUS, usize) {
     // Keep the IOCTL response byte-oriented. Rust bool layout must not be part
     // of the kernel/user ABI.
-    let mut data = [0u8; 256];
+    let mut data = [0u8; MAX_DRIVER_TRANSFER_SIZE];
     let mut success = false;
     let mut error_code = 0u32;
     match reader(
@@ -462,11 +464,14 @@ unsafe fn read_ioctl(
     ptr::write_unaligned(output as *mut u32, 0x4B53_5231);
     *output.add(4) = success as u8;
     ptr::copy_nonoverlapping(data.as_ptr(), output.add(8), request.size as usize);
-    ptr::write_unaligned(output.add(264) as *mut u32, error_code);
+    ptr::write_unaligned(
+        output.add(4 + 1 + 3 + MAX_DRIVER_TRANSFER_SIZE) as *mut u32,
+        error_code,
+    );
     // The IOCTL transport succeeded even when the target memory operation did
     // not. The operation status is carried in error_code so user mode does not
     // lose the original NTSTATUS through GetLastError mapping.
-    (STATUS_SUCCESS, 268usize.min(output_len))
+    (STATUS_SUCCESS, READ_RESPONSE_SIZE.min(output_len))
 }
 
 unsafe fn complete(irp: *mut IRP, status: NTSTATUS, information: usize) -> NTSTATUS {

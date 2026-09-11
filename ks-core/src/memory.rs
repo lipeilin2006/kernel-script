@@ -1,5 +1,5 @@
 pub trait MemoryAccess {
-    fn read_memory(&self, process_id: u64, address: u64, size: u64) -> Result<[u8; 256], u32>;
+    fn read_memory(&self, process_id: u64, address: u64, size: u64) -> Result<[u8; 4096], u32>;
     fn write_memory(&self, process_id: u64, address: u64, data: &[u8]) -> Result<(), u32>;
 }
 

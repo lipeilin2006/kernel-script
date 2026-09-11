@@ -1,6 +1,7 @@
 use core::{ffi::c_void, ptr};
 
 use crate::wdm::*;
+use ks_core::protocol::MAX_DRIVER_TRANSFER_SIZE;
 
 /// RAII owner for the reference returned by PsLookupProcessByProcessId.
 struct ProcessRef(isize);
@@ -88,7 +89,7 @@ pub fn read_process_memory_mdl(
     address: u64,
     output: &mut [u8],
 ) -> Result<(), NTSTATUS> {
-    if output.is_empty() || output.len() > 256 || address == 0 {
+    if output.is_empty() || output.len() > MAX_DRIVER_TRANSFER_SIZE || address == 0 {
         return Err(STATUS_INVALID_PARAMETER);
     }
     mdl_access(process_id, address, output.len(), |mapped| unsafe {
@@ -103,7 +104,7 @@ pub fn write_process_memory_mdl(
     address: u64,
     data: &[u8],
 ) -> Result<(), NTSTATUS> {
-    if data.is_empty() || data.len() > 256 || address == 0 {
+    if data.is_empty() || data.len() > MAX_DRIVER_TRANSFER_SIZE || address == 0 {
         return Err(STATUS_INVALID_PARAMETER);
     }
     mdl_access(process_id, address, data.len(), |mapped| unsafe {
@@ -116,7 +117,7 @@ pub fn read_process_memory(
     address: u64,
     output: &mut [u8],
 ) -> Result<(), NTSTATUS> {
-    if output.is_empty() || output.len() > 256 || address == 0 {
+    if output.is_empty() || output.len() > MAX_DRIVER_TRANSFER_SIZE || address == 0 {
         return Err(STATUS_INVALID_PARAMETER);
     }
     let process = lookup(process_id)?;
@@ -149,7 +150,7 @@ fn lookup(process_id: u64) -> Result<ProcessRef, NTSTATUS> {
 }
 
 pub fn write_process_memory(process_id: u64, address: u64, data: &[u8]) -> Result<(), NTSTATUS> {
-    if data.is_empty() || data.len() > 256 || address == 0 {
+    if data.is_empty() || data.len() > MAX_DRIVER_TRANSFER_SIZE || address == 0 {
         return Err(STATUS_INVALID_PARAMETER);
     }
     let process = lookup(process_id)?;

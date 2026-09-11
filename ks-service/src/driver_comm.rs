@@ -2,6 +2,7 @@ use std::fmt;
 
 use ks_core::protocol::{
     MemoryReadRequest, MemoryWriteRequest, IOCTL_PING, IOCTL_READ_MEMORY, IOCTL_WRITE_MEMORY,
+    MAX_DRIVER_TRANSFER_SIZE,
 };
 
 const DRIVER_PATH: &str = "\\\\.\\KernelScriptProfiler";
@@ -138,13 +139,13 @@ impl DriverComm {
         address: u64,
         size: u64,
     ) -> Result<Vec<u8>, DriverError> {
-        if process_id == 0 || address == 0 || size == 0 || size > 256 {
+        if process_id == 0 || address == 0 || size == 0 || size > MAX_DRIVER_TRANSFER_SIZE as u64 {
             return Err(DriverError::ResponseParseFailed);
         }
         let handle = self.handle.as_ref().ok_or(DriverError::NotConnected)?;
 
         let mut bytes_returned = 0u32;
-        let mut buffer = [0u8; 272];
+        let mut buffer = [0u8; 8 + MAX_DRIVER_TRANSFER_SIZE + 4];
 
         let request = MemoryReadRequest {
             process_id,
@@ -170,7 +171,7 @@ impl DriverComm {
             return Err(DriverError::IoctlFailed(err));
         }
 
-        if (bytes_returned as usize) < 268 {
+        if (bytes_returned as usize) < 8 + MAX_DRIVER_TRANSFER_SIZE {
             return Err(DriverError::ResponseParseFailed);
         }
 
@@ -184,7 +185,7 @@ impl DriverComm {
         }
         if buffer[4] == 0 {
             let error_code = u32::from_ne_bytes(
-                buffer[264..268]
+                buffer[8 + MAX_DRIVER_TRANSFER_SIZE..12 + MAX_DRIVER_TRANSFER_SIZE]
                     .try_into()
                     .map_err(|_| DriverError::ResponseParseFailed)?,
             );
@@ -200,19 +201,19 @@ impl DriverComm {
         address: u64,
         data: &[u8],
     ) -> Result<(), DriverError> {
-        if process_id == 0 || address == 0 || data.is_empty() || data.len() > 256 {
+        if process_id == 0 || address == 0 || data.is_empty() || data.len() > MAX_DRIVER_TRANSFER_SIZE {
             return Err(DriverError::ResponseParseFailed);
         }
         let handle = self.handle.as_ref().ok_or(DriverError::NotConnected)?;
 
         let mut bytes_returned = 0u32;
-        let mut buffer = [0u8; 272];
+        let mut buffer = [0u8; 8 + MAX_DRIVER_TRANSFER_SIZE + 4];
 
         let mut request = MemoryWriteRequest {
             process_id,
             address,
             size: data.len() as u64,
-            data: [0u8; 256],
+            data: [0u8; MAX_DRIVER_TRANSFER_SIZE],
         };
 
         request.data[..data.len()].copy_from_slice(data);
@@ -274,7 +275,7 @@ impl DriverComm {
         relative_address: u64,
         size: u64,
     ) -> Result<Vec<u8>, DriverError> {
-        if process_id == 0 || size == 0 || size > 256 {
+        if process_id == 0 || size == 0 || size > MAX_DRIVER_TRANSFER_SIZE as u64 {
             return Err(DriverError::ResponseParseFailed);
         }
         let handle = self.handle.as_ref().ok_or(DriverError::NotConnected)?;
@@ -283,7 +284,7 @@ impl DriverComm {
             relative_address,
             size,
         };
-        let mut buffer = [0u8; 272];
+        let mut buffer = [0u8; 8 + MAX_DRIVER_TRANSFER_SIZE + 4];
         let mut returned = 0u32;
         let ok = unsafe {
             windows_sys::Win32::System::IO::DeviceIoControl(
@@ -302,14 +303,18 @@ impl DriverComm {
                 windows_sys::Win32::Foundation::GetLastError()
             }));
         }
-        if returned < 268 {
+        if returned < 8 + MAX_DRIVER_TRANSFER_SIZE as u32 {
             return Err(DriverError::ResponseParseFailed);
         }
         if u32::from_ne_bytes(buffer[..4].try_into().unwrap()) != 0x4B53_5231 {
             return Err(DriverError::ResponseParseFailed);
         }
         if buffer[4] == 0 {
-            let error_code = u32::from_ne_bytes(buffer[264..268].try_into().unwrap());
+            let error_code = u32::from_ne_bytes(
+                buffer[8 + MAX_DRIVER_TRANSFER_SIZE..12 + MAX_DRIVER_TRANSFER_SIZE]
+                    .try_into()
+                    .unwrap(),
+            );
             tracing::error!(
                 pid = process_id,
                 relative_address,
@@ -327,7 +332,7 @@ impl DriverComm {
         relative_address: u64,
         data: &[u8],
     ) -> Result<(), DriverError> {
-        if process_id == 0 || data.is_empty() || data.len() > 256 {
+        if process_id == 0 || data.is_empty() || data.len() > MAX_DRIVER_TRANSFER_SIZE {
             return Err(DriverError::ResponseParseFailed);
         }
         let handle = self.handle.as_ref().ok_or(DriverError::NotConnected)?;
@@ -335,7 +340,7 @@ impl DriverComm {
             process_id,
             relative_address,
             size: data.len() as u64,
-            data: [0; 256],
+            data: [0; MAX_DRIVER_TRANSFER_SIZE],
         };
         request.data[..data.len()].copy_from_slice(data);
         let mut returned = 0u32;
@@ -422,12 +427,12 @@ impl DriverComm {
         address: u64,
         size: u64,
     ) -> Result<Vec<u8>, DriverError> {
-        if process_id == 0 || address == 0 || size == 0 || size > 256 {
+        if process_id == 0 || address == 0 || size == 0 || size > MAX_DRIVER_TRANSFER_SIZE as u64 {
             return Err(DriverError::ResponseParseFailed);
         }
         let handle = self.handle.as_ref().ok_or(DriverError::NotConnected)?;
         let mut bytes_returned = 0u32;
-        let mut buffer = [0u8; 272];
+        let mut buffer = [0u8; 8 + MAX_DRIVER_TRANSFER_SIZE + 4];
         let request = MemoryReadRequest {
             process_id,
             address,
@@ -449,7 +454,7 @@ impl DriverComm {
             let err = unsafe { windows_sys::Win32::Foundation::GetLastError() };
             return Err(DriverError::IoctlFailed(err));
         }
-        if (bytes_returned as usize) < 268 {
+        if (bytes_returned as usize) < 8 + MAX_DRIVER_TRANSFER_SIZE {
             return Err(DriverError::ResponseParseFailed);
         }
         if u32::from_ne_bytes(
@@ -462,7 +467,7 @@ impl DriverComm {
         }
         if buffer[4] == 0 {
             let error_code = u32::from_ne_bytes(
-                buffer[264..268]
+                buffer[8 + MAX_DRIVER_TRANSFER_SIZE..12 + MAX_DRIVER_TRANSFER_SIZE]
                     .try_into()
                     .map_err(|_| DriverError::ResponseParseFailed)?,
             );
@@ -478,17 +483,17 @@ impl DriverComm {
         address: u64,
         data: &[u8],
     ) -> Result<(), DriverError> {
-        if process_id == 0 || address == 0 || data.is_empty() || data.len() > 256 {
+        if process_id == 0 || address == 0 || data.is_empty() || data.len() > MAX_DRIVER_TRANSFER_SIZE {
             return Err(DriverError::ResponseParseFailed);
         }
         let handle = self.handle.as_ref().ok_or(DriverError::NotConnected)?;
         let mut bytes_returned = 0u32;
-        let mut buffer = [0u8; 272];
+        let mut buffer = [0u8; 8 + MAX_DRIVER_TRANSFER_SIZE + 4];
         let mut request = MemoryWriteRequest {
             process_id,
             address,
             size: data.len() as u64,
-            data: [0u8; 256],
+            data: [0u8; MAX_DRIVER_TRANSFER_SIZE],
         };
         request.data[..data.len()].copy_from_slice(data);
         let result = unsafe {
