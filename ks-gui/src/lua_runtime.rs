@@ -208,7 +208,8 @@ enum AsyncRequest {
     },
     BatchRead {
         pid: u64,
-        entries: Vec<ks_core::protocol::BatchReadEntry>,
+        size: u32,
+        addresses: Vec<u64>,
     },
     ListProcesses,
 }
@@ -320,8 +321,8 @@ impl AsyncScheduler {
                 .write_memory_mdl_rva(pid, relative_address, &data)
                 .await
                 .map(|()| AsyncValue::Unit),
-            AsyncRequest::BatchRead { pid, entries } => client
-                .batch_read_memory(pid, &entries)
+            AsyncRequest::BatchRead { pid, size, addresses } => client
+                .batch_read_memory(pid, size, &addresses)
                 .await
                 .map(AsyncValue::Bytes),
             AsyncRequest::ListProcesses => client.list_processes().await.map(AsyncValue::Processes),
@@ -1555,27 +1556,25 @@ fn register_memory_api(lua: &Lua, async_scheduler: AsyncScheduler) -> mlua::Resu
         let scheduler = async_scheduler.clone();
         module.set(
             "async_batch_read",
-            lua.create_function(move |_, (pid, entries_table): (u64, mlua::Table)| {
-                let count = entries_table.len()? as usize;
+            lua.create_function(move |_, (pid, size, addresses_table): (u64, u64, mlua::Table)| {
+                let size =
+                    u32::try_from(size).map_err(|_| mlua::Error::runtime("size too large"))?;
+                if size == 0 || size > ks_core::protocol::MAX_DRIVER_TRANSFER_SIZE as u32 {
+                    return Err(mlua::Error::runtime("invalid read size"));
+                }
+                let count = addresses_table.len()? as usize;
                 if count == 0 || count > ks_core::protocol::MAX_BATCH_ENTRIES {
                     return Err(mlua::Error::runtime(
-                        "batch read: 0 < entries <= MAX_BATCH_ENTRIES",
+                        "batch read: 0 < count <= MAX_BATCH_ENTRIES",
                     ));
                 }
-                let mut entries = Vec::with_capacity(count);
+                let mut addresses = Vec::with_capacity(count);
                 for i in 1..=count {
-                    let entry: mlua::Table = entries_table.get(i)?;
-                    let address: u64 = entry.get("address")?;
-                    let size: u64 = entry.get("size")?;
-                    let size =
-                        u32::try_from(size).map_err(|_| mlua::Error::runtime("size too large"))?;
-                    if size == 0 || size > ks_core::protocol::MAX_DRIVER_TRANSFER_SIZE as u32 {
-                        return Err(mlua::Error::runtime("invalid entry size"));
-                    }
-                    entries.push(ks_core::protocol::BatchReadEntry { address, size });
+                    let addr: u64 = addresses_table.get(i)?;
+                    addresses.push(addr);
                 }
                 scheduler
-                    .submit(AsyncRequest::BatchRead { pid, entries })
+                    .submit(AsyncRequest::BatchRead { pid, size, addresses })
                     .map_err(mlua::Error::external)
             })?,
         )?;

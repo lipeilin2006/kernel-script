@@ -328,19 +328,21 @@ impl IpcClient {
     pub async fn batch_read_memory(
         &self,
         pid: u64,
-        entries: &[BatchReadEntry],
+        size: u32,
+        addresses: &[u64],
     ) -> Result<Vec<u8>, String> {
-        let mut payload = Vec::with_capacity(12 + entries.len() * BATCH_READ_ENTRY_WIRE_SIZE);
+        let mut payload = Vec::with_capacity(16 + addresses.len() * 8);
         payload.extend_from_slice(&pid.to_le_bytes());
-        payload.extend_from_slice(&(entries.len() as u32).to_le_bytes());
-        for e in entries {
-            payload.extend_from_slice(&e.address.to_le_bytes());
-            payload.extend_from_slice(&e.size.to_le_bytes());
+        payload.extend_from_slice(&size.to_le_bytes());
+        payload.extend_from_slice(&(addresses.len() as u32).to_le_bytes());
+        for &addr in addresses {
+            payload.extend_from_slice(&addr.to_le_bytes());
         }
         match self
             .send_request(&Request::BatchReadMemory {
                 pid,
-                entries: &payload[12..],
+                size,
+                addresses: &payload[16..],
             })
             .await?
         {

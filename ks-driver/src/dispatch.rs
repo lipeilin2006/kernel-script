@@ -335,19 +335,21 @@ unsafe extern "system" fn dispatch_device_control(
                     (STATUS_BUFFER_TOO_SMALL, 0)
                 } else {
                     let pid = ptr::read_unaligned(system as *const u64);
-                    let count = ptr::read_unaligned(system.add(8) as *const u32) as usize;
+                    let size = ptr::read_unaligned(system.add(8) as *const u32);
+                    let count = ptr::read_unaligned(system.add(12) as *const u32) as usize;
                     if pid == 0
                         || count == 0
                         || count > MAX_BATCH_ENTRIES
-                        || input_length < (12 + count * BATCH_READ_ENTRY_WIRE_SIZE) as u32
+                        || size == 0
+                        || size > MAX_DRIVER_TRANSFER_SIZE as u32
+                        || input_length < (16 + count * 8) as u32
                     {
                         (STATUS_INVALID_PARAMETER, 0)
                     } else {
                         let mut entries = [(0u64, 0u32); MAX_BATCH_ENTRIES];
                         for i in 0..count {
-                            let base = 12 + i * BATCH_READ_ENTRY_WIRE_SIZE;
+                            let base = 16 + i * 8;
                             let addr = ptr::read_unaligned(system.add(base) as *const u64);
-                            let size = ptr::read_unaligned(system.add(base + 8) as *const u32);
                             entries[i] = (addr, size);
                         }
                         match memory::batch_read_process_memory(

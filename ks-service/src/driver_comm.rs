@@ -499,23 +499,26 @@ fn write_memory_via(
 pub fn batch_read_memory(
     handle: &DriverHandle,
     process_id: u64,
-    entries: &[(u64, u32)],
+    size: u32,
+    addresses: &[u64],
 ) -> Result<Vec<u8>, DriverError> {
-    if process_id == 0 || entries.is_empty() || entries.len() > MAX_BATCH_ENTRIES {
+    if process_id == 0 || addresses.is_empty() || addresses.len() > MAX_BATCH_ENTRIES
+        || size == 0 || size > MAX_DRIVER_TRANSFER_SIZE as u32
+    {
         return Err(DriverError::ResponseParseFailed);
     }
-    let input_size = 12 + entries.len() * BATCH_READ_ENTRY_WIRE_SIZE;
+    let input_size = 16 + addresses.len() * 8;
     let mut input = vec![0u8; input_size];
     input[..8].copy_from_slice(&process_id.to_le_bytes());
-    input[8..12].copy_from_slice(&(entries.len() as u32).to_le_bytes());
-    for (i, &(addr, size)) in entries.iter().enumerate() {
-        let off = 12 + i * BATCH_READ_ENTRY_WIRE_SIZE;
+    input[8..12].copy_from_slice(&size.to_le_bytes());
+    input[12..16].copy_from_slice(&(addresses.len() as u32).to_le_bytes());
+    for (i, &addr) in addresses.iter().enumerate() {
+        let off = 16 + i * 8;
         input[off..off + 8].copy_from_slice(&addr.to_le_bytes());
-        input[off + 8..off + 12].copy_from_slice(&size.to_le_bytes());
     }
 
     let mut bytes_returned = 0u32;
-    let output_size = entries.iter().map(|&(_, s)| s as usize).sum::<usize>();
+    let output_size = addresses.len() * size as usize;
     let mut output = vec![0u8; output_size];
 
     let result = unsafe {

@@ -346,7 +346,8 @@ pub enum Request<'a> {
     },
     BatchReadMemory {
         pid: u64,
-        entries: &'a [u8],
+        size: u32,
+        addresses: &'a [u8],
     },
 }
 
@@ -489,8 +490,8 @@ impl<'a> WireEncode for Request<'a> {
             Self::WriteProcessMemory { data, .. } => 20usize
                 .checked_add(data.len())
                 .ok_or(ProtocolError::TooLarge)?,
-            Self::BatchReadMemory { entries, .. } => {
-                12 + entries.len()
+            Self::BatchReadMemory { addresses, .. } => {
+                16 + addresses.len()
             }
         };
         if n > MAX_FRAME_SIZE - HEADER_SIZE {
@@ -582,11 +583,12 @@ impl<'a> WireEncode for Request<'a> {
                 out[26..30].copy_from_slice(&(data.len() as u32).to_le_bytes());
                 out[30..total].copy_from_slice(data);
             }
-            Self::BatchReadMemory { pid, entries } => {
+            Self::BatchReadMemory { pid, size, addresses } => {
                 out[10..18].copy_from_slice(&pid.to_le_bytes());
-                let count = (entries.len() / BATCH_READ_ENTRY_WIRE_SIZE) as u32;
-                out[18..22].copy_from_slice(&count.to_le_bytes());
-                out[22..total].copy_from_slice(entries);
+                out[18..22].copy_from_slice(&size.to_le_bytes());
+                let count = (addresses.len() / 8) as u32;
+                out[22..26].copy_from_slice(&count.to_le_bytes());
+                out[26..total].copy_from_slice(addresses);
             }
         }
         Ok(total)
@@ -676,16 +678,20 @@ impl<'a> WireDecode<'a> for Request<'a> {
                     data: &p[20..],
                 })
             }
-            MessageType::BatchReadMemory if p.len() >= 12 => {
+            MessageType::BatchReadMemory if p.len() >= 16 => {
                 let pid = u64::from_le_bytes(p[..8].try_into().unwrap());
-                let count = u32::from_le_bytes(p[8..12].try_into().unwrap()) as usize;
-                let expected = 12 + count * BATCH_READ_ENTRY_WIRE_SIZE;
-                if p.len() != expected || count > MAX_BATCH_ENTRIES {
+                let size = u32::from_le_bytes(p[8..12].try_into().unwrap());
+                let count = u32::from_le_bytes(p[12..16].try_into().unwrap()) as usize;
+                let expected = 16 + count * 8;
+                if p.len() != expected || count > MAX_BATCH_ENTRIES || size == 0
+                    || size > MAX_DRIVER_TRANSFER_SIZE as u32
+                {
                     return Err(ProtocolError::InvalidPayload);
                 }
                 Ok(Self::BatchReadMemory {
                     pid,
-                    entries: &p[12..],
+                    size,
+                    addresses: &p[16..],
                 })
             }
             _ => Err(ProtocolError::InvalidPayload),

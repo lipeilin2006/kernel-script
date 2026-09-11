@@ -308,16 +308,15 @@ fn dispatch_sync(
                 data: data.to_vec(),
             }
         }
-        Request::BatchReadMemory { pid, entries } => {
-            let count = entries.len() / BATCH_READ_ENTRY_WIRE_SIZE;
+        Request::BatchReadMemory { pid, size, addresses } => {
+            let count = addresses.len() / 8;
             let mut parsed = Vec::with_capacity(count);
             for i in 0..count {
-                let off = i * BATCH_READ_ENTRY_WIRE_SIZE;
-                let addr = u64::from_le_bytes(entries[off..off + 8].try_into().unwrap());
-                let size = u32::from_le_bytes(entries[off + 8..off + 12].try_into().unwrap());
-                parsed.push((addr, size));
+                let off = i * 8;
+                let addr = u64::from_le_bytes(addresses[off..off + 8].try_into().unwrap());
+                parsed.push(addr);
             }
-            OwnedRequest::BatchRead { pid, entries: parsed }
+            OwnedRequest::BatchRead { pid, size, addresses: parsed }
         }
     };
 
@@ -417,11 +416,11 @@ fn dispatch_sync(
                 }
             }
         }
-        OwnedRequest::BatchRead { pid, entries } => {
-            match driver_comm::batch_read_memory(handle, pid, &entries) {
+        OwnedRequest::BatchRead { pid, size, addresses } => {
+            match driver_comm::batch_read_memory(handle, pid, size, &addresses) {
                 Ok(data) => encode_response(Response::BatchReadMemory(&data)),
                 Err(error) => {
-                    tracing::error!(pid, entries = entries.len(), %error, "driver batch read failed");
+                    tracing::error!(pid, addresses = addresses.len(), %error, "driver batch read failed");
                     encode_error_detail(&error)
                 }
             }
@@ -491,7 +490,8 @@ enum OwnedRequest {
     },
     BatchRead {
         pid: u64,
-        entries: Vec<(u64, u32)>,
+        size: u32,
+        addresses: Vec<u64>,
     },
 }
 
