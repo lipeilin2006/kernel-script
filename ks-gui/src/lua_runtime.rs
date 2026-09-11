@@ -329,11 +329,8 @@ impl AsyncScheduler {
             .try_acquire_owned()
             .map_err(|_| "IPC task queue is full".to_owned())?;
         let task_id = id;
-        tracing::info!(task_id, "submitting IPC task");
         self.runtime.spawn(async move {
-            tracing::info!(task_id, "IPC task started");
             let result = Self::execute(request).await;
-            tracing::info!(task_id, "IPC task completed");
             let _ = result_tx.send((task_id, result));
             drop(permit);
         });

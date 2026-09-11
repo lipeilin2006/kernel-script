@@ -5,16 +5,19 @@ use std::time::Instant;
 use ks_core::protocol::{Frame, ReadProcessMemory, Request, Response, WireDecode, WireEncode};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::windows::named_pipe::{ClientOptions, NamedPipeClient};
-use tokio::sync::Mutex;
 
 const PIPE_NAME: &str = r"\\.\pipe\KernelScript";
 const IPC_TIMEOUT: Duration = Duration::from_secs(5);
 const RECONNECT_DELAY: Duration = Duration::from_millis(5);
 const MAX_MESSAGE_SIZE: usize = 1024 * 1024;
 
+type ResponseMap = std::collections::HashMap<u64, tokio::sync::oneshot::Sender<Result<Vec<u8>, String>>>;
+
 #[derive(Clone)]
 pub struct IpcClient {
-    inner: Arc<Mutex<Option<NamedPipeClient>>>,
+    sender: tokio::sync::mpsc::UnboundedSender<(u64, Vec<u8>)>,
+    next_id: Arc<std::sync::atomic::AtomicU64>,
+    responses: Arc<tokio::sync::Mutex<ResponseMap>>,
 }
 
 enum OwnedResponse {
@@ -37,30 +40,17 @@ pub struct ProcessInfo {
 
 impl IpcClient {
     pub fn new() -> Self {
+        let (req_tx, req_rx) = tokio::sync::mpsc::unbounded_channel::<(u64, Vec<u8>)>();
+        let responses: Arc<tokio::sync::Mutex<ResponseMap>> =
+            Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+        let responses_clone = responses.clone();
+
+        tokio::spawn(connection_task(req_rx, responses_clone));
+
         Self {
-            inner: Arc::new(Mutex::new(None)),
-        }
-    }
-
-    async fn get_stream(&self) -> Result<tokio::sync::MutexGuard<'_, Option<NamedPipeClient>>, String> {
-        let mut guard = self.inner.lock().await;
-        if guard.is_none() {
-            let stream = Self::connect().await?;
-            *guard = Some(stream);
-        }
-        Ok(guard)
-    }
-
-    async fn connect() -> Result<NamedPipeClient, String> {
-        let deadline = Instant::now() + IPC_TIMEOUT;
-        loop {
-            match ClientOptions::new().open(PIPE_NAME) {
-                Ok(stream) => return Ok(stream),
-                Err(_error) if Instant::now() < deadline => {
-                    tokio::time::sleep(RECONNECT_DELAY).await;
-                }
-                Err(error) => return Err(format!("connect failed: {error}")),
-            }
+            sender: req_tx,
+            next_id: Arc::new(std::sync::atomic::AtomicU64::new(1)),
+            responses,
         }
     }
 
@@ -75,57 +65,35 @@ impl IpcClient {
             .encode(&mut output)
             .map_err(|e| format!("encode request: {e:?}"))?;
 
-        // Try once with existing connection; reconnect on failure.
-        let result = self.try_send(&output).await;
-        match result {
-            Ok(response) => Ok(response),
-            Err(_first_error) => {
-                // Drop broken connection, reconnect, retry once.
-                {
-                    let mut guard = self.inner.lock().await;
-                    *guard = None;
-                }
-                let stream = Self::connect().await?;
-                {
-                    let mut guard = self.inner.lock().await;
-                    *guard = Some(stream);
-                }
-                self.try_send(&output).await
-            }
+        let id = self.next_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
+
+        {
+            let mut map = self.responses.lock().await;
+            map.insert(id, resp_tx);
         }
-    }
 
-    async fn try_send(&self, output: &[u8]) -> Result<OwnedResponse, String> {
-        let mut guard = self.inner.lock().await;
-        let stream = guard
-            .as_mut()
-            .ok_or_else(|| "no connection".to_owned())?;
+        self.sender
+            .send((id, output))
+            .map_err(|_| "connection task closed".to_owned())?;
 
-        tokio::time::timeout(IPC_TIMEOUT, stream.write_all(output))
+        let result = tokio::time::timeout(IPC_TIMEOUT, resp_rx)
             .await
-            .map_err(|_| "IPC write timed out".to_owned())?
-            .map_err(|error| format!("write request failed: {error}"))?;
+            .map_err(|_| {
+                tokio::spawn({
+                    let responses = self.responses.clone();
+                    async move {
+                        let mut map = responses.lock().await;
+                        map.remove(&id);
+                    }
+                });
+                "IPC response timed out".to_owned()
+            })?
+            .map_err(|_| "connection task dropped sender".to_owned())?;
 
-        let mut header = [0u8; ks_core::protocol::HEADER_SIZE];
-        tokio::time::timeout(IPC_TIMEOUT, stream.read_exact(&mut header))
-            .await
-            .map_err(|_| "IPC header read timed out".to_owned())?
-            .map_err(|error| format!("read response header failed: {error}"))?;
-        let payload_len = u32::from_le_bytes(header[6..10].try_into().unwrap()) as usize;
-        if payload_len > MAX_MESSAGE_SIZE - ks_core::protocol::HEADER_SIZE {
-            return Err("response too large".into());
-        }
-        let mut response = vec![0u8; ks_core::protocol::HEADER_SIZE + payload_len];
-        response[..ks_core::protocol::HEADER_SIZE].copy_from_slice(&header);
-        tokio::time::timeout(
-            IPC_TIMEOUT,
-            stream.read_exact(&mut response[ks_core::protocol::HEADER_SIZE..]),
-        )
-        .await
-        .map_err(|_| "IPC payload read timed out".to_owned())?
-        .map_err(|error| format!("read response payload failed: {error}"))?;
-
-        let frame = Frame::parse(&response).map_err(|e| format!("parse response: {e:?}"))?;
+        let response_bytes = result?;
+        let frame =
+            Frame::parse(&response_bytes).map_err(|e| format!("parse response: {e:?}"))?;
         match Response::decode(frame.message_type, frame.payload)
             .map_err(|e| format!("decode response: {e:?}"))?
         {
@@ -358,3 +326,103 @@ impl Default for IpcClient {
         Self::new()
     }
 }
+
+async fn connect() -> Result<NamedPipeClient, String> {
+    let deadline = Instant::now() + IPC_TIMEOUT;
+    loop {
+        match ClientOptions::new().open(PIPE_NAME) {
+            Ok(stream) => return Ok(stream),
+            Err(_error) if Instant::now() < deadline => {
+                tokio::time::sleep(RECONNECT_DELAY).await;
+            }
+            Err(error) => return Err(format!("connect failed: {error}")),
+        }
+    }
+}
+
+async fn connection_task(
+    mut req_rx: tokio::sync::mpsc::UnboundedReceiver<(u64, Vec<u8>)>,
+    responses: Arc<tokio::sync::Mutex<ResponseMap>>,
+) {
+    let mut stream = match connect().await {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::error!("initial connection failed: {e}");
+            return;
+        }
+    };
+
+    while let Some((id, request_bytes)) = req_rx.recv().await {
+        if let Err(e) = stream.write_all(&request_bytes).await {
+            tracing::warn!("write failed: {e}, reconnecting");
+            stream = match reconnect_or_die(&responses, id, &e).await {
+                Some(s) => s,
+                None => return,
+            };
+            // Retry the failed request once.
+            if let Err(e) = stream.write_all(&request_bytes).await {
+                tracing::error!("retry write also failed: {e}");
+                respond_error(&responses, id, "write failed".into()).await;
+                continue;
+            }
+        }
+
+        let mut header = [0u8; ks_core::protocol::HEADER_SIZE];
+        if let Err(e) = stream.read_exact(&mut header).await {
+            tracing::warn!("header read failed: {e}, reconnecting");
+            stream = match reconnect_or_die(&responses, id, &e).await {
+                Some(s) => s,
+                None => return,
+            };
+            respond_error(&responses, id, "read header failed".into()).await;
+            continue;
+        }
+
+        let payload_len = u32::from_le_bytes(header[6..10].try_into().unwrap()) as usize;
+        if payload_len > MAX_MESSAGE_SIZE - HEADER_SIZE {
+            respond_error(&responses, id, "response too large".into()).await;
+            continue;
+        }
+
+        let mut response = vec![0u8; HEADER_SIZE + payload_len];
+        response[..HEADER_SIZE].copy_from_slice(&header);
+        if let Err(e) = stream.read_exact(&mut response[HEADER_SIZE..]).await {
+            tracing::warn!("payload read failed: {e}, reconnecting");
+            stream = match reconnect_or_die(&responses, id, &e).await {
+                Some(s) => s,
+                None => return,
+            };
+            respond_error(&responses, id, "read payload failed".into()).await;
+            continue;
+        }
+
+        let mut map = responses.lock().await;
+        if let Some(tx) = map.remove(&id) {
+            let _ = tx.send(Ok(response));
+        }
+    }
+}
+
+async fn reconnect_or_die(
+    responses: &Arc<tokio::sync::Mutex<ResponseMap>>,
+    failed_id: u64,
+    _error: &std::io::Error,
+) -> Option<NamedPipeClient> {
+    respond_error(responses, failed_id, "connection lost".into()).await;
+    match connect().await {
+        Ok(s) => Some(s),
+        Err(e) => {
+            tracing::error!("reconnect failed: {e}");
+            None
+        }
+    }
+}
+
+async fn respond_error(responses: &Arc<tokio::sync::Mutex<ResponseMap>>, id: u64, error: String) {
+    let mut map = responses.lock().await;
+    if let Some(tx) = map.remove(&id) {
+        let _ = tx.send(Err(error));
+    }
+}
+
+use ks_core::protocol::HEADER_SIZE;
