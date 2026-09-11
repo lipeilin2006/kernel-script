@@ -1,16 +1,21 @@
+use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
 
 use ks_core::protocol::{Frame, ReadProcessMemory, Request, Response, WireDecode, WireEncode};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::windows::named_pipe::{ClientOptions, NamedPipeClient};
+use tokio::sync::Mutex;
 
 const PIPE_NAME: &str = r"\\.\pipe\KernelScript";
 const IPC_TIMEOUT: Duration = Duration::from_secs(5);
+const RECONNECT_DELAY: Duration = Duration::from_millis(5);
 const MAX_MESSAGE_SIZE: usize = 1024 * 1024;
 
-#[derive(Clone, Default)]
-pub struct IpcClient;
+#[derive(Clone)]
+pub struct IpcClient {
+    inner: Arc<Mutex<Option<NamedPipeClient>>>,
+}
 
 enum OwnedResponse {
     Memory(Vec<u8>),
@@ -32,21 +37,34 @@ pub struct ProcessInfo {
 
 impl IpcClient {
     pub fn new() -> Self {
-        Self
+        Self {
+            inner: Arc::new(Mutex::new(None)),
+        }
     }
 
-    async fn send_request(&self, request: &Request<'_>) -> Result<OwnedResponse, String> {
+    async fn get_stream(&self) -> Result<tokio::sync::MutexGuard<'_, Option<NamedPipeClient>>, String> {
+        let mut guard = self.inner.lock().await;
+        if guard.is_none() {
+            let stream = Self::connect().await?;
+            *guard = Some(stream);
+        }
+        Ok(guard)
+    }
+
+    async fn connect() -> Result<NamedPipeClient, String> {
         let deadline = Instant::now() + IPC_TIMEOUT;
-        let mut stream: NamedPipeClient = loop {
+        loop {
             match ClientOptions::new().open(PIPE_NAME) {
-                Ok(stream) => break stream,
+                Ok(stream) => return Ok(stream),
                 Err(_error) if Instant::now() < deadline => {
-                    tokio::time::sleep(Duration::from_millis(25)).await;
+                    tokio::time::sleep(RECONNECT_DELAY).await;
                 }
                 Err(error) => return Err(format!("connect failed: {error}")),
             }
-        };
+        }
+    }
 
+    async fn send_request(&self, request: &Request<'_>) -> Result<OwnedResponse, String> {
         let mut output = vec![
             0u8;
             request
@@ -56,7 +74,34 @@ impl IpcClient {
         request
             .encode(&mut output)
             .map_err(|e| format!("encode request: {e:?}"))?;
-        tokio::time::timeout(IPC_TIMEOUT, stream.write_all(&output))
+
+        // Try once with existing connection; reconnect on failure.
+        let result = self.try_send(&output).await;
+        match result {
+            Ok(response) => Ok(response),
+            Err(_first_error) => {
+                // Drop broken connection, reconnect, retry once.
+                {
+                    let mut guard = self.inner.lock().await;
+                    *guard = None;
+                }
+                let stream = Self::connect().await?;
+                {
+                    let mut guard = self.inner.lock().await;
+                    *guard = Some(stream);
+                }
+                self.try_send(&output).await
+            }
+        }
+    }
+
+    async fn try_send(&self, output: &[u8]) -> Result<OwnedResponse, String> {
+        let mut guard = self.inner.lock().await;
+        let stream = guard
+            .as_mut()
+            .ok_or_else(|| "no connection".to_owned())?;
+
+        tokio::time::timeout(IPC_TIMEOUT, stream.write_all(output))
             .await
             .map_err(|_| "IPC write timed out".to_owned())?
             .map_err(|error| format!("write request failed: {error}"))?;
@@ -124,6 +169,69 @@ impl IpcClient {
             .await?
         {
             OwnedResponse::Memory(value) => Ok(value),
+            OwnedResponse::Error(code) => Err(format!("service error: {code}")),
+            OwnedResponse::ErrorDetail(detail) => Err(detail),
+            _ => Err("unexpected response".into()),
+        }
+    }
+
+    pub async fn write_memory(
+        &self,
+        pid: u64,
+        address: u64,
+        data: &[u8],
+    ) -> Result<(), String> {
+        match self
+            .send_request(&Request::WriteProcessMemory {
+                pid,
+                target_address: address,
+                data,
+            })
+            .await?
+        {
+            OwnedResponse::WriteComplete => Ok(()),
+            OwnedResponse::Error(code) => Err(format!("service error: {code}")),
+            OwnedResponse::ErrorDetail(detail) => Err(detail),
+            _ => Err("unexpected response".into()),
+        }
+    }
+
+    pub async fn read_memory_rva(
+        &self,
+        pid: u64,
+        relative_address: u64,
+        size: u64,
+    ) -> Result<Vec<u8>, String> {
+        match self
+            .send_request(&Request::ReadMemoryRva {
+                pid,
+                relative_address,
+                size,
+            })
+            .await?
+        {
+            OwnedResponse::Memory(value) => Ok(value),
+            OwnedResponse::Error(code) => Err(format!("service error: {code}")),
+            OwnedResponse::ErrorDetail(detail) => Err(detail),
+            _ => Err("unexpected response".into()),
+        }
+    }
+
+    pub async fn write_memory_rva(
+        &self,
+        pid: u64,
+        relative_address: u64,
+        data: &[u8],
+    ) -> Result<(), String> {
+        match self
+            .send_request(&Request::WriteMemoryRva {
+                pid,
+                relative_address,
+                data,
+            })
+            .await?
+        {
+            OwnedResponse::WriteComplete => Ok(()),
             OwnedResponse::Error(code) => Err(format!("service error: {code}")),
             OwnedResponse::ErrorDetail(detail) => Err(detail),
             _ => Err("unexpected response".into()),
@@ -214,74 +322,7 @@ impl IpcClient {
         }
     }
 
-    pub async fn get_process_base(&self, pid: u64) -> Result<u64, String> {
-        match self.send_request(&Request::GetProcessBase { pid }).await? {
-            OwnedResponse::ProcessBase(base) => Ok(base),
-            OwnedResponse::Error(code) => Err(format!("service error: {code}")),
-            OwnedResponse::ErrorDetail(detail) => Err(detail),
-            _ => Err("unexpected response".into()),
-        }
-    }
-
-    pub async fn read_memory_rva(
-        &self,
-        pid: u64,
-        relative_address: u64,
-        size: u64,
-    ) -> Result<Vec<u8>, String> {
-        match self
-            .send_request(&Request::ReadMemoryRva {
-                pid,
-                relative_address,
-                size,
-            })
-            .await?
-        {
-            OwnedResponse::Memory(value) => Ok(value),
-            OwnedResponse::Error(code) => Err(format!("service error: {code}")),
-            OwnedResponse::ErrorDetail(detail) => Err(detail),
-            _ => Err("unexpected response".into()),
-        }
-    }
-
-    pub async fn write_memory_rva(
-        &self,
-        pid: u64,
-        relative_address: u64,
-        data: &[u8],
-    ) -> Result<(), String> {
-        match self
-            .send_request(&Request::WriteMemoryRva {
-                pid,
-                relative_address,
-                data,
-            })
-            .await?
-        {
-            OwnedResponse::WriteComplete => Ok(()),
-            OwnedResponse::Error(code) => Err(format!("service error: {code}")),
-            OwnedResponse::ErrorDetail(detail) => Err(detail),
-            _ => Err("unexpected response".into()),
-        }
-    }
-
-    pub async fn write_memory(&self, pid: u64, address: u64, data: &[u8]) -> Result<(), String> {
-        match self
-            .send_request(&Request::WriteProcessMemory {
-                pid,
-                target_address: address,
-                data,
-            })
-            .await?
-        {
-            OwnedResponse::WriteComplete => Ok(()),
-            OwnedResponse::Error(code) => Err(format!("service error: {code}")),
-            OwnedResponse::ErrorDetail(detail) => Err(detail),
-            _ => Err("unexpected response".into()),
-        }
-    }
-
-    pub async fn get_process_id(&self, name: &str) -> Result<u64, String> {
+    pub async fn get_pid(&self, name: &str) -> Result<u64, String> {
         let name = name.trim();
         if name.is_empty() || name.len() > 255 || name.bytes().any(|byte| byte == 0) {
             return Err("process name must be 1..255 bytes and contain no NUL".into());
@@ -297,5 +338,23 @@ impl IpcClient {
             OwnedResponse::ErrorDetail(detail) => Err(detail),
             _ => Err("unexpected response".into()),
         }
+    }
+
+    pub async fn get_process_base(&self, pid: u64) -> Result<u64, String> {
+        match self
+            .send_request(&Request::GetProcessBase { pid })
+            .await?
+        {
+            OwnedResponse::ProcessBase(base) => Ok(base),
+            OwnedResponse::Error(code) => Err(format!("service error: {code}")),
+            OwnedResponse::ErrorDetail(detail) => Err(detail),
+            _ => Err("unexpected response".into()),
+        }
+    }
+}
+
+impl Default for IpcClient {
+    fn default() -> Self {
+        Self::new()
     }
 }

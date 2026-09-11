@@ -271,7 +271,7 @@ impl AsyncScheduler {
                 .await
                 .map(|()| AsyncValue::Unit),
             AsyncRequest::GetPid { name } => {
-                client.get_process_id(&name).await.map(AsyncValue::Pid)
+                client.get_pid(&name).await.map(AsyncValue::Pid)
             }
             AsyncRequest::GetProcessBase { pid } => {
                 client.get_process_base(pid).await.map(AsyncValue::Pid)
