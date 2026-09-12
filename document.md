@@ -1,9 +1,9 @@
-# Kernel Script Lua API
+# Kernel Script Luau API
 
-This document describes the Lua APIs registered by `ks-gui`. Each `scripts/*.lua`
-script runs in its own Lua VM. All scripts share scalar values through
-`shared.set/get/delete` but do not share Lua tables, functions, threads, or
-userdata.
+This document describes the Luau APIs registered by `ks-gui`. Each `scripts/*.lua`
+script runs in its own Luau VM with JIT compilation enabled. All scripts share
+scalar values through `shared.set/get/delete` but do not share Luau tables,
+functions, threads, or userdata.
 
 ## Lifecycle
 
@@ -287,13 +287,14 @@ prefixes. This eliminates per-read IPC overhead and avoids Lua Table allocation.
 
 ### memory.async_batch_read
 
-Reads multiple memory regions from a target process. Returns a single flat byte
-buffer where each entry's data is packed contiguously.
+Reads multiple memory regions from a target process. All entries share the same
+`size`. Returns a single flat byte buffer where each entry's data is packed
+contiguously.
 
 ```lua
-local raw = await_async(memory.async_batch_read(pid, {
-    { address = 0x1407FFF0, size = 256 },
-    { address = 0x14080000, size = 256 },
+local raw = await_async(memory.async_batch_read(pid, 256, {
+    0x1407FFF0,
+    0x14080000,
 }))
 ```
 
@@ -304,8 +305,7 @@ table where index `i` is the byte offset of the `i`-th entry, and `total` is
 the total byte count.
 
 ```lua
-local sizes = { 0x100, 0x100, 0x100 }
-local offsets = memory.batch_offset(sizes)
+local offsets = memory.batch_offset({ 0x100, 0x100, 0x100 })
 -- offsets[1] = 0, offsets[2] = 256, offsets[3] = 512, offsets.total = 768
 ```
 
@@ -315,29 +315,20 @@ local offsets = memory.batch_offset(sizes)
 local ENTITY_SIZE = 0x100
 local FIELD_HP_OFFSET = 0x40
 local FIELD_POS_OFFSET = 0x4C
-local ENTITY_COUNT = 30
-
-local entities = {}  -- address list, built once
-local sizes = {}
-for i = 1, ENTITY_COUNT do sizes[i] = ENTITY_SIZE end
-local offsets = memory.batch_offset(sizes)
 
 start_async(function()
-    local entries = {}
-    for i, addr in ipairs(entities) do
-        entries[i] = { address = addr, size = ENTITY_SIZE }
-    end
-    local raw = await_async(memory.async_batch_read(pid, entries))
-    for i = 1, ENTITY_COUNT do
-        local base = offsets[i]
+    local raw = await_async(memory.async_batch_read(pid, ENTITY_SIZE, entities))
+    local offsets = memory.batch_offset({ ENTITY_SIZE })
+    for i = 1, #entities do
+        local base = (i - 1) * ENTITY_SIZE
         local hp = string.unpack("<i4", raw, base + FIELD_HP_OFFSET)
         local x, y, z = string.unpack("<fff", raw, base + FIELD_POS_OFFSET)
-        -- ... draw logic (no Table allocation per field)
+        -- ... draw logic (zero Table allocation per field)
     end
 end)
 ```
 
-The response is a single Lua byte string. `string.unpack` reads fields at
+The response is a single Luau byte string. `string.unpack` reads fields at
 calculated offsets directly — zero intermediate Table allocation, minimal GC
 pressure.
 

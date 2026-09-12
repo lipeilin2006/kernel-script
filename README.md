@@ -20,7 +20,7 @@ A modular kernel-based scripting framework for Windows, featuring a three-tier a
 
 ## Features
 
-- **Lua Scripting**: Hot-reloadable Lua scripts with coroutine-based async IPC
+- **Luau JIT Scripting**: Hot-reloadable Luau scripts with JIT compilation, coroutine-based async IPC
 - **Memory Read/Write**: Normal and MDL-based (bypasses page protection), up to 4096 bytes per transfer
 - **Batch Read**: Single IOCTL reads multiple memory regions — one IPC round-trip for N entities
 - **RVA API**: Driver-side address calculation from image base + offset
@@ -65,7 +65,7 @@ kernel-script/
 │       ├── main.rs               # GUI entry
 │       ├── app.rs                # Frame lifecycle, DWM transparency
 │       ├── ipc_client.rs         # Named Pipe client
-│       ├── lua_runtime.rs        # Lua VM, scheduler, API bindings
+│       ├── lua_runtime.rs        # Luau VM, scheduler, API bindings
 │       └── window_util.rs        # Win32 EnumWindows + DwmGetWindowAttribute
 │
 ├── ks-installer/                 # Elevated GUI installer (sc.exe only)
@@ -156,7 +156,7 @@ The GUI creates a fullscreen transparent overlay window with DWM transparency. M
 
 ### 3. Write Lua Scripts
 
-Place `.lua` files in `scripts/`. Each script runs in its own Lua VM; all scripts share scalar values through `shared.set/get`.
+Place `.lua` files in `scripts/`. Each script runs in its own Luau VM with JIT enabled; all scripts share scalar values through `shared.set/get`.
 
 #### Poll Pattern (Recommended)
 

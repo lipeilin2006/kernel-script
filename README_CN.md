@@ -20,7 +20,7 @@
 
 ## 功能特性
 
-- **Lua 脚本**: 支持热重载的 Lua 脚本，协程异步 IPC
+- **Luau JIT 脚本**: 支持热重载的 Luau 脚本，JIT 编译，协程异步 IPC
 - **内存读写**: 普通读写和 MDL 读写（绕过页保护），单次最大 4096 字节
 - **批量读取**: 单次 IOCTL 读取多个内存区域 — N 个实体只需 1 次 IPC 往返
 - **RVA API**: 驱动侧自动计算 image base + offset
@@ -65,7 +65,7 @@ kernel-script/
 │       ├── main.rs               # GUI 入口
 │       ├── app.rs                # 帧生命周期、DWM 透明
 │       ├── ipc_client.rs         # Named Pipe 客户端
-│       ├── lua_runtime.rs        # Lua VM、调度器、API 绑定
+│       ├── lua_runtime.rs        # Luau VM、调度器、API 绑定
 │       └── window_util.rs        # Win32 EnumWindows + DwmGetWindowAttribute
 │
 ├── ks-installer/                 # 提权 GUI 安装器（仅 sc.exe）
@@ -156,7 +156,7 @@ GUI 创建一个全屏透明覆盖窗口，使用 DWM 透明。鼠标点击会�
 
 ### 3. 编写 Lua 脚本
 
-将 `.lua` 文件放入 `scripts/` 目录。每个脚本在独立 Lua VM 中运行；所有脚本通过 `shared.set/get` 共享标量值。
+将 `.lua` 文件放入 `scripts/` 目录。每个脚本在独立 Luau VM 中运行，启用 JIT；所有脚本通过 `shared.set/get` 共享标量值。
 
 #### 轮询模式（推荐）
 

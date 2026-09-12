@@ -1,8 +1,8 @@
-# Kernel Script Lua API
+# Kernel Script Luau API
 
-本文档描述 `ks-gui` 当前实际注册到 Lua VM 的 API。每个 `scripts/*.lua`
-脚本在独立 Lua VM 中运行；所有脚本共享 `shared` 标量存储，但不共享 Lua
-table、function、thread 或 userdata。
+本文档描述 `ks-gui` 当前实际注册到 Luau VM 的 API。每个 `scripts/*.lua`
+脚本在独立 Luau VM 中运行，启用 JIT 编译；所有脚本共享 `shared` 标量存储，
+但不共享 Luau table、function、thread 或 userdata。
 
 ## Lifecycle
 
@@ -282,12 +282,13 @@ IPC 开销，避免 Lua Table 分配。
 
 ### memory.async_batch_read
 
-从目标进程读取多个内存区域，返回单个平铺字节缓冲区，各条目数据紧密排列。
+从目标进程读取多个内存区域，所有条目共享同一个 `size`。返回单个平铺字节
+缓冲区，各条目数据紧密排列。
 
 ```lua
-local raw = await_async(memory.async_batch_read(pid, {
-    { address = 0x1407FFF0, size = 256 },
-    { address = 0x14080000, size = 256 },
+local raw = await_async(memory.async_batch_read(pid, 256, {
+    0x1407FFF0,
+    0x14080000,
 }))
 ```
 
@@ -297,8 +298,7 @@ local raw = await_async(memory.async_batch_read(pid, {
 第 `i` 个条目的字节偏移，`total` 是总字节数。
 
 ```lua
-local sizes = { 0x100, 0x100, 0x100 }
-local offsets = memory.batch_offset(sizes)
+local offsets = memory.batch_offset({ 0x100, 0x100, 0x100 })
 -- offsets[1] = 0, offsets[2] = 256, offsets[3] = 512, offsets.total = 768
 ```
 
@@ -308,21 +308,12 @@ local offsets = memory.batch_offset(sizes)
 local ENTITY_SIZE = 0x100
 local FIELD_HP_OFFSET = 0x40
 local FIELD_POS_OFFSET = 0x4C
-local ENTITY_COUNT = 30
-
-local entities = {}  -- 地址列表，一次性构建
-local sizes = {}
-for i = 1, ENTITY_COUNT do sizes[i] = ENTITY_SIZE end
-local offsets = memory.batch_offset(sizes)
 
 start_async(function()
-    local entries = {}
-    for i, addr in ipairs(entities) do
-        entries[i] = { address = addr, size = ENTITY_SIZE }
-    end
-    local raw = await_async(memory.async_batch_read(pid, entries))
-    for i = 1, ENTITY_COUNT do
-        local base = offsets[i]
+    local raw = await_async(memory.async_batch_read(pid, ENTITY_SIZE, entities))
+    local offsets = memory.batch_offset({ ENTITY_SIZE })
+    for i = 1, #entities do
+        local base = (i - 1) * ENTITY_SIZE
         local hp = string.unpack("<i4", raw, base + FIELD_HP_OFFSET)
         local x, y, z = string.unpack("<fff", raw, base + FIELD_POS_OFFSET)
         -- ... 绘制逻辑（每个字段无 Table 分配）
@@ -330,12 +321,12 @@ start_async(function()
 end)
 ```
 
-响应是单个 Lua byte string。`string.unpack` 直接在缓冲区上按偏移读取字段
+响应是单个 Luau byte string。`string.unpack` 直接在缓冲区上按偏移读取字段
 ——零中间 Table 分配，GC 压力极低。
 
 ## Shared Globals
 
-多个 Lua VM 通过 Rust 侧共享存储交换简单值。
+多个 Luau VM 通过 Rust 侧共享存储交换简单值。
 
 ### shared.set
 
