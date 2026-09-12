@@ -73,7 +73,7 @@ Rules:
 - Multiple Lua scripts are loaded from `scripts/*.lua`; they run on the GUI Lua thread and share only scalar values explicitly stored through `shared.set/get/delete`.
 - Do not let a coroutine hold an egui UI borrow across a yield.
 
-Supported asynchronous Lua operations include:
+Supported asynchronous Luau operations include:
 
 ```lua
 memory.async_read_i32(pid, address)
@@ -88,7 +88,7 @@ memory.async_read_mdl_rva(pid, relative_address, size)
 memory.async_write_mdl_rva(pid, relative_address, data)
 memory.async_get_process_base(pid)
 memory.async_list_processes()
-memory.async_batch_read(pid, entries)
+memory.async_batch_read(pid, size, addresses)
 memory.batch_offset(sizes)
 memory.poll_async(task_id)
 ```
