@@ -278,7 +278,9 @@ await_async(memory.async_write_mdl_rva(pid, 0x1234, {
 `ks_copy_process_memory`，返回**无 size 前缀**的平铺字节缓冲区。消除逐次
 IPC 开销，避免 Lua Table 分配。
 
-**最大条目数**：每次调用最多 64 个。**总传输限制**：4096 字节。
+**最大条目数**：每次调用最多 256 个。**总传输限制**：4096 字节。
+
+无效地址（null 或不可读）会被跳过并零填充，不会导致整个 batch 失败。
 
 ### memory.async_batch_read
 
@@ -706,7 +708,7 @@ GUI 到 service 的 IPC 使用批量流水线实现高吞吐：
 - `OnRender` 不得执行同步网络或 driver 操作。
 - `OnUpdate` 不得等待 Future；使用 coroutine 或 `poll_async`。
 - 单次内存读写最多 4096 字节。
-- 批量读取限制：最多 64 个条目，总计 4096 字节。
+- 批量读取限制：最多 256 个条目，总计 4096 字节。
 - 进程列表由 service 在用户态枚举。
 - 内存读写和 RVA 计算由 driver 执行。
 - 窗口枚举在 GUI 进程（用户会话）中执行。

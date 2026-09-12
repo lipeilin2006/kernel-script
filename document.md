@@ -283,7 +283,10 @@ Batch read performs multiple memory reads in a single IPC round-trip. The driver
 does one process lookup and N copies, returning a flat byte buffer with no size
 prefixes. This eliminates per-read IPC overhead and avoids Lua Table allocation.
 
-**Maximum entries**: 64 per call. **Total transfer limit**: 4096 bytes.
+**Maximum entries**: 256 per call. **Total transfer limit**: 4096 bytes.
+
+Invalid addresses (null or unreadable) are skipped and zero-filled in the output
+buffer, so valid entries are still returned even if some pointers are stale.
 
 ### memory.async_batch_read
 
@@ -718,7 +721,7 @@ round-trips, enabling real-time linked-list traversal and entity scanning.
 - `OnRender` must not perform synchronous network or driver operations.
 - `OnUpdate` must not await futures; use coroutines or `poll_async`.
 - Single memory read/write limit: 4096 bytes.
-- Batch read limit: 64 entries, 4096 bytes total.
+- Batch read limit: 256 entries, 4096 bytes total.
 - Process list is enumerated in user mode by the service.
 - Memory read/write and RVA computation are performed by the driver.
 - Window rect enumeration runs in the GUI process (user session).
