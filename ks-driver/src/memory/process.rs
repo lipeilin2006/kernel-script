@@ -177,8 +177,10 @@ pub fn write_process_memory(process_id: u64, address: u64, data: &[u8]) -> Resul
 /// process lookup. Each entry reads `size` bytes from `address` into the
 /// output buffer contiguously (no size prefix, no padding).
 ///
-/// Returns the total number of bytes written to `output`, or the first
-/// failing NTSTATUS.
+/// Invalid addresses (null or unreadable) are skipped and zero-filled in the
+/// output buffer so that valid entries are still returned.
+///
+/// Returns the total number of bytes written to `output`.
 pub fn batch_read_process_memory(
     process_id: u64,
     entries: &[(u64, u32)],
@@ -190,7 +192,7 @@ pub fn batch_read_process_memory(
     let process = lookup(process_id)?;
     let mut out_off = 0usize;
     for &(address, size) in entries {
-        if address == 0 || size == 0 || size > MAX_DRIVER_TRANSFER_SIZE as u32 {
+        if size == 0 || size > MAX_DRIVER_TRANSFER_SIZE as u32 {
             return Err(STATUS_INVALID_PARAMETER);
         }
         let size = size as usize;
@@ -198,6 +200,11 @@ pub fn batch_read_process_memory(
             return Err(STATUS_BUFFER_TOO_SMALL);
         }
         let data_slice = &mut output[out_off..out_off + size];
+        if address == 0 {
+            data_slice.fill(0);
+            out_off += size;
+            continue;
+        }
         let mut copied = 0usize;
         let status = unsafe {
             ks_copy_process_memory(
@@ -210,10 +217,9 @@ pub fn batch_read_process_memory(
         };
         if nt_success(status) && copied == size {
             out_off += size;
-        } else if nt_success(status) {
-            return Err(STATUS_ACCESS_VIOLATION);
         } else {
-            return Err(status);
+            data_slice.fill(0);
+            out_off += size;
         }
     }
     Ok(out_off)

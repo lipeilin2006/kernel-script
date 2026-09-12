@@ -73,7 +73,7 @@ pub const PROCESS_RECORD_HEADER_SIZE: usize = 26;
 pub const MAX_PROCESS_LIST_SIZE: usize =
     4 + MAX_PROCESS_LIST_ENTRIES * (PROCESS_RECORD_HEADER_SIZE + MAX_PROCESS_NAME_BYTES);
 pub const MAX_WRITE_SIZE: usize = MAX_FRAME_SIZE - HEADER_SIZE - 20;
-pub const MAX_BATCH_ENTRIES: usize = 64;
+pub const MAX_BATCH_ENTRIES: usize = 256;
 pub const BATCH_READ_ENTRY_WIRE_SIZE: usize = 12; // address:8 + size:4
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
