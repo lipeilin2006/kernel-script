@@ -7,7 +7,6 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime};
 
 use egui;
-use mlua::debug::HookTriggers;
 use mlua::{FromLua, Function, IntoLuaMulti, Lua, Table, Value, VmState};
 
 use crate::ipc_client::IpcClient;
@@ -134,7 +133,6 @@ const MAX_UPDATE_STEPS_PER_FRAME: usize = 4;
 const MAX_FRAME_DELTA: Duration = Duration::from_millis(250);
 const RELOAD_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const LUA_MEMORY_LIMIT: usize = 64 * 1024 * 1024;
-const HOOK_INSTRUCTION_INTERVAL: u32 = 10_000;
 const START_BUDGET: Duration = Duration::from_millis(100);
 const UPDATE_BUDGET: Duration = Duration::from_millis(10);
 const RENDER_BUDGET: Duration = Duration::from_millis(12);
@@ -517,7 +515,7 @@ impl LuaRuntime {
         for global in ["os", "io", "package", "debug"] {
             lua.globals().set(global, Value::Nil)?;
         }
-        let deadline = install_execution_hook(&lua)?;
+        let deadline = install_execution_hook(&lua);
         register_engine_api(&lua, control)?;
         register_memory_api(&lua, async_scheduler)?;
         register_shared_api(&lua, shared_globals)?;
@@ -695,23 +693,20 @@ impl FixedUpdateScheduler {
     }
 }
 
-fn install_execution_hook(lua: &Lua) -> mlua::Result<Arc<Mutex<Option<Instant>>>> {
+fn install_execution_hook(lua: &Lua) -> Arc<Mutex<Option<Instant>>> {
     let deadline = Arc::new(Mutex::new(None));
     let hook_deadline = Arc::clone(&deadline);
-    lua.set_hook(
-        HookTriggers::new().every_nth_instruction(HOOK_INSTRUCTION_INTERVAL),
-        move |_, _| {
-            if hook_deadline
-                .lock()
-                .map_err(|_| mlua::Error::runtime("execution deadline lock poisoned"))?
-                .is_some_and(|deadline| Instant::now() >= deadline)
-            {
-                return Err(mlua::Error::runtime("script execution budget exceeded"));
-            }
-            Ok(VmState::Continue)
-        },
-    )?;
-    Ok(deadline)
+    lua.set_interrupt(move |_| {
+        if hook_deadline
+            .lock()
+            .map_err(|_| mlua::Error::runtime("execution deadline lock poisoned"))?
+            .is_some_and(|deadline| Instant::now() >= deadline)
+        {
+            return Err(mlua::Error::runtime("script execution budget exceeded"));
+        }
+        Ok(VmState::Continue)
+    });
+    deadline
 }
 
 fn call_optional_budgeted<A>(
@@ -1978,7 +1973,7 @@ mod tests {
     #[test]
     fn execution_hook_stops_runaway_script() {
         let lua = Lua::new();
-        let deadline = install_execution_hook(&lua).unwrap();
+        let deadline = install_execution_hook(&lua);
         lua.load("function OnUpdate() while true do end end")
             .exec()
             .unwrap();
