@@ -14,16 +14,6 @@
 service with `sc.exe` only (`create`/`start`/`stop`/`delete`). It copies no
 files; driver, service, GUI, and installer must sit in the same directory.
 
-The deployment package uses this flat layout:
-
-```text
-driver-package/
-├── ks-driver.sys
-├── ks-service.exe
-├── ks-gui.exe
-└── ks-installer.exe
-```
-
 The intended data flow is:
 
 ```text
@@ -159,65 +149,9 @@ The secure device wrapper uses `WdmlibIoCreateDeviceSecure` and links the WDK
 `wdmsec` and `BufferOverflowK` libraries. Keep this dependency in the WDK-only
 driver build path.
 
-The generated driver is written by the current linker to:
-
-```text
-D:\kernel-script\ks-driver.sys
-```
-
-Inspect the result before deployment:
-
-```powershell
-dumpbin /headers D:\kernel-script\ks-driver.sys
-```
-
-Expected properties include x64 machine type, Native subsystem, and `DriverEntry` as the entry point.
-
-## VirtualBox Test Workflow
-
-The VM is test-only. Compilation happens on the host.
-
-- Host source: `D:\kernel-script`.
-- Host deployment directory: `D:\kernel-script\driver-package`.
-- VM host-only/shared-folder mapping: `Z:\ = \\VBoxSvr\ksdriver`.
-- VM SSH endpoint: `Admin@192.168.11.101`.
-
-After a successful host build, copy only intended artifacts to the package directory:
-
-```powershell
-Copy-Item D:\kernel-script\ks-driver.sys D:\kernel-script\driver-package\ks-driver.sys -Force
-Copy-Item D:\kernel-script\ks-driver.pdb D:\kernel-script\driver-package\ks-driver.pdb -Force
-Copy-Item D:\kernel-script\target\release\ks-service.exe D:\kernel-script\driver-package\ks-service.exe -Force
-Copy-Item D:\kernel-script\target\release\ks-gui.exe D:\kernel-script\driver-package\ks-gui.exe -Force
-Copy-Item D:\kernel-script\target\release\ks-installer.exe D:\kernel-script\driver-package\ks-installer.exe -Force
-Copy-Item D:\kernel-script\target\release\ks_service.pdb D:\kernel-script\driver-package\ks-service.pdb -Force
-Copy-Item D:\kernel-script\target\release\ks_gui.pdb D:\kernel-script\driver-package\ks-gui.pdb -Force
-Copy-Item D:\kernel-script\target\release\ks_installer.pdb D:\kernel-script\driver-package\ks-installer.pdb -Force
-```
-
-Keep every `.exe`/`.sys` paired with its matching `.pdb`; symbols only load
-when the PDB matches the binary build.
-
-Verify hashes on both host and VM before testing. The VM must have test signing enabled and the driver must be signed with a certificate for which the signing private key is available. A `.cer` file alone cannot sign a driver.
-
-Typical VM driver service setup, from an elevated shell:
-
-```cmd
-copy /y Z:\ks-driver.sys C:\ks-test\ks-driver.sys
-sc.exe create ks-driver type= kernel start= demand binPath= C:\ks-test\ks-driver.sys
-sc.exe start ks-driver
-sc.exe query ks-driver
-```
-
-If the service already exists, use `sc.exe config` instead of `create`. Error `577` means signature verification failed; it is not a Rust or IPC error.
-
-Run the service in console mode for IPC testing:
-
-```cmd
-Z:\ks-service.exe --console
-```
-
-The GUI should be run from the VM desktop session, not from an SSH session, because OpenGL/Winit needs an interactive display.
+Inspect the native driver image with platform linker tools before loading it.
+Driver signing and VM deployment are environment-specific and are outside the
+workspace source tree.
 
 ## Verification Checklist
 
@@ -230,7 +164,7 @@ Before considering a change complete:
 5. Check `cargo tree -e features` when changing dependencies.
 6. Search for stale synchronous Lua calls after changing the Lua API.
 7. If artifacts are deployed to the VM, verify SHA256 hashes.
-8. Do not overwrite a known-good driver artifact with a failed or unsigned build.
+8. Do not load an unverified native driver image in a test environment.
 
 ## Known Warnings and Limitations
 

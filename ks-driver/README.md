@@ -2,7 +2,7 @@
 
 `ks-driver` contains the Rust WDM framework and intentionally keeps the
 structured-exception boundary in `seh_shim.c`. Build that file with MSVC and
-the Windows Driver Kit, then link it into the `.sys` target. Rust cannot use
+the Windows Driver Kit, then link it into the native driver target. Rust cannot use
 `catch_unwind` to catch kernel SEH exceptions.
 
 The Rust crate is a `no_std` source framework. Its `wdm.rs` declarations must
@@ -33,6 +33,6 @@ cargo build -p ks-driver --features wdk --target x86_64-pc-windows-msvc --releas
 ```
 
 Unset `KS_DRIVER_WDK` and omit `--features wdk` for framework-only `cargo check`.
-The WDK build has a dedicated `no_std` binary target and writes `ks-driver.sys`.
-The final packaging step must provide an INF and apply a valid test signature
-before installation.
+The WDK build has a dedicated `no_std` binary target and produces a native
+driver image as a local build output. Inspect and sign that image according to
+the target test environment before installation.

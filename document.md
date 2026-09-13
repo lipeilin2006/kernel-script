@@ -30,9 +30,6 @@ Notes:
 - All memory API calls are synchronous and block the Lua thread for ~60-100μs.
 - Do not call memory APIs inside `ui.window` callbacks if latency is critical.
 
-## Async Tasks
-
-### start_async
 ## Process API
 
 ### memory.get_pid

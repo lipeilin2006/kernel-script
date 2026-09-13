@@ -1,107 +1,84 @@
 # Kernel Script
 
-基于内核的模块化 Windows 脚本框架，三层架构设计，兼顾安全性与稳定性。
+Kernel Script 是一个仅面向 Windows 的 Rust 工作区，用于通过受保护的用户态
+service 和 WDM driver 执行 Luau 脚本。运行时分层如下：
 
-## 架构
-
-```
-┌───────────────────────────────┐
-│         ks-gui (图形界面)      │  <-- 运行在普通用户会话
-└───────────────┬───────────────┘      egui overlay + Lua 脚本 + Draw API
-                │  Named Pipe IPC
-┌───────────────▼───────────────┐
-│     ks-service (系统服务)      │  <-- 以 NT AUTHORITY\SYSTEM 运行
-└───────────────┬───────────────┘      服务桥接 + 驱动分发
-                │  IOCTL
-┌───────────────▼───────────────┐
-│      ks-driver (内核驱动)      │  <-- Ring 0
-└───────────────────────────────┘      内存读写 + MDL 重映射
+```text
+Luau 脚本
+    -> ks-gui 同步 Named Pipe 客户端
+    -> ks-service Tokio Named Pipe 服务端
+    -> DeviceIoControl
+    -> ks-driver WDM 内存操作
 ```
 
-## 功能特性
+## 功能
 
-- **Luau JIT 脚本**: 支持热重载的 Luau 脚本，JIT 编译，协程异步 IPC
-- **内存读写**: 普通读写和 MDL 读写（绕过页保护），单次最大 4096 字节
-- **批量读取**: 单次 IOCTL 读取多个内存区域 — N 个实体只需 1 次 IPC 往返
-- **RVA API**: 驱动侧自动计算 image base + offset
-- **Draw API**: 透明全屏窗口上的覆盖层渲染（直线、矩形、圆形、文字）
-- **窗口查询**: 通过 DWM 查询目标进程窗口位置
-- **多窗口支持**: 处理拥有多个窗口的进程
-- **透明覆盖层**: GLFW + DWM 透明，鼠标穿透
-- **中文字体**: 自动加载 `msyh.ttc` / `simhei.ttf` / `simsun.ttc`
-- **高性能 IPC**: 基于 channel 的代理，持久连接，零拷贝帧处理
+- Luau JIT、脚本热重载和生命周期回调执行预算。
+- 同步进程查找、模块基址、内存读写、RVA、MDL、批量读取和指针链 API。
+- EgUI/GLFW 透明覆盖层和缓存绘制命令。
+- `ks-service` 在用户态使用 Toolhelp 枚举进程。
+- SYSTEM-only driver 设备访问和首次打开进程绑定。
+- `ks-core` 提供显式小端序的分帧 IPC 协议。
 
-## 项目结构
+## 工作区结构
 
-```
+```text
 kernel-script/
-├── Cargo.toml                    # Workspace 根配置
+├── Cargo.toml
 ├── README.md / README_CN.md
-├── document.md / document_CN.md  # Lua API 参考
-│
-├── ks-core/                      # [R0/R3] 共享协议与 ABI
-│   └── src/
-│       ├── lib.rs                # no_std 兼容
-│       ├── protocol.rs           # IOCTL 常量、线路消息
-│       └── memory.rs             # 内存操作定义
-│
-├── ks-driver/                    # [Ring 0] WDM 内核驱动
-│   ├── build.rs                  # WDK 链接标志
-│   ├── seh_shim.c                # MmProbeAndLockPages SEH 边界
-│   └── src/
-│       ├── dispatch.rs           # IOCTL 派遣
-│       ├── memory/               # 普通 + MDL 读写
-│       └── wdm.rs                # FFI 声明
-│
-├── ks-service/                   # [Ring 3 - SYSTEM] 服务 + IPC
-│   └── src/
-│       ├── main.rs               # 服务入口 / 控制台模式
-│       ├── driver_comm.rs        # DeviceIoControl 调用
-│       ├── ipc.rs                # Named Pipe 服务端
-│       └── process.rs            # Toolhelp 进程枚举
-│
-├── ks-gui/                       # [Ring 3 - User] egui overlay + Lua 运行时
-│   └── src/
-│       ├── main.rs               # GUI 入口
-│       ├── app.rs                # 帧生命周期、DWM 透明
-│       ├── ipc_client.rs         # Named Pipe 客户端
-│       ├── lua_runtime.rs        # Luau VM、调度器、API 绑定
-│       └── window_util.rs        # Win32 EnumWindows + DwmGetWindowAttribute
-│
-├── ks-installer/                 # 提权 GUI 安装器（仅 sc.exe）
-│   └── src/main.rs
-│
-└── driver-package/               # 部署目录（扁平布局）
-    ├── ks-driver.sys + .pdb
-    ├── ks-service.exe + .pdb
-    ├── ks-gui.exe + .pdb
-    ├── ks-installer.exe + .pdb
-    └── scripts/
-        ├── monitor.lua           # 进程监控示例
-        ├── search.lua            # 内存搜索示例
-        ├── draw_test.lua         # 覆盖层绘制测试
-        └── debug_rva.lua         # RVA 调试
+├── document.md / document_CN.md
+├── AGENTS.md
+├── ks-core/                    # no_std 协议和 ABI
+├── ks-driver/                  # WDM 内核 driver
+│   ├── build.rs
+│   ├── seh_shim.c
+│   └── src/{dispatch.rs,memory/,wdm.rs}
+├── ks-service/                 # SYSTEM service 和 IPC
+│   └── src/{main.rs,driver_comm.rs,ipc.rs,process.rs}
+├── ks-gui/                    # overlay、Luau 和同步 IPC
+│   └── src/{app.rs,lua_runtime.rs,lua_runtime/,sync_ipc.rs,window_util.rs}
+├── ks-installer/              # 使用 sc.exe 的 service 管理器
+└── ks-test/                   # 独立 IPC benchmark 客户端
 ```
 
-## 构建
+## Lua 生命周期
 
-### 前置条件
+每个 GUI 加载的 `.lua` 文件运行在独立的 Luau VM 中：
 
-- Rust 1.75+
-- Visual Studio 2022+（含 C++ 工作负载）
-- WDK 10.0.26100.0
+```lua
+function OnStart() end
+function OnUpdate(dt) end
+function OnRender() end
+function OnDestroy() end
+```
 
-### 工作区检查
+- `OnStart` 在加载后执行一次。
+- `OnUpdate` 由固定逻辑调度器调用，可以执行同步内存操作。
+- `OnRender` 应主要绘制 UI 和读取缓存结果，不应在 UI 回调中重复执行阻塞 IPC。
+- `OnDestroy` 在热重载和退出时执行。
+
+所有 memory API 都是同步调用，并在 GUI Lua 线程执行。完整 API 见
+`document_CN.md` 或英文版 `document.md`。
+
+## 构建和测试
+
+普通工作区检查：
 
 ```powershell
 cargo fmt --all
 cargo test --workspace
 cargo check --workspace
+cargo build --release --workspace
 ```
 
-### WDK 驱动构建
+GUI 需要运行时 panic 恢复时使用 unwind profile：
 
-需要 Visual Studio Developer Command Prompt，并设置 WDK 环境变量：
+```powershell
+cargo build --profile gui-release -p ks-gui
+```
+
+driver 必须在 Visual Studio Developer Command Prompt 中使用 WDK 单独构建。
+当前支持的 WDK 版本为 `10.0.26100.0`：
 
 ```powershell
 $env:KS_DRIVER_WDK = '1'
@@ -110,115 +87,35 @@ $env:WDK_LIB = 'C:\Program Files (x86)\Windows Kits\10\Lib\10.0.26100.0\km\x64'
 $env:WDK_VERSION = '10.0.26100.0'
 
 $vs = 'C:\Program Files\Microsoft Visual Studio\18\Community\Common7\Tools\VsDevCmd.bat'
-cmd.exe /d /c "call `"$vs`" -arch=x64 -host_arch=x64 >nul && cargo build -p ks-driver --bin ks-driver --features wdk"
+cmd.exe /d /c "call `"$vs`" -arch=x64 -host_arch=x64 >nul && set `"KS_DRIVER_WDK=1`" && set `"WDK_ROOT=C:\Program Files (x86)\Windows Kits\10`" && set `"WDK_LIB=C:\Program Files (x86)\Windows Kits\10\Lib\10.0.26100.0\km\x64`" && set `"WDK_VERSION=10.0.26100.0`" && cargo build --release -p ks-driver --bin ks-driver --features wdk"
 ```
 
-### Release 构建
+使用 `dumpbin` 检查 native driver image，确认 x64、Native subsystem、
+`DriverEntry` 入口点，并确认没有用户态 DLL 导入。
 
-```powershell
-cargo build --release --workspace
-cargo build --profile gui-release -p ks-gui    # 启用 unwind 用于 catch_unwind
-```
+## 运行
 
-### 部署到包目录
-
-```powershell
-$pkg = 'D:\kernel-script\driver-package'
-Copy-Item D:\kernel-script\ks-driver.sys "$pkg\ks-driver.sys" -Force
-Copy-Item D:\kernel-script\ks-driver.pdb "$pkg\ks-driver.pdb" -Force
-Copy-Item D:\kernel-script\target\release\ks-service.exe "$pkg\ks-service.exe" -Force
-Copy-Item D:\kernel-script\target\release\ks_service.pdb "$pkg\ks-service.pdb" -Force
-Copy-Item D:\kernel-script\target\gui-release\ks-gui.exe "$pkg\ks-gui.exe" -Force
-Copy-Item D:\kernel-script\target\gui-release\ks_gui.pdb "$pkg\ks_gui.pdb" -Force
-Copy-Item D:\kernel-script\target\release\ks-installer.exe "$pkg\ks-installer.exe" -Force
-Copy-Item D:\kernel-script\target\release\ks_installer.pdb "$pkg\ks_installer.pdb" -Force
-```
-
-## 使用
-
-### 1. 安装驱动和服务
-
-以管理员身份运行 `ks-installer.exe`，或手动：
+service 必须以 SYSTEM 身份运行才能打开 driver 设备。交互式诊断可以在提升
+权限的环境中运行：
 
 ```cmd
-sc.exe create ks-driver type= kernel start= demand binPath= C:\path\to\ks-driver.sys
-sc.exe start ks-driver
 ks-service.exe --console
 ```
 
-### 2. 启动 GUI
+GUI 必须从交互式桌面运行，因为 GLFW/OpenGL 需要窗口站。Lua 脚本从 GUI
+可执行文件旁的 `scripts` 目录加载。文件名 stem 以下划线开头的脚本保留用于
+手动测试，但默认不会加载。
 
-```cmd
-ks-gui.exe
-```
+installer 只使用 `sc.exe` 管理 service 注册，不复制源码，也不管理构建产物。
 
-GUI 创建一个全屏透明覆盖窗口，使用 DWM 透明。鼠标点击会穿透到下方应用，除非光标在 UI 元素上。
+## 安全边界
 
-### 3. 编写 Lua 脚本
+- `ks-core` 保持无依赖并兼容 `no_std`。
+- driver 只负责内存操作，进程枚举由 service 负责。
+- driver 设备使用 SYSTEM-only DACL，并绑定首次成功打开设备的进程。
+- 协议、service 和 driver 边界都校验长度、数量、地址、PID 和帧大小。
+- Lua VM 对象不会跨 worker thread 传递。
 
-将 `.lua` 文件放入 `scripts/` 目录。每个脚本在独立 Luau VM 中运行，启用 JIT；所有脚本通过 `shared.set/get` 共享标量值。
+## License
 
-#### 轮询模式（推荐）
-
-```lua
-local state = { pid_task = nil, pid = 0 }
-
-function OnUpdate(dt)
-    if state.pid_task then
-        local result = memory.poll_async(state.pid_task)
-        if result then
-            state.pid_task = nil
-            if result.error then
-                print("失败:", result.error)
-            else
-                state.pid = result.value
-            end
-        end
-    end
-end
-
-function OnRender()
-    ui.window("示例", function()
-        if ui.button("开始") and not state.pid_task then
-            state.pid_task = memory.async_get_pid("notepad.exe")
-        end
-        ui.label("PID: " .. tostring(state.pid))
-    end)
-end
-```
-
-#### 协程模式
-
-```lua
-start_async(function()
-    local pid = await_async(memory.async_get_pid("notepad.exe"))
-    local hp = await_async(memory.async_read_i32(pid, 0x1407FFF0))
-    print("HP: " .. hp)
-end)
-```
-
-#### Draw 覆盖层
-
-```lua
-function OnRender()
-    -- 在透明全屏覆盖层上绘制
-    draw.rect(100, 100, 200, 150, 255, 0, 0, 200, 3.0)
-    draw.filled_rect(100, 100, 200, 150, 0, 255, 0, 50)
-    draw.circle(200, 175, 30.0, 255, 255, 0, 220, 2.0)
-    draw.filled_circle(200, 175, 30.0, 255, 200, 0, 160)
-    draw.line(100, 100, 300, 250, 255, 255, 255, 200, 1.0)
-    draw.text(100, 260, "你好！", 0, 255, 0, 255, 14.0)
-end
-```
-
-## 安全特性
-
-- **进程隔离**：GUI 运行在用户模式，服务以 SYSTEM 运行，驱动在 Ring 0
-- **句柄保护**：驱动设备句柄仅由服务持有
-- **DACL**：设备对象使用 `D:P(A;;GA;;;SY)` — 仅 SYSTEM 可访问
-- **崩溃隔离**：GUI 崩溃不影响驱动或服务稳定性
-- **会话隔离**：服务运行在 session 0；窗口枚举在 GUI 进程中执行
-
-## 许可证
-
-本项目仅供学习用途。
+本项目仅用于教育和研究目的。

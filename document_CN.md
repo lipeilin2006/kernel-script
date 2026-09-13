@@ -374,7 +374,7 @@ ui.label("Kernel Script")
 
 ```lua
 if ui.button("Read") then
-    -- submit async request
+    -- 执行同步操作
 end
 ```
 
