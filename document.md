@@ -1,9 +1,7 @@
 # Kernel Script Luau API
 
 This document describes the Luau APIs registered by `ks-gui`. Each `scripts/*.lua`
-script runs in its own Luau VM with JIT compilation enabled. All scripts share
-scalar values through `shared.set/get/delete` but do not share Luau tables,
-functions, threads, or userdata.
+script runs in its own Luau VM with JIT compilation enabled.
 
 ## Lifecycle
 
@@ -29,113 +27,30 @@ Notes:
 - `OnUpdate` is called during the logic tick phase (60 Hz).
 - `OnRender` is called during the GUI render phase.
 - `OnDestroy` is called on hot-reload or GUI exit.
-- Do not wait for IPC inside `OnRender`.
-- Do not call `await_async` or `coroutine.yield` inside a `ui.window` callback.
-- Network and driver requests must run inside a `start_async` coroutine.
+- All memory API calls are synchronous and block the Lua thread for ~60-100μs.
+- Do not call memory APIs inside `ui.window` callbacks if latency is critical.
 
 ## Async Tasks
 
 ### start_async
-
-Starts a Lua coroutine that is automatically resumed by the GUI each frame.
-
-```lua
-local co = start_async(function(arg)
-    print(arg)
-end, "hello")
-```
-
-Returns a coroutine object; direct manipulation is usually unnecessary.
-
-### await_async
-
-Waits for an async task to complete. Only suspends the current Lua coroutine
-during the wait; never blocks the GUI thread.
-
-```lua
-local value = await_async(memory.async_read_i32(pid, address))
-```
-
-On failure a Lua error is raised inside the coroutine. Use `pcall` to catch:
-
-```lua
-start_async(function()
-    local ok, result = pcall(function()
-        return await_async(memory.async_read_i32(pid, address))
-    end)
-    if ok then
-        print("value:", result)
-    else
-        print("failed:", result)
-    end
-end)
-```
-
-### memory.poll_async
-
-Non-blocking task result poll. Returns `nil` if the task has not completed.
-
-```lua
-local task_id = memory.async_list_processes()
-local result = memory.poll_async(task_id)
-if result then
-    if result.error then
-        print("failed:", result.error)
-    else
-        local value = result.value
-    end
-end
-```
-
-Success shape:
-
-```lua
-{ done = true, value = ... }
-```
-
-Failure shape:
-
-```lua
-{ done = true, error = "error message" }
-```
-
 ## Process API
 
-### memory.async_list_processes
+### memory.get_pid
 
-Asynchronously lists all running processes.
-
-```lua
-local processes = await_async(memory.async_list_processes())
-for _, process in ipairs(processes) do
-    print(process.pid, process.name)
-end
-```
-
-Each record contains:
+Resolves a process name to a PID (case-insensitive comparison).
 
 ```lua
-{ pid = 1234, parent_pid = 1000, thread_count = 12, name = "notepad.exe" }
-```
-
-Process enumeration is performed by `ks-service` using Windows Toolhelp APIs.
-
-### memory.async_get_pid
-
-Asynchronously resolves a process name to a PID (case-insensitive comparison).
-
-```lua
-local pid = await_async(memory.async_get_pid("notepad.exe"))
+local pid = memory.get_pid("notepad.exe")
 ```
 
 Constraints: non-empty, at most 255 bytes, no NUL bytes.
 
-### memory.async_get_process_base
+### memory.get_process_base
 
-Asynchronously retrieves the main module base address for a given PID.
+Retrieves the main module base address for a given PID.
 
 ```lua
-local base = await_async(memory.async_get_process_base(pid))
+local base = memory.get_process_base(pid)
 print(string.format("base = 0x%X", base))
 ```
 
@@ -160,20 +75,20 @@ Address `0` is forwarded to the service/driver which returns an error; it does
 not throw synchronously in the GUI render callback. Negative addresses and
 unsupported Lua types are rejected at parameter conversion time.
 
-### memory.async_read_i32
+### memory.read_i32
 
 Reads a 32-bit signed integer.
 
 ```lua
-local value = await_async(memory.async_read_i32(pid, "0x1407FFF0"))
+local value = memory.read_i32(pid, "0x1407FFF0")
 ```
 
-### memory.async_read_bytes
+### memory.read_bytes
 
 Reads a byte array.
 
 ```lua
-local data = await_async(memory.async_read_bytes(pid, address, 16))
+local data = memory.read_bytes(pid, address, 16)
 for i, byte in ipairs(data) do
     print(i, byte)
 end
@@ -181,22 +96,22 @@ end
 
 Single transfer limit: 4096 bytes.
 
-### memory.async_write_i32
+### memory.write_i32
 
 Writes a 32-bit signed integer.
 
 ```lua
-await_async(memory.async_write_i32(pid, address, 123456789))
+memory.write_i32(pid, address, 123456789)
 ```
 
-### memory.async_write_bytes
+### memory.write_bytes
 
 Writes a Lua byte array.
 
 ```lua
-await_async(memory.async_write_bytes(pid, address, {
+memory.write_bytes(pid, address, {
     0x15, 0xCD, 0x5B, 0x07
-}))
+})
 ```
 
 Each element must be coercible to a byte. Maximum 4096 bytes per call.
@@ -212,22 +127,22 @@ absolute_address = process_image_base + relative_address
 `relative_address` is an unsigned offset. Addition overflow causes the request
 to fail.
 
-### memory.async_read_rva
+### memory.read_rva
 
 Reads `base + relative_address` after resolving the image base internally.
 
 ```lua
-local data = await_async(memory.async_read_rva(pid, 0x1234, 4))
+local data = memory.read_rva(pid, 0x1234, 4)
 ```
 
-### memory.async_write_rva
+### memory.write_rva
 
 Writes `base + relative_address` after resolving the image base internally.
 
 ```lua
-await_async(memory.async_write_rva(pid, 0x1234, {
+memory.write_rva(pid, 0x1234, {
     0x15, 0xCD, 0x5B, 0x07
-}))
+})
 ```
 
 RVA read/write is also limited to 4096 bytes per transfer.
@@ -242,39 +157,39 @@ code pages).
 
 Usage is identical to normal read/write. The only differences:
 
-- `async_read_mdl*` / `async_write_mdl*` are separate APIs; they do not fall
+- `read_mdl*` / `write_mdl*` are separate APIs; they do not fall
   back to normal read/write.
 - MDL writes hit shared physical pages: modifying an image code section affects
   every process mapping that module (copy-on-write pages excepted).
 - Same 4096-byte single transfer limit applies.
 
-### memory.async_read_mdl
+### memory.read_mdl
 
 ```lua
-local data = await_async(memory.async_read_mdl(pid, address, 16))
+local data = memory.read_mdl(pid, address, 16)
 ```
 
-### memory.async_write_mdl
+### memory.write_mdl
 
 ```lua
 -- Modify read-only memory / code section
-await_async(memory.async_write_mdl(pid, address, {
+memory.write_mdl(pid, address, {
     0x90, 0x90, 0x90, 0xC3
-}))
+})
 ```
 
-### memory.async_read_mdl_rva
+### memory.read_mdl_rva
 
 ```lua
-local data = await_async(memory.async_read_mdl_rva(pid, 0x1234, 4))
+local data = memory.read_mdl_rva(pid, 0x1234, 4)
 ```
 
-### memory.async_write_mdl_rva
+### memory.write_mdl_rva
 
 ```lua
-await_async(memory.async_write_mdl_rva(pid, 0x1234, {
+memory.write_mdl_rva(pid, 0x1234, {
     0x15, 0xCD, 0x5B, 0x07
-}))
+})
 ```
 
 ## Batch Read API
@@ -288,17 +203,17 @@ prefixes. This eliminates per-read IPC overhead and avoids Lua Table allocation.
 Invalid addresses (null or unreadable) are skipped and zero-filled in the output
 buffer, so valid entries are still returned even if some pointers are stale.
 
-### memory.async_batch_read
+### memory.batch_read
 
 Reads multiple memory regions from a target process. All entries share the same
 `size`. Returns a single flat byte buffer where each entry's data is packed
 contiguously.
 
 ```lua
-local raw = await_async(memory.async_batch_read(pid, 256, {
+local raw = memory.batch_read(pid, 256, {
     0x1407FFF0,
     0x14080000,
-}))
+})
 ```
 
 ### memory.batch_offset
@@ -312,6 +227,25 @@ local offsets = memory.batch_offset({ 0x100, 0x100, 0x100 })
 -- offsets[1] = 0, offsets[2] = 256, offsets[3] = 512, offsets.total = 768
 ```
 
+### memory.traverse_pointer_chain
+
+Walks a pointer chain in a target process using a single IPC round-trip.
+Starting from `base`, reads a pointer at `base + offsets[1]`, then at
+`result + offsets[2]`, and so on. Returns the final address as a `u64`.
+
+```lua
+local base = memory.get_process_base(pid)
+local addr = memory.traverse_pointer_chain(pid, base, {
+    0x1000,  -- base + 0x1000
+    0x30,    -- (base + 0x1000) + 0x30
+    0x80,    -- ... + 0x80
+})
+print(addr)
+```
+
+**Maximum offsets**: 32 per call. Returns `0` if any pointer in the chain is
+null or unreadable.
+
 ### Example: Zero-Allocation Entity Scan
 
 ```lua
@@ -319,52 +253,19 @@ local ENTITY_SIZE = 0x100
 local FIELD_HP_OFFSET = 0x40
 local FIELD_POS_OFFSET = 0x4C
 
-start_async(function()
-    local raw = await_async(memory.async_batch_read(pid, ENTITY_SIZE, entities))
-    local offsets = memory.batch_offset({ ENTITY_SIZE })
-    for i = 1, #entities do
-        local base = (i - 1) * ENTITY_SIZE
-        local hp = string.unpack("<i4", raw, base + FIELD_HP_OFFSET)
-        local x, y, z = string.unpack("<fff", raw, base + FIELD_POS_OFFSET)
-        -- ... draw logic (zero Table allocation per field)
-    end
-end)
+local raw = memory.batch_read(pid, ENTITY_SIZE, entities)
+local offsets = memory.batch_offset({ ENTITY_SIZE })
+for i = 1, #entities do
+    local base = (i - 1) * ENTITY_SIZE
+    local hp = string.unpack("<i4", raw, base + FIELD_HP_OFFSET)
+    local x, y, z = string.unpack("<fff", raw, base + FIELD_POS_OFFSET)
+    -- ... draw logic (zero Table allocation per field)
+end
 ```
 
 The response is a single Luau byte string. `string.unpack` reads fields at
 calculated offsets directly — zero intermediate Table allocation, minimal GC
 pressure.
-
-## Shared Globals
-
-Multiple Lua VMs exchange simple values through Rust-side shared storage.
-
-### shared.set
-
-```lua
-shared.set("selected_pid", 1234)
-shared.set("target_address", "0x7FF812345000")
-shared.set("enabled", true)
-```
-
-Supported value types: `nil`, boolean, integer, finite number, string.
-Lua tables, functions, threads, and userdata cannot be shared.
-
-### shared.get
-
-```lua
-local pid = shared.get("selected_pid")
-```
-
-Returns `nil` for missing keys.
-
-### shared.delete
-
-```lua
-shared.delete("selected_pid")
-```
-
-Key limit: 128 bytes.
 
 ## Window Rect API
 
@@ -633,54 +534,30 @@ ui.add_space(8)
 
 ## Complete Example
 
-### Poll Pattern (Recommended)
-
 ```lua
 local state = {
     process_name = "notepad.exe",
     pid = 0,
-    pid_task = nil,
     base = 0,
-    base_task = nil,
     rects = nil,
     status = "Ready",
 }
 
 function OnUpdate(dt)
-    if state.pid_task then
-        local result = memory.poll_async(state.pid_task)
-        if result then
-            state.pid_task = nil
-            if result.error then
-                state.status = "Failed: " .. result.error
-            else
-                state.pid = result.value
-                shared.set("selected_pid", state.pid)
-                state.base_task = memory.async_get_process_base(state.pid)
-            end
-        end
-    end
-
-    if state.base_task then
-        local result = memory.poll_async(state.base_task)
-        if result then
-            state.base_task = nil
-            if result.error then
-                state.status = "Base failed: " .. result.error
-            else
-                state.base = result.value
-                state.status = string.format("Attached 0x%X", state.base)
-                state.rects = memory.get_window_rect(state.pid)
-            end
-        end
-    end
+    -- All memory calls are synchronous (~60-100μs each)
 end
 
 function OnRender()
     ui.window("Kernel Script", function()
-        if ui.button("Attach") and not state.pid_task then
-            state.pid_task = memory.async_get_pid(state.process_name)
-            state.status = "Looking up " .. state.process_name .. "..."
+        if ui.button("Attach") then
+            state.pid = memory.get_pid(state.process_name)
+            if state.pid > 0 then
+                state.base = memory.get_process_base(state.pid)
+                state.status = string.format("Attached 0x%X", state.base)
+                state.rects = memory.get_window_rect(state.pid)
+            else
+                state.status = "Process not found"
+            end
         end
         state.process_name = select(
             1, ui.text_edit(state.process_name, false, false, false)
@@ -697,29 +574,26 @@ function OnRender()
 end
 ```
 
-## IPC Batch Pipeline
+## IPC Architecture
 
-The GUI-to-service IPC uses a batch pipeline for high throughput:
+The GUI-to-service IPC uses synchronous blocking named pipe calls:
 
-1. **GUI side**: The `connection_task` drains all pending requests from the
-   `mpsc` channel and writes them all to the pipe in one burst.
-2. **Service side**: `handle_client` reads all available frames from the pipe
-   decoder, spawns each as a `spawn_blocking` task. All tasks run concurrently
-   on Tokio's blocking pool. Results are collected in order and written back to
-   the pipe in one burst.
+1. **GUI side**: Each memory API call opens a blocking pipe connection (or
+   reuses a thread-local connection), writes the framed request, and reads
+   the response synchronously.
+2. **Service side**: `handle_client` reads frames from the pipe decoder,
+   spawns each as a `spawn_blocking` task on Tokio's blocking pool.
 3. **Zero-mutex IOCTL**: The driver handle is shared as `Arc<DriverHandle>`.
    Each blocking task calls `DeviceIoControl` directly without acquiring a
    mutex. Windows I/O manager serializes IRPs internally.
 
-This means 30 concurrent reads cost ~1 pipe round-trip instead of 30 sequential
-round-trips, enabling real-time linked-list traversal and entity scanning.
+Round-trip latency: ~60-100μs per call. At 60fps (16.6ms frame budget), you
+can comfortably fit 100+ synchronous memory reads per frame.
 
 ## Runtime Constraints
 
 - Lua VM is only accessed by the GUI Lua thread.
-- Background Tokio tasks transfer only task IDs and owned plain data.
-- `OnRender` must not perform synchronous network or driver operations.
-- `OnUpdate` must not await futures; use coroutines or `poll_async`.
+- All memory API calls are synchronous and block the Lua thread for ~60-100μs.
 - Single memory read/write limit: 4096 bytes.
 - Batch read limit: 256 entries, 4096 bytes total.
 - Process list is enumerated in user mode by the service.

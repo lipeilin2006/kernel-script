@@ -3,7 +3,6 @@ mod ipc;
 mod process;
 
 use std::ffi::OsString;
-use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::sync::broadcast;

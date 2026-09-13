@@ -1,5 +1,27 @@
 # Rust
 target/
+Cargo.lock.old
+**/target/
+
+# Runtime and diagnostic logs
+*.log
+*.log.*
+*.dmp
+*.wer
+
+# Local environment and tool state
+.env
+.env.*
+!.env.example
+.cargo/config.local.toml
+
+# Rust/editor temporary files
+*.rs.bk
+*.rmeta
+*.rlib
+*.rbc
+*.profraw
+*.profdata
 
 # Build outputs
 *.sys
@@ -11,6 +33,8 @@ target/
 *.obj
 *.iobj
 *.ipdb
+*.tlog
+*.lastbuildstate
 *.zip
 
 # Deployment package

@@ -1,9 +1,9 @@
 #![windows_subsystem = "windows"]
 mod app;
 
-mod ipc_client;
-
 mod lua_runtime;
+
+mod sync_ipc;
 
 mod window_util;
 fn main() {

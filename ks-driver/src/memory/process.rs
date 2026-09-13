@@ -224,3 +224,42 @@ pub fn batch_read_process_memory(
     }
     Ok(out_off)
 }
+
+/// Walk a pointer chain in a target process. Starting from `base`, read a u64
+/// pointer at `base + offsets[0]`, then read at `result + offsets[1]`, etc.
+///
+/// Returns the final address, or 0 if any pointer is null or unreadable.
+pub fn traverse_pointer_chain(process_id: u64, base: u64, offsets: &[u64]) -> u64 {
+    if process_id == 0 || offsets.is_empty() {
+        return 0;
+    }
+    let process = match lookup(process_id) {
+        Ok(p) => p,
+        Err(_) => return 0,
+    };
+    let mut current = base;
+    for &offset in offsets {
+        if current == 0 {
+            return 0;
+        }
+        let Some(target) = current.checked_add(offset) else {
+            return 0;
+        };
+        let mut ptr_value: u64 = 0;
+        let mut copied = 0usize;
+        let status = unsafe {
+            ks_copy_process_memory(
+                process.0,
+                target as Pvoid,
+                &mut ptr_value as *mut u64 as Pvoid,
+                8,
+                &mut copied,
+            )
+        };
+        if !nt_success(status) || copied != 8 {
+            return 0;
+        }
+        current = ptr_value;
+    }
+    current
+}

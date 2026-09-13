@@ -4,7 +4,6 @@ use std::{ffi::c_void, ptr};
 use bytes::{Bytes, BytesMut};
 use ks_core::protocol::{
     Frame, ProcessList, ProtocolError, HEADER_SIZE, MAGIC, MAX_DRIVER_TRANSFER_SIZE, MAX_FRAME_SIZE,
-    BATCH_READ_ENTRY_WIRE_SIZE,
 };
 use ks_core::protocol::{Request, Response, WireDecode, WireEncode};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -308,7 +307,14 @@ fn dispatch_sync(
                 data: data.to_vec(),
             }
         }
-        Request::BatchReadMemory { pid, size, addresses } => {
+        Request::BatchReadMemory {
+            pid,
+            size,
+            addresses,
+        } => {
+            if addresses.is_empty() || addresses.len() % 8 != 0 {
+                return encode_response(Response::Error(1));
+            }
             let count = addresses.len() / 8;
             let mut parsed = Vec::with_capacity(count);
             for i in 0..count {
@@ -316,7 +322,28 @@ fn dispatch_sync(
                 let addr = u64::from_le_bytes(addresses[off..off + 8].try_into().unwrap());
                 parsed.push(addr);
             }
-            OwnedRequest::BatchRead { pid, size, addresses: parsed }
+            OwnedRequest::BatchRead {
+                pid,
+                size,
+                addresses: parsed,
+            }
+        }
+        Request::TraversePointerChain { pid, base, offsets } => {
+            if offsets.is_empty() || offsets.len() % 8 != 0 {
+                return encode_response(Response::Error(1));
+            }
+            let count = offsets.len() / 8;
+            let mut parsed = Vec::with_capacity(count);
+            for i in 0..count {
+                let off = i * 8;
+                let offset = u64::from_le_bytes(offsets[off..off + 8].try_into().unwrap());
+                parsed.push(offset);
+            }
+            OwnedRequest::TraversePointerChain {
+                pid,
+                base,
+                offsets: parsed,
+            }
         }
     };
 
@@ -335,33 +362,35 @@ fn dispatch_sync(
                 encode_response(Response::Error(8))
             }
         },
-        OwnedRequest::GetProcessBase { pid } => {
-            match driver_comm::get_process_base(handle, pid) {
-                Ok(base) => encode_response(Response::ProcessBase(base)),
-                Err(error) => {
-                    tracing::warn!(pid, %error, "process base lookup failed");
-                    encode_response(Response::Error(10))
-                }
+        OwnedRequest::GetProcessBase { pid } => match driver_comm::get_process_base(handle, pid) {
+            Ok(base) => encode_response(Response::ProcessBase(base)),
+            Err(error) => {
+                tracing::warn!(pid, %error, "process base lookup failed");
+                encode_response(Response::Error(10))
             }
-        }
-        OwnedRequest::ReadRva { pid, relative_address, size } => {
-            match driver_comm::read_memory_rva(handle, pid, relative_address, size) {
-                Ok(data) => encode_response(Response::Memory(&data)),
-                Err(error) => {
-                    tracing::error!(pid, relative_address, size, %error, "driver RVA read failed");
-                    encode_error_detail(&error)
-                }
+        },
+        OwnedRequest::ReadRva {
+            pid,
+            relative_address,
+            size,
+        } => match driver_comm::read_memory_rva(handle, pid, relative_address, size) {
+            Ok(data) => encode_response(Response::Memory(&data)),
+            Err(error) => {
+                tracing::error!(pid, relative_address, size, %error, "driver RVA read failed");
+                encode_error_detail(&error)
             }
-        }
-        OwnedRequest::WriteRva { pid, relative_address, data } => {
-            match driver_comm::write_memory_rva(handle, pid, relative_address, &data) {
-                Ok(()) => encode_response(Response::WriteComplete),
-                Err(error) => {
-                    tracing::error!(pid, relative_address, size = data.len(), %error, "driver RVA write failed");
-                    encode_error_detail(&error)
-                }
+        },
+        OwnedRequest::WriteRva {
+            pid,
+            relative_address,
+            data,
+        } => match driver_comm::write_memory_rva(handle, pid, relative_address, &data) {
+            Ok(()) => encode_response(Response::WriteComplete),
+            Err(error) => {
+                tracing::error!(pid, relative_address, size = data.len(), %error, "driver RVA write failed");
+                encode_error_detail(&error)
             }
-        }
+        },
         OwnedRequest::Read(value) => {
             match driver_comm::read_memory(handle, value.pid, value.target_address, value.size) {
                 Ok(data) => encode_response(Response::Memory(&data)),
@@ -372,7 +401,8 @@ fn dispatch_sync(
             }
         }
         OwnedRequest::ReadMdl(value) => {
-            match driver_comm::read_memory_mdl(handle, value.pid, value.target_address, value.size) {
+            match driver_comm::read_memory_mdl(handle, value.pid, value.target_address, value.size)
+            {
                 Ok(data) => encode_response(Response::Memory(&data)),
                 Err(error) => {
                     tracing::error!(pid = value.pid, address = format_args!("0x{:X}", value.target_address), size = value.size, %error, "driver MDL read failed");
@@ -380,47 +410,66 @@ fn dispatch_sync(
                 }
             }
         }
-        OwnedRequest::ReadMdlRva { pid, relative_address, size } => {
-            match driver_comm::read_memory_mdl_rva(handle, pid, relative_address, size) {
-                Ok(data) => encode_response(Response::Memory(&data)),
-                Err(error) => {
-                    tracing::error!(pid, relative_address, size, %error, "driver MDL RVA read failed");
-                    encode_error_detail(&error)
-                }
+        OwnedRequest::ReadMdlRva {
+            pid,
+            relative_address,
+            size,
+        } => match driver_comm::read_memory_mdl_rva(handle, pid, relative_address, size) {
+            Ok(data) => encode_response(Response::Memory(&data)),
+            Err(error) => {
+                tracing::error!(pid, relative_address, size, %error, "driver MDL RVA read failed");
+                encode_error_detail(&error)
             }
-        }
-        OwnedRequest::WriteMdl { pid, target_address, data } => {
-            match driver_comm::write_memory_mdl(handle, pid, target_address, &data) {
-                Ok(()) => encode_response(Response::WriteComplete),
-                Err(error) => {
-                    tracing::error!(pid, address = format_args!("0x{:X}", target_address), size = data.len(), %error, "driver MDL write failed");
-                    encode_error_detail(&error)
-                }
+        },
+        OwnedRequest::WriteMdl {
+            pid,
+            target_address,
+            data,
+        } => match driver_comm::write_memory_mdl(handle, pid, target_address, &data) {
+            Ok(()) => encode_response(Response::WriteComplete),
+            Err(error) => {
+                tracing::error!(pid, address = format_args!("0x{:X}", target_address), size = data.len(), %error, "driver MDL write failed");
+                encode_error_detail(&error)
             }
-        }
-        OwnedRequest::WriteMdlRva { pid, relative_address, data } => {
-            match driver_comm::write_memory_mdl_rva(handle, pid, relative_address, &data) {
-                Ok(()) => encode_response(Response::WriteComplete),
-                Err(error) => {
-                    tracing::error!(pid, relative_address, size = data.len(), %error, "driver MDL RVA write failed");
-                    encode_error_detail(&error)
-                }
+        },
+        OwnedRequest::WriteMdlRva {
+            pid,
+            relative_address,
+            data,
+        } => match driver_comm::write_memory_mdl_rva(handle, pid, relative_address, &data) {
+            Ok(()) => encode_response(Response::WriteComplete),
+            Err(error) => {
+                tracing::error!(pid, relative_address, size = data.len(), %error, "driver MDL RVA write failed");
+                encode_error_detail(&error)
             }
-        }
-        OwnedRequest::Write { pid, target_address, data } => {
-            match driver_comm::write_memory(handle, pid, target_address, &data) {
-                Ok(()) => encode_response(Response::WriteComplete),
-                Err(error) => {
-                    tracing::error!(pid, address = format_args!("0x{:X}", target_address), size = data.len(), %error, "driver write failed");
-                    encode_error_detail(&error)
-                }
+        },
+        OwnedRequest::Write {
+            pid,
+            target_address,
+            data,
+        } => match driver_comm::write_memory(handle, pid, target_address, &data) {
+            Ok(()) => encode_response(Response::WriteComplete),
+            Err(error) => {
+                tracing::error!(pid, address = format_args!("0x{:X}", target_address), size = data.len(), %error, "driver write failed");
+                encode_error_detail(&error)
             }
-        }
-        OwnedRequest::BatchRead { pid, size, addresses } => {
-            match driver_comm::batch_read_memory(handle, pid, size, &addresses) {
-                Ok(data) => encode_response(Response::BatchReadMemory(&data)),
+        },
+        OwnedRequest::BatchRead {
+            pid,
+            size,
+            addresses,
+        } => match driver_comm::batch_read_memory(handle, pid, size, &addresses) {
+            Ok(data) => encode_response(Response::BatchReadMemory(&data)),
+            Err(error) => {
+                tracing::error!(pid, addresses = addresses.len(), %error, "driver batch read failed");
+                encode_error_detail(&error)
+            }
+        },
+        OwnedRequest::TraversePointerChain { pid, base, offsets } => {
+            match driver_comm::traverse_pointer_chain(handle, pid, base, &offsets) {
+                Ok(result) => encode_response(Response::PointerChainResult(result)),
                 Err(error) => {
-                    tracing::error!(pid, addresses = addresses.len(), %error, "driver batch read failed");
+                    tracing::error!(pid, base = format_args!("0x{:X}", base), %error, "driver pointer chain traversal failed");
                     encode_error_detail(&error)
                 }
             }
@@ -492,6 +541,11 @@ enum OwnedRequest {
         pid: u64,
         size: u32,
         addresses: Vec<u64>,
+    },
+    TraversePointerChain {
+        pid: u64,
+        base: u64,
+        offsets: Vec<u64>,
     },
 }
 

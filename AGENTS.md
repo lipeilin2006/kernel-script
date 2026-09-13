@@ -7,7 +7,7 @@
 - `ks-core`: shared `no_std` protocol and ABI definitions.
 - `ks-driver`: `no_std` WDM kernel driver. It performs target-process memory reads and writes.
 - `ks-service`: SYSTEM user-mode service. It owns the TCP IPC server, driver handle, driver request dispatch, and user-mode process enumeration.
-- `ks-gui`: user-mode egui/eframe OpenGL GUI and Lua runtime. It owns the Lua VM, coroutine scheduler, and asynchronous Named Pipe client.
+- `ks-gui`: user-mode egui/eframe OpenGL GUI and Lua runtime. It owns the Lua VM, synchronous Named Pipe IPC client, and draw command pipeline.
 - `ks-installer`: elevated egui GUI that manages the driver and service with `sc.exe` commands only.
 
 `ks-installer` is an elevated egui GUI that manages the driver and backend
@@ -27,8 +27,8 @@ driver-package/
 The intended data flow is:
 
 ```text
-Lua coroutine / egui
-    -> ks-gui Tokio TCP client
+Lua (synchronous call)
+    -> ks-gui blocking Named Pipe IPC
     -> ks-service Tokio TCP server
     -> driver worker / DeviceIoControl
     -> ks-driver
@@ -46,7 +46,7 @@ Process enumeration and process-name-to-PID lookup are service responsibilities.
 - Use explicit little-endian wire encoding. Do not expose Rust struct layout on the TCP protocol.
 - Validate lengths, counts, addresses, PIDs, and frame sizes at every trust boundary.
 - Use `windows-sys` with narrow feature lists when possible.
-- Do not reintroduce removed synchronous Lua APIs. GUI Lua IPC APIs must remain asynchronous.
+- Do not reintroduce removed synchronous Lua APIs. GUI Lua IPC APIs must remain synchronous.
 - Do not call blocking network operations, `block_on`, or synchronous driver operations from the GUI render thread.
 - Lua VM objects must only be accessed by the GUI Lua thread. Never send `Lua`, `Thread`, `Function`, or registry keys to worker threads.
 - Background workers may send only task IDs and owned plain data back to the GUI thread.
@@ -57,7 +57,6 @@ The GUI frame lifecycle is:
 
 ```text
 check_hot_reload
-    -> poll/resume async Lua coroutines
     -> OnUpdate
     -> OnRender
     -> Lua GC
@@ -66,41 +65,38 @@ check_hot_reload
 Rules:
 
 - `OnRender` must only draw UI and read cached results.
-- `OnUpdate` may start or poll asynchronous work but must not wait for network completion.
-- Use `memory.async_*` plus `await_async` for process and memory operations.
-- `start_async` creates a Lua coroutine and the Rust-side scheduler resumes it on later frames.
-- Hot reload destroys the old Lua VM and therefore invalidates all old Lua coroutines.
-- Multiple Lua scripts are loaded from `scripts/*.lua`; they run on the GUI Lua thread and share only scalar values explicitly stored through `shared.set/get/delete`.
-- Do not let a coroutine hold an egui UI borrow across a yield.
+- `OnUpdate` may perform synchronous memory operations (~60-100μs each).
+- All memory API calls are synchronous and block the Lua thread for ~60-100μs.
+- Hot reload destroys the old Lua VM.
+- Multiple Lua scripts are loaded from `scripts/*.lua`; they run on the GUI Lua thread.
 
-Supported asynchronous Luau operations include:
+Supported synchronous Luau operations include:
 
 ```lua
-memory.async_read_i32(pid, address)
-memory.async_read_bytes(pid, address, size)
-memory.async_read_rva(pid, relative_address, size)
-memory.async_write_i32(pid, address, value)
-memory.async_write_bytes(pid, address, data)
-memory.async_write_rva(pid, relative_address, data)
-memory.async_read_mdl(pid, address, size)
-memory.async_write_mdl(pid, address, data)
-memory.async_read_mdl_rva(pid, relative_address, size)
-memory.async_write_mdl_rva(pid, relative_address, data)
-memory.async_get_process_base(pid)
-memory.async_list_processes()
-memory.async_batch_read(pid, size, addresses)
+memory.get_pid(name)
+memory.get_process_base(pid)
+memory.read_i32(pid, address)
+memory.read_bytes(pid, address, size)
+memory.write_i32(pid, address, value)
+memory.write_bytes(pid, address, data)
+memory.read_rva(pid, relative_address, size)
+memory.write_rva(pid, relative_address, data)
+memory.read_mdl(pid, address, size)
+memory.write_mdl(pid, address, data)
+memory.read_mdl_rva(pid, relative_address, size)
+memory.write_mdl_rva(pid, relative_address, data)
+memory.batch_read(pid, size, addresses)
 memory.batch_offset(sizes)
-memory.poll_async(task_id)
+memory.traverse_pointer_chain(pid, base, offsets)
 ```
 
 Typical usage:
 
 ```lua
-start_async(function()
-    local pid = await_async(memory.async_get_pid("notepad.exe"))
-    local value = await_async(memory.async_read_i32(pid, "0x1407FFF0"))
-    print(value)
-end)
+local pid = memory.get_pid("notepad.exe")
+local base = memory.get_process_base(pid)
+local value = memory.read_i32(pid, "0x1407FFF0")
+print(value)
 ```
 
 ## IPC and Protocol

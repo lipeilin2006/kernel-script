@@ -1,15 +1,18 @@
-use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{mpsc, Arc, Mutex};
-use std::thread::{self, JoinHandle};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
 use egui;
-use mlua::{FromLua, Function, IntoLuaMulti, Lua, Table, Value, VmState};
+use mlua::{Function, Lua, Table, Value};
 
-use crate::ipc_client::IpcClient;
+mod execution;
+mod scheduler;
+mod types;
+
+use scheduler::{FixedUpdateScheduler, RuntimeControl};
+pub use types::{DrawCommand, DrawCommands};
 
 static CONTENT_SCALE: AtomicU32 = AtomicU32::new(100);
 
@@ -17,115 +20,7 @@ pub fn set_content_scale(scale: f32) {
     CONTENT_SCALE.store((scale * 100.0) as u32, Ordering::Relaxed);
 }
 
-#[derive(Clone, Debug)]
-pub enum DrawCommand {
-    Line {
-        x1: f32,
-        y1: f32,
-        x2: f32,
-        y2: f32,
-        color: [u8; 4],
-        thickness: f32,
-    },
-    Rect {
-        x: f32,
-        y: f32,
-        w: f32,
-        h: f32,
-        color: [u8; 4],
-        thickness: f32,
-    },
-    FilledRect {
-        x: f32,
-        y: f32,
-        w: f32,
-        h: f32,
-        color: [u8; 4],
-    },
-    Circle {
-        x: f32,
-        y: f32,
-        radius: f32,
-        color: [u8; 4],
-        thickness: f32,
-    },
-    FilledCircle {
-        x: f32,
-        y: f32,
-        radius: f32,
-        color: [u8; 4],
-    },
-    Text {
-        x: f32,
-        y: f32,
-        text: String,
-        color: [u8; 4],
-        size: f32,
-    },
-}
-
-pub type DrawCommands = Arc<Mutex<Vec<DrawCommand>>>;
-
-#[derive(Clone, Debug)]
-enum SharedValue {
-    Nil,
-    Boolean(bool),
-    Integer(i64),
-    Number(f64),
-    String(String),
-}
-
-type SharedGlobals = Arc<Mutex<HashMap<String, SharedValue>>>;
-
-fn shared_value_to_lua(lua: &Lua, value: SharedValue) -> mlua::Result<Value> {
-    Ok(match value {
-        SharedValue::Nil => Value::Nil,
-        SharedValue::Boolean(value) => Value::Boolean(value),
-        SharedValue::Integer(value) => Value::Integer(value),
-        SharedValue::Number(value) => Value::Number(value),
-        SharedValue::String(value) => Value::String(lua.create_string(value)?),
-    })
-}
-
-fn lua_to_shared_value(value: Value) -> mlua::Result<SharedValue> {
-    match value {
-        Value::Nil => Ok(SharedValue::Nil),
-        Value::Boolean(value) => Ok(SharedValue::Boolean(value)),
-        Value::Integer(value) => Ok(SharedValue::Integer(value)),
-        Value::Number(value) if value.is_finite() => Ok(SharedValue::Number(value)),
-        Value::String(value) => Ok(SharedValue::String(value.to_str()?.to_owned())),
-        _ => Err(mlua::Error::runtime(
-            "shared values must be nil, boolean, integer, number, or string",
-        )),
-    }
-}
-
-#[derive(Clone, Copy, Debug)]
-struct Address(u64);
-
-impl Address {
-    fn new(value: u64) -> Self {
-        Self(value)
-    }
-
-    fn get(self) -> u64 {
-        self.0
-    }
-}
-
-impl FromLua for Address {
-    fn from_lua(value: Value, _lua: &Lua) -> mlua::Result<Self> {
-        match value {
-            Value::Integer(value) if value > 0 => Ok(Address::new(value as u64)),
-            Value::Integer(_) => Err(mlua::Error::runtime("address must not be negative")),
-            Value::String(value) => parse_address(value.to_str()?.as_ref()),
-            value => Err(mlua::Error::runtime(format!(
-                "address must be a positive integer or string, got {}",
-                value.type_name()
-            ))),
-        }
-    }
-}
+use types::Address;
 
 // Lua OnUpdate targets 60 updates per second (16.667 ms per step).
 const UPDATE_STEP: Duration = Duration::from_nanos(16_666_667);
@@ -134,253 +29,20 @@ const MAX_FRAME_DELTA: Duration = Duration::from_millis(250);
 const RELOAD_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const LUA_MEMORY_LIMIT: usize = 64 * 1024 * 1024;
 const START_BUDGET: Duration = Duration::from_millis(100);
-const UPDATE_BUDGET: Duration = Duration::from_millis(10);
+const UPDATE_BUDGET: Duration = Duration::from_millis(20);
 const RENDER_BUDGET: Duration = Duration::from_millis(12);
 const DESTROY_BUDGET: Duration = Duration::from_millis(50);
-
-#[derive(Clone)]
-struct AsyncScheduler {
-    results: Arc<Mutex<mpsc::Receiver<(u64, AsyncResult)>>>,
-    result_tx: mpsc::Sender<(u64, AsyncResult)>,
-    next_id: Arc<AtomicU64>,
-    completed: Arc<Mutex<HashMap<u64, AsyncResult>>>,
-    runtime: Arc<tokio::runtime::Runtime>,
-    permits: Arc<tokio::sync::Semaphore>,
-}
-
-enum AsyncRequest {
-    ReadI32 {
-        pid: u64,
-        address: u64,
-    },
-    ReadBytes {
-        pid: u64,
-        address: u64,
-        size: u64,
-    },
-    WriteI32 {
-        pid: u64,
-        address: u64,
-        value: i32,
-    },
-    WriteBytes {
-        pid: u64,
-        address: u64,
-        data: Vec<u8>,
-    },
-    GetPid {
-        name: String,
-    },
-    GetProcessBase {
-        pid: u64,
-    },
-    ReadRva {
-        pid: u64,
-        relative_address: u64,
-        size: u64,
-    },
-    WriteRva {
-        pid: u64,
-        relative_address: u64,
-        data: Vec<u8>,
-    },
-    ReadMdl {
-        pid: u64,
-        address: u64,
-        size: u64,
-    },
-    WriteMdl {
-        pid: u64,
-        address: u64,
-        data: Vec<u8>,
-    },
-    ReadMdlRva {
-        pid: u64,
-        relative_address: u64,
-        size: u64,
-    },
-    WriteMdlRva {
-        pid: u64,
-        relative_address: u64,
-        data: Vec<u8>,
-    },
-    BatchRead {
-        pid: u64,
-        size: u32,
-        addresses: Vec<u64>,
-    },
-    ListProcesses,
-}
-
-enum AsyncValue {
-    I32(i32),
-    Bytes(Vec<u8>),
-    Pid(u64),
-    Processes(Vec<crate::ipc_client::ProcessInfo>),
-    Unit,
-}
-
-type AsyncResult = Result<AsyncValue, String>;
-
-impl AsyncScheduler {
-    fn new() -> Self {
-        let (result_tx, result_rx) = mpsc::channel::<(u64, AsyncResult)>();
-        let runtime = Arc::new(
-            tokio::runtime::Builder::new_multi_thread()
-                .worker_threads(2)
-                .max_blocking_threads(4)
-                .enable_io()
-                .enable_time()
-                .build()
-                .expect("failed to create GUI async runtime"),
-        );
-        Self {
-            results: Arc::new(Mutex::new(result_rx)),
-            result_tx,
-            next_id: Arc::new(AtomicU64::new(1)),
-            completed: Arc::new(Mutex::new(HashMap::new())),
-            runtime,
-            permits: Arc::new(tokio::sync::Semaphore::new(256)),
-        }
-    }
-
-    async fn execute(request: AsyncRequest) -> AsyncResult {
-        let client = IpcClient::new();
-        match request {
-            AsyncRequest::ReadI32 { pid, address } => {
-                client.read_memory(pid, address, 4).await.and_then(|data| {
-                    let bytes: [u8; 4] = data
-                        .get(..4)
-                        .ok_or_else(|| "read returned fewer than 4 bytes".to_owned())?
-                        .try_into()
-                        .map_err(|_| "invalid i32 response".to_owned())?;
-                    Ok(AsyncValue::I32(i32::from_ne_bytes(bytes)))
-                })
-            }
-            AsyncRequest::ReadBytes { pid, address, size } => client
-                .read_memory(pid, address, size)
-                .await
-                .map(AsyncValue::Bytes),
-            AsyncRequest::WriteI32 {
-                pid,
-                address,
-                value,
-            } => client
-                .write_memory(pid, address, &value.to_ne_bytes())
-                .await
-                .map(|()| AsyncValue::Unit),
-            AsyncRequest::WriteBytes { pid, address, data } => client
-                .write_memory(pid, address, &data)
-                .await
-                .map(|()| AsyncValue::Unit),
-            AsyncRequest::GetPid { name } => {
-                client.get_pid(&name).await.map(AsyncValue::Pid)
-            }
-            AsyncRequest::GetProcessBase { pid } => {
-                client.get_process_base(pid).await.map(AsyncValue::Pid)
-            }
-            AsyncRequest::ReadRva {
-                pid,
-                relative_address,
-                size,
-            } => client
-                .read_memory_rva(pid, relative_address, size)
-                .await
-                .map(AsyncValue::Bytes),
-            AsyncRequest::WriteRva {
-                pid,
-                relative_address,
-                data,
-            } => client
-                .write_memory_rva(pid, relative_address, &data)
-                .await
-                .map(|()| AsyncValue::Unit),
-            AsyncRequest::ReadMdl { pid, address, size } => client
-                .read_memory_mdl(pid, address, size)
-                .await
-                .map(AsyncValue::Bytes),
-            AsyncRequest::WriteMdl { pid, address, data } => client
-                .write_memory_mdl(pid, address, &data)
-                .await
-                .map(|()| AsyncValue::Unit),
-            AsyncRequest::ReadMdlRva {
-                pid,
-                relative_address,
-                size,
-            } => client
-                .read_memory_mdl_rva(pid, relative_address, size)
-                .await
-                .map(AsyncValue::Bytes),
-            AsyncRequest::WriteMdlRva {
-                pid,
-                relative_address,
-                data,
-            } => client
-                .write_memory_mdl_rva(pid, relative_address, &data)
-                .await
-                .map(|()| AsyncValue::Unit),
-            AsyncRequest::BatchRead { pid, size, addresses } => client
-                .batch_read_memory(pid, size, &addresses)
-                .await
-                .map(AsyncValue::Bytes),
-            AsyncRequest::ListProcesses => client.list_processes().await.map(AsyncValue::Processes),
-        }
-    }
-
-    fn submit(&self, request: AsyncRequest) -> Result<u64, String> {
-        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        let result_tx = self.result_tx.clone();
-        let permit = self
-            .permits
-            .clone()
-            .try_acquire_owned()
-            .map_err(|_| "IPC task queue is full".to_owned())?;
-        let task_id = id;
-        self.runtime.spawn(async move {
-            let result = Self::execute(request).await;
-            let _ = result_tx.send((task_id, result));
-            drop(permit);
-        });
-        Ok(id)
-    }
-
-    fn poll(&self) -> Option<(u64, AsyncResult)> {
-        self.results.lock().ok()?.try_recv().ok()
-    }
-
-    pub fn drain_pending(&self) {
-        let mut completed = match self.completed.lock() {
-            Ok(c) => c,
-            Err(_) => return,
-        };
-        while let Some((id, result)) = self.poll() {
-            completed.insert(id, result);
-        }
-    }
-
-    fn poll_id(&self, id: u64) -> Option<AsyncResult> {
-        if let Ok(mut completed) = self.completed.lock() {
-            completed.remove(&id)
-        } else {
-            None
-        }
-    }
-}
 
 pub struct LuaRuntime {
     lua: Lua,
     script_path: PathBuf,
     control: Arc<RuntimeControl>,
-    deadline: Arc<Mutex<Option<Instant>>>,
+    deadline: Arc<AtomicU64>,
     scheduler: FixedUpdateScheduler,
     last_error: Option<String>,
     last_tick: Instant,
     last_reload_poll: Instant,
     script_modified: Option<SystemTime>,
-    update_stop: Arc<AtomicBool>,
-    update_thread: Option<JoinHandle<()>>,
-    async_scheduler: AsyncScheduler,
-    shared_globals: SharedGlobals,
     draw_commands: DrawCommands,
 }
 
@@ -391,13 +53,17 @@ pub struct LuaRuntimeManager {
 
 impl LuaRuntimeManager {
     pub fn new(script_directory: PathBuf) -> mlua::Result<Self> {
-        let shared_globals = Arc::new(Mutex::new(HashMap::new()));
         let draw_commands: DrawCommands = Arc::new(Mutex::new(Vec::new()));
         let mut paths = fs::read_dir(&script_directory)
             .map_err(mlua::Error::external)?
             .filter_map(Result::ok)
             .map(|entry| entry.path())
             .filter(|path| path.extension().is_some_and(|extension| extension == "lua"))
+            .filter(|path| {
+                path.file_stem()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| !name.starts_with('_'))
+            })
             .collect::<Vec<_>>();
         paths.sort();
         if paths.is_empty() {
@@ -408,15 +74,12 @@ impl LuaRuntimeManager {
         }
         let runtimes = paths
             .into_iter()
-            .map(|path| {
-                LuaRuntime::new(
-                    path,
-                    Arc::clone(&shared_globals),
-                    Arc::clone(&draw_commands),
-                )
-            })
+            .map(|path| LuaRuntime::new(path, Arc::clone(&draw_commands)))
             .collect::<mlua::Result<Vec<_>>>()?;
-        Ok(Self { runtimes, draw_commands })
+        Ok(Self {
+            runtimes,
+            draw_commands,
+        })
     }
 
     pub fn frame(&mut self, ctx: &egui::Context, now: Instant) {
@@ -443,37 +106,17 @@ impl LuaRuntimeManager {
 }
 
 impl LuaRuntime {
-    fn new(
-        script_path: PathBuf,
-        shared_globals: SharedGlobals,
-        draw_commands: DrawCommands,
-    ) -> mlua::Result<Self> {
+    fn new(script_path: PathBuf, draw_commands: DrawCommands) -> mlua::Result<Self> {
         let control = Arc::new(RuntimeControl::default());
-        let async_scheduler = AsyncScheduler::new();
         let (lua, deadline) = Self::build_vm(
             &script_path,
             Arc::clone(&control),
-            async_scheduler.clone(),
-            Arc::clone(&shared_globals),
             Arc::clone(&draw_commands),
         )?;
         let now = Instant::now();
-        let update_stop = Arc::new(AtomicBool::new(false));
-        let update_stop_thread = Arc::clone(&update_stop);
-        let update_control = Arc::clone(&control);
-        let update_thread = thread::spawn(move || {
-            while !update_stop_thread.load(Ordering::Relaxed) {
-                thread::sleep(UPDATE_STEP);
-                update_control.pending_steps.fetch_add(1, Ordering::Relaxed);
-            }
-        });
         Ok(Self {
             lua,
             script_modified: script_modified(&script_path),
-            update_stop,
-            update_thread: Some(update_thread),
-            async_scheduler,
-            shared_globals,
             draw_commands,
             script_path,
             control,
@@ -505,61 +148,39 @@ impl LuaRuntime {
     fn build_vm(
         script_path: &Path,
         control: Arc<RuntimeControl>,
-        async_scheduler: AsyncScheduler,
-        shared_globals: SharedGlobals,
         draw_commands: DrawCommands,
-    ) -> mlua::Result<(Lua, Arc<Mutex<Option<Instant>>>)> {
+    ) -> mlua::Result<(Lua, Arc<AtomicU64>)> {
         let lua = Lua::new();
         lua.set_memory_limit(LUA_MEMORY_LIMIT)?;
         // Scripts only need the registered engine and memory APIs.
         for global in ["os", "io", "package", "debug"] {
             lua.globals().set(global, Value::Nil)?;
         }
-        let deadline = install_execution_hook(&lua);
+        let deadline = execution::install_hook(&lua);
         register_engine_api(&lua, control)?;
-        register_memory_api(&lua, async_scheduler)?;
-        register_shared_api(&lua, shared_globals)?;
+        register_memory_api(&lua)?;
         register_draw_api(&lua, draw_commands)?;
-        install_async_helpers(&lua)?;
 
         let source = fs::read_to_string(script_path).map_err(mlua::Error::external)?;
-        set_deadline(&deadline, Some(Instant::now() + START_BUDGET))?;
+        execution::set_deadline(&deadline, Some(START_BUDGET));
         let load_result = lua
             .load(&source)
             .set_name(script_path.to_string_lossy().as_ref())
             .exec();
-        set_deadline(&deadline, None)?;
+        execution::set_deadline(&deadline, None);
         load_result?;
-        call_optional_budgeted(&lua, &deadline, "OnStart", (), START_BUDGET)?;
+        execution::call_budgeted(&lua, &deadline, "OnStart", (), START_BUDGET)?;
         Ok((lua, deadline))
     }
 
     fn run_updates(&mut self, now: Instant) {
-        let _elapsed = now.duration_since(self.last_tick);
+        let elapsed = now.duration_since(self.last_tick);
         self.last_tick = now;
 
-        let steps = if self.control.paused.load(Ordering::Relaxed) {
-            self.scheduler.reset();
-            self.control.pending_steps.swap(0, Ordering::Relaxed).min(1)
-        } else {
-            self.control
-                .pending_steps
-                .swap(0, Ordering::Relaxed)
-                .min(MAX_UPDATE_STEPS_PER_FRAME)
-        };
+        let steps = scheduler::update_steps(&mut self.scheduler, &self.control, elapsed);
 
         for _ in 0..steps {
-            if let Err(error) = call_optional_budgeted(
-                &self.lua,
-                &self.deadline,
-                "__pump_async_tasks",
-                (),
-                UPDATE_BUDGET,
-            ) {
-                self.last_error = Some(format!("async task failed: {error}"));
-                break;
-            }
-            if let Err(error) = call_optional_budgeted(
+            if let Err(error) = execution::call_budgeted(
                 &self.lua,
                 &self.deadline,
                 "OnUpdate",
@@ -577,7 +198,7 @@ impl LuaRuntime {
         let result = self.lua.scope(|scope| {
             let module = create_ui_module(&self.lua, scope, ctx)?;
             self.lua.globals().set("ui", module)?;
-            call_optional_budgeted(&self.lua, &self.deadline, "OnRender", (), RENDER_BUDGET)
+            execution::call_budgeted(&self.lua, &self.deadline, "OnRender", (), RENDER_BUDGET)
         });
         if let Err(error) = result {
             self.last_error = Some(format!("OnRender failed: {error}"));
@@ -613,12 +234,10 @@ impl LuaRuntime {
         match Self::build_vm(
             &self.script_path,
             Arc::clone(&self.control),
-            self.async_scheduler.clone(),
-            Arc::clone(&self.shared_globals),
             Arc::clone(&self.draw_commands),
         ) {
             Ok((new_lua, new_deadline)) => {
-                if let Err(error) = call_optional_budgeted(
+                if let Err(error) = execution::call_budgeted(
                     &self.lua,
                     &self.deadline,
                     "OnDestroy",
@@ -641,100 +260,12 @@ impl LuaRuntime {
 
 impl Drop for LuaRuntime {
     fn drop(&mut self) {
-        self.update_stop.store(true, Ordering::Relaxed);
-        if let Some(thread) = self.update_thread.take() {
-            let _ = thread.join();
-        }
         if let Err(error) =
-            call_optional_budgeted(&self.lua, &self.deadline, "OnDestroy", (), DESTROY_BUDGET)
+            execution::call_budgeted(&self.lua, &self.deadline, "OnDestroy", (), DESTROY_BUDGET)
         {
             eprintln!("OnDestroy failed during shutdown: {error}");
         }
     }
-}
-
-#[derive(Default)]
-struct RuntimeControl {
-    paused: AtomicBool,
-    pending_steps: AtomicUsize,
-}
-
-struct FixedUpdateScheduler {
-    step: Duration,
-    max_elapsed: Duration,
-    max_steps: usize,
-    accumulator: Duration,
-}
-
-impl FixedUpdateScheduler {
-    fn new(step: Duration, max_elapsed: Duration, max_steps: usize) -> Self {
-        Self {
-            step,
-            max_elapsed,
-            max_steps,
-            accumulator: Duration::ZERO,
-        }
-    }
-
-    fn advance(&mut self, elapsed: Duration) -> usize {
-        self.accumulator += elapsed.min(self.max_elapsed);
-        let available = (self.accumulator.as_nanos() / self.step.as_nanos()) as usize;
-        let steps = available.min(self.max_steps);
-        self.accumulator = if available > self.max_steps {
-            Duration::ZERO
-        } else {
-            self.accumulator - self.step * steps as u32
-        };
-        steps
-    }
-
-    fn reset(&mut self) {
-        self.accumulator = Duration::ZERO;
-    }
-}
-
-fn install_execution_hook(lua: &Lua) -> Arc<Mutex<Option<Instant>>> {
-    let deadline = Arc::new(Mutex::new(None));
-    let hook_deadline = Arc::clone(&deadline);
-    lua.set_interrupt(move |_| {
-        if hook_deadline
-            .lock()
-            .map_err(|_| mlua::Error::runtime("execution deadline lock poisoned"))?
-            .is_some_and(|deadline| Instant::now() >= deadline)
-        {
-            return Err(mlua::Error::runtime("script execution budget exceeded"));
-        }
-        Ok(VmState::Continue)
-    });
-    deadline
-}
-
-fn call_optional_budgeted<A>(
-    lua: &Lua,
-    deadline: &Mutex<Option<Instant>>,
-    name: &str,
-    args: A,
-    budget: Duration,
-) -> mlua::Result<()>
-where
-    A: IntoLuaMulti,
-{
-    let callback = lua.globals().get::<Option<Function>>(name)?;
-    let Some(callback) = callback else {
-        return Ok(());
-    };
-
-    set_deadline(deadline, Some(Instant::now() + budget))?;
-    let result = callback.call::<()>(args);
-    set_deadline(deadline, None)?;
-    result
-}
-
-fn set_deadline(deadline: &Mutex<Option<Instant>>, value: Option<Instant>) -> mlua::Result<()> {
-    *deadline
-        .lock()
-        .map_err(|_| mlua::Error::runtime("execution deadline lock poisoned"))? = value;
-    Ok(())
 }
 
 fn register_engine_api(lua: &Lua, control: Arc<RuntimeControl>) -> mlua::Result<()> {
@@ -771,6 +302,10 @@ fn register_engine_api(lua: &Lua, control: Arc<RuntimeControl>) -> mlua::Result<
     module.set(
         "memory_used",
         lua.create_function(|lua, ()| Ok(lua.used_memory()))?,
+    )?;
+    module.set(
+        "time_us",
+        lua.create_function(|_, ()| -> mlua::Result<u64> { Ok(execution::time_us()) })?,
     )?;
     lua.globals().set("engine", module)
 }
@@ -1307,273 +842,170 @@ fn create_ui_module<'scope>(
 }
 
 */
-fn register_memory_api(lua: &Lua, async_scheduler: AsyncScheduler) -> mlua::Result<()> {
+fn register_memory_api(lua: &Lua) -> mlua::Result<()> {
     let module = lua.create_table()?;
 
-    {
-        let scheduler = async_scheduler.clone();
-        module.set(
-            "async_read_i32",
-            lua.create_function(move |_, (pid, address): (u64, Address)| {
-                scheduler
-                    .submit(AsyncRequest::ReadI32 {
-                        pid,
-                        address: address.get(),
-                    })
-                    .map_err(mlua::Error::external)
-            })?,
-        )?;
-    }
+    module.set(
+        "get_pid",
+        lua.create_function(|_, name: String| -> mlua::Result<u64> {
+            crate::sync_ipc::get_pid(&name).map_err(mlua::Error::runtime)
+        })?,
+    )?;
 
-    {
-        let scheduler = async_scheduler.clone();
-        module.set(
-            "async_read_bytes",
-            lua.create_function(move |_, (pid, address, size): (u64, Address, u64)| {
+    module.set(
+        "get_process_base",
+        lua.create_function(|_, pid: u64| -> mlua::Result<u64> {
+            crate::sync_ipc::get_process_base(pid).map_err(mlua::Error::runtime)
+        })?,
+    )?;
+
+    module.set(
+        "read_i32",
+        lua.create_function(|_, (pid, address): (u64, Address)| -> mlua::Result<i32> {
+            crate::sync_ipc::read_i32(pid, address.get()).map_err(mlua::Error::runtime)
+        })?,
+    )?;
+
+    module.set(
+        "read_bytes",
+        lua.create_function(
+            |_, (pid, address, size): (u64, Address, u64)| -> mlua::Result<Vec<u8>> {
                 let size = usize::try_from(size)
                     .map_err(|_| mlua::Error::runtime("size does not fit usize"))?;
                 if size == 0 || size > ks_core::protocol::MAX_DRIVER_TRANSFER_SIZE {
-                    return Err(mlua::Error::runtime("invalid pid or read size"));
+                    return Err(mlua::Error::runtime("invalid read size"));
                 }
-                scheduler
-                    .submit(AsyncRequest::ReadBytes {
-                        pid,
-                        address: address.get(),
-                        size: size as u64,
-                    })
-                    .map_err(mlua::Error::external)
-            })?,
-        )?;
-    }
+                crate::sync_ipc::read_bytes(pid, address.get(), size as u64)
+                    .map_err(mlua::Error::runtime)
+            },
+        )?,
+    )?;
 
-    {
-        let scheduler = async_scheduler.clone();
-        module.set(
-            "async_write_i32",
-            lua.create_function(move |_, (pid, address, value): (u64, Address, i32)| {
-                scheduler
-                    .submit(AsyncRequest::WriteI32 {
-                        pid,
-                        address: address.get(),
-                        value,
-                    })
-                    .map_err(mlua::Error::external)
-            })?,
-        )?;
-    }
+    module.set(
+        "write_i32",
+        lua.create_function(
+            |_, (pid, address, value): (u64, Address, i32)| -> mlua::Result<()> {
+                crate::sync_ipc::write_i32(pid, address.get(), value).map_err(mlua::Error::runtime)
+            },
+        )?,
+    )?;
 
-    {
-        let scheduler = async_scheduler.clone();
-        module.set(
-            "async_write_bytes",
-            lua.create_function(move |_, (pid, address, data): (u64, Address, Vec<u8>)| {
+    module.set(
+        "write_bytes",
+        lua.create_function(
+            |_, (pid, address, data): (u64, Address, Vec<u8>)| -> mlua::Result<()> {
                 if data.is_empty() || data.len() > ks_core::protocol::MAX_DRIVER_TRANSFER_SIZE {
-                    return Err(mlua::Error::runtime("invalid pid or write size"));
+                    return Err(mlua::Error::runtime("invalid write size"));
                 }
-                scheduler
-                    .submit(AsyncRequest::WriteBytes {
-                        pid,
-                        address: address.get(),
-                        data,
-                    })
-                    .map_err(mlua::Error::external)
-            })?,
-        )?;
-    }
+                crate::sync_ipc::write_bytes(pid, address.get(), &data)
+                    .map_err(mlua::Error::runtime)
+            },
+        )?,
+    )?;
 
-    {
-        let scheduler = async_scheduler.clone();
-        module.set(
-            "async_get_pid",
-            lua.create_function(move |_, name: String| {
-                let name = name.trim().to_owned();
-                if name.is_empty() || name.len() > 255 || name.bytes().any(|byte| byte == 0) {
-                    return Err(mlua::Error::runtime(
-                        "process name must be 1..255 bytes and contain no NUL",
-                    ));
-                }
-                scheduler
-                    .submit(AsyncRequest::GetPid { name })
-                    .map_err(mlua::Error::external)
-            })?,
-        )?;
-    }
-
-    {
-        let scheduler = async_scheduler.clone();
-        module.set(
-            "async_get_process_base",
-            lua.create_function(move |_, pid: u64| {
-                scheduler
-                    .submit(AsyncRequest::GetProcessBase { pid })
-                    .map_err(mlua::Error::external)
-            })?,
-        )?;
-    }
-
-    {
-        let scheduler = async_scheduler.clone();
-        module.set(
-            "async_read_rva",
-            lua.create_function(move |_, (pid, relative_address, size): (u64, u64, u64)| {
+    module.set(
+        "read_rva",
+        lua.create_function(
+            |_, (pid, relative_address, size): (u64, u64, u64)| -> mlua::Result<Vec<u8>> {
                 let size = usize::try_from(size)
                     .map_err(|_| mlua::Error::runtime("size does not fit usize"))?;
                 if size == 0 || size > ks_core::protocol::MAX_DRIVER_TRANSFER_SIZE {
                     return Err(mlua::Error::runtime("invalid RVA read size"));
                 }
-                scheduler
-                    .submit(AsyncRequest::ReadRva {
-                        pid,
-                        relative_address,
-                        size: size as u64,
-                    })
-                    .map_err(mlua::Error::external)
-            })?,
-        )?;
-    }
+                crate::sync_ipc::read_rva(pid, relative_address, size as u64)
+                    .map_err(mlua::Error::runtime)
+            },
+        )?,
+    )?;
 
-    {
-        let scheduler = async_scheduler.clone();
-        module.set(
-            "async_write_rva",
-            lua.create_function(
-                move |_, (pid, relative_address, data): (u64, u64, Vec<u8>)| {
-                    if data.is_empty() || data.len() > ks_core::protocol::MAX_DRIVER_TRANSFER_SIZE {
-                        return Err(mlua::Error::runtime("invalid RVA write size"));
-                    }
-                    scheduler
-                        .submit(AsyncRequest::WriteRva {
-                            pid,
-                            relative_address,
-                            data,
-                        })
-                        .map_err(mlua::Error::external)
-                },
-            )?,
-        )?;
-    }
+    module.set(
+        "write_rva",
+        lua.create_function(
+            |_, (pid, relative_address, data): (u64, u64, Vec<u8>)| -> mlua::Result<()> {
+                if data.is_empty() || data.len() > ks_core::protocol::MAX_DRIVER_TRANSFER_SIZE {
+                    return Err(mlua::Error::runtime("invalid RVA write size"));
+                }
+                crate::sync_ipc::write_rva(pid, relative_address, &data)
+                    .map_err(mlua::Error::runtime)
+            },
+        )?,
+    )?;
 
-    {
-        let scheduler = async_scheduler.clone();
-        module.set(
-            "async_read_mdl",
-            lua.create_function(move |_, (pid, address, size): (u64, Address, u64)| {
+    module.set(
+        "read_mdl",
+        lua.create_function(
+            |_, (pid, address, size): (u64, Address, u64)| -> mlua::Result<Vec<u8>> {
                 let size = usize::try_from(size)
                     .map_err(|_| mlua::Error::runtime("size does not fit usize"))?;
                 if size == 0 || size > ks_core::protocol::MAX_DRIVER_TRANSFER_SIZE {
                     return Err(mlua::Error::runtime("invalid MDL read size"));
                 }
-                scheduler
-                    .submit(AsyncRequest::ReadMdl {
-                        pid,
-                        address: address.get(),
-                        size: size as u64,
-                    })
-                    .map_err(mlua::Error::external)
-            })?,
-        )?;
-    }
+                crate::sync_ipc::read_mdl(pid, address.get(), size as u64)
+                    .map_err(mlua::Error::runtime)
+            },
+        )?,
+    )?;
 
-    {
-        let scheduler = async_scheduler.clone();
-        module.set(
-            "async_write_mdl",
-            lua.create_function(move |_, (pid, address, data): (u64, Address, Vec<u8>)| {
+    module.set(
+        "write_mdl",
+        lua.create_function(
+            |_, (pid, address, data): (u64, Address, Vec<u8>)| -> mlua::Result<()> {
                 if data.is_empty() || data.len() > ks_core::protocol::MAX_DRIVER_TRANSFER_SIZE {
                     return Err(mlua::Error::runtime("invalid MDL write size"));
                 }
-                scheduler
-                    .submit(AsyncRequest::WriteMdl {
-                        pid,
-                        address: address.get(),
-                        data,
-                    })
-                    .map_err(mlua::Error::external)
-            })?,
-        )?;
-    }
+                crate::sync_ipc::write_mdl(pid, address.get(), &data).map_err(mlua::Error::runtime)
+            },
+        )?,
+    )?;
 
-    {
-        let scheduler = async_scheduler.clone();
-        module.set(
-            "async_read_mdl_rva",
-            lua.create_function(move |_, (pid, relative_address, size): (u64, u64, u64)| {
+    module.set(
+        "read_mdl_rva",
+        lua.create_function(
+            |_, (pid, relative_address, size): (u64, u64, u64)| -> mlua::Result<Vec<u8>> {
                 let size = usize::try_from(size)
                     .map_err(|_| mlua::Error::runtime("size does not fit usize"))?;
                 if size == 0 || size > ks_core::protocol::MAX_DRIVER_TRANSFER_SIZE {
                     return Err(mlua::Error::runtime("invalid MDL RVA read size"));
                 }
-                scheduler
-                    .submit(AsyncRequest::ReadMdlRva {
-                        pid,
-                        relative_address,
-                        size: size as u64,
-                    })
-                    .map_err(mlua::Error::external)
-            })?,
-        )?;
-    }
+                crate::sync_ipc::read_mdl_rva(pid, relative_address, size as u64)
+                    .map_err(mlua::Error::runtime)
+            },
+        )?,
+    )?;
 
-    {
-        let scheduler = async_scheduler.clone();
-        module.set(
-            "async_write_mdl_rva",
-            lua.create_function(
-                move |_, (pid, relative_address, data): (u64, u64, Vec<u8>)| {
-                    if data.is_empty() || data.len() > ks_core::protocol::MAX_DRIVER_TRANSFER_SIZE {
-                        return Err(mlua::Error::runtime("invalid MDL RVA write size"));
-                    }
-                    scheduler
-                        .submit(AsyncRequest::WriteMdlRva {
-                            pid,
-                            relative_address,
-                            data,
-                        })
-                        .map_err(mlua::Error::external)
-                },
-            )?,
-        )?;
-    }
+    module.set(
+        "write_mdl_rva",
+        lua.create_function(
+            |_, (pid, relative_address, data): (u64, u64, Vec<u8>)| -> mlua::Result<()> {
+                if data.is_empty() || data.len() > ks_core::protocol::MAX_DRIVER_TRANSFER_SIZE {
+                    return Err(mlua::Error::runtime("invalid MDL RVA write size"));
+                }
+                crate::sync_ipc::write_mdl_rva(pid, relative_address, &data)
+                    .map_err(mlua::Error::runtime)
+            },
+        )?,
+    )?;
 
-    {
-        let scheduler = async_scheduler.clone();
-        module.set(
-            "async_list_processes",
-            lua.create_function(move |_, ()| {
-                scheduler
-                    .submit(AsyncRequest::ListProcesses)
-                    .map_err(mlua::Error::external)
-            })?,
-        )?;
-    }
-
-    {
-        let scheduler = async_scheduler.clone();
-        module.set(
-            "async_batch_read",
-            lua.create_function(move |_, (pid, size, addresses_table): (u64, u64, mlua::Table)| {
-                let size =
-                    u32::try_from(size).map_err(|_| mlua::Error::runtime("size too large"))?;
+    module.set(
+        "batch_read",
+        lua.create_function(
+            |_, (pid, size, addresses_table): (u64, u32, mlua::Table)| -> mlua::Result<Vec<u8>> {
                 if size == 0 || size > ks_core::protocol::MAX_DRIVER_TRANSFER_SIZE as u32 {
-                    return Err(mlua::Error::runtime("invalid read size"));
+                    return Err(mlua::Error::runtime("invalid batch entry size"));
                 }
                 let count = addresses_table.len()? as usize;
-                if count == 0 || count > ks_core::protocol::MAX_BATCH_ENTRIES {
-                    return Err(mlua::Error::runtime(
-                        "batch read: 0 < count <= MAX_BATCH_ENTRIES",
-                    ));
+                if count > ks_core::protocol::MAX_BATCH_ENTRIES {
+                    return Err(mlua::Error::runtime("too many batch entries"));
                 }
                 let mut addresses = Vec::with_capacity(count);
                 for i in 1..=count {
                     let addr: u64 = addresses_table.get(i)?;
                     addresses.push(addr);
                 }
-                scheduler
-                    .submit(AsyncRequest::BatchRead { pid, size, addresses })
-                    .map_err(mlua::Error::external)
-            })?,
-        )?;
-    }
+                crate::sync_ipc::batch_read(pid, size, &addresses).map_err(mlua::Error::runtime)
+            },
+        )?,
+    )?;
 
     module.set(
         "batch_offset",
@@ -1589,6 +1021,25 @@ fn register_memory_api(lua: &Lua, async_scheduler: AsyncScheduler) -> mlua::Resu
             offsets.set("total", acc)?;
             Ok(offsets)
         })?,
+    )?;
+
+    module.set(
+        "traverse_pointer_chain",
+        lua.create_function(
+            |_, (pid, base, offsets_table): (u64, u64, mlua::Table)| -> mlua::Result<u64> {
+                let count = offsets_table.len()? as usize;
+                if count > 32 {
+                    return Err(mlua::Error::runtime("pointer chain: max 32 offsets"));
+                }
+                let mut offsets = Vec::with_capacity(count);
+                for i in 1..=count {
+                    let offset: u64 = offsets_table.get(i)?;
+                    offsets.push(offset);
+                }
+                crate::sync_ipc::traverse_pointer_chain(pid, base, &offsets)
+                    .map_err(mlua::Error::runtime)
+            },
+        )?,
     )?;
 
     module.set(
@@ -1613,109 +1064,7 @@ fn register_memory_api(lua: &Lua, async_scheduler: AsyncScheduler) -> mlua::Resu
         })?,
     )?;
 
-    {
-        let scheduler = async_scheduler.clone();
-        module.set(
-            "drain_pending",
-            lua.create_function(move |_, ()| -> mlua::Result<()> {
-                scheduler.drain_pending();
-                Ok(())
-            })?,
-        )?;
-    }
-
-    {
-        let scheduler = async_scheduler.clone();
-        module.set(
-            "poll_async",
-            lua.create_function(move |lua, id: u64| -> mlua::Result<Option<mlua::Table>> {
-                let Some(result) = scheduler.poll_id(id) else {
-                    return Ok(None);
-                };
-                let output = lua.create_table()?;
-                match result {
-                    Ok(AsyncValue::I32(value)) => {
-                        output.set("value", value)?;
-                    }
-                    Ok(AsyncValue::Bytes(value)) => {
-                        output.set("value", value)?;
-                    }
-                    Ok(AsyncValue::Pid(value)) => {
-                        output.set("value", value)?;
-                    }
-                    Ok(AsyncValue::Processes(value)) => {
-                        let processes = lua.create_table_with_capacity(value.len(), 0)?;
-                        for (index, process_info) in value.into_iter().enumerate() {
-                            let process = lua.create_table()?;
-                            process.set("pid", process_info.pid)?;
-                            process.set("parent_pid", process_info.parent_pid)?;
-                            process.set("thread_count", process_info.thread_count)?;
-                            process.set("name", process_info.name)?;
-                            processes.set(index + 1, process)?;
-                        }
-                        output.set("value", processes)?;
-                    }
-                    Ok(AsyncValue::Unit) => {}
-                    Err(error) => {
-                        output.set("error", error)?;
-                    }
-                }
-                output.set("done", true)?;
-                Ok(Some(output))
-            })?,
-        )?;
-    }
-
     lua.globals().set("memory", module)
-}
-
-fn register_shared_api(lua: &Lua, shared: SharedGlobals) -> mlua::Result<()> {
-    let module = lua.create_table()?;
-    {
-        let shared = Arc::clone(&shared);
-        module.set(
-            "get",
-            lua.create_function(move |lua, key: String| {
-                let value = shared
-                    .lock()
-                    .map_err(|_| mlua::Error::runtime("shared globals lock poisoned"))?
-                    .get(&key)
-                    .cloned()
-                    .unwrap_or(SharedValue::Nil);
-                shared_value_to_lua(lua, value)
-            })?,
-        )?;
-    }
-    {
-        let shared = Arc::clone(&shared);
-        module.set(
-            "set",
-            lua.create_function(move |_, (key, value): (String, Value)| {
-                if key.is_empty() || key.len() > 128 {
-                    return Err(mlua::Error::runtime("shared key must be 1..128 bytes"));
-                }
-                shared
-                    .lock()
-                    .map_err(|_| mlua::Error::runtime("shared globals lock poisoned"))?
-                    .insert(key, lua_to_shared_value(value)?);
-                Ok(())
-            })?,
-        )?;
-    }
-    {
-        let shared = Arc::clone(&shared);
-        module.set(
-            "delete",
-            lua.create_function(move |_, key: String| {
-                shared
-                    .lock()
-                    .map_err(|_| mlua::Error::runtime("shared globals lock poisoned"))?
-                    .remove(&key);
-                Ok(())
-            })?,
-        )?;
-    }
-    lua.globals().set("shared", module)
 }
 
 fn register_draw_api(lua: &Lua, draw_commands: DrawCommands) -> mlua::Result<()> {
@@ -1792,8 +1141,7 @@ fn register_draw_api(lua: &Lua, draw_commands: DrawCommands) -> mlua::Result<()>
         module.set(
             "filled_rect",
             lua.create_function(
-                move |_,
-                      (x, y, w, h, r, g, b, a): (f32, f32, f32, f32, u8, u8, u8, u8)| {
+                move |_, (x, y, w, h, r, g, b, a): (f32, f32, f32, f32, u8, u8, u8, u8)| {
                     dc.lock()
                         .map_err(|_| mlua::Error::runtime("draw lock poisoned"))?
                         .push(DrawCommand::FilledRect {
@@ -1814,7 +1162,17 @@ fn register_draw_api(lua: &Lua, draw_commands: DrawCommands) -> mlua::Result<()>
         module.set(
             "circle",
             lua.create_function(
-                move |_, (x, y, radius, r, g, b, a, thickness): (f32, f32, f32, u8, u8, u8, u8, f32)| {
+                move |_,
+                      (x, y, radius, r, g, b, a, thickness): (
+                    f32,
+                    f32,
+                    f32,
+                    u8,
+                    u8,
+                    u8,
+                    u8,
+                    f32,
+                )| {
                     dc.lock()
                         .map_err(|_| mlua::Error::runtime("draw lock poisoned"))?
                         .push(DrawCommand::Circle {
@@ -1876,53 +1234,6 @@ fn register_draw_api(lua: &Lua, draw_commands: DrawCommands) -> mlua::Result<()>
 
 // Coroutine suspension happens entirely on the Lua thread. The IPC worker
 // only produces task results, so no Lua object crosses a thread boundary.
-fn install_async_helpers(lua: &Lua) -> mlua::Result<()> {
-    lua.load(
-        r#"
-        __async_tasks = {}
-
-        function await_async(task_id)
-            while true do
-                local result = memory.poll_async(task_id)
-                if result then
-                    if result.error then error(result.error) end
-                    return result.value
-                end
-                coroutine.yield()
-            end
-        end
-
-        function start_async(fn, ...)
-            local co = coroutine.create(fn)
-            local ok, err = coroutine.resume(co, ...)
-            if not ok then error(err) end
-            if coroutine.status(co) ~= "dead" then
-                __async_tasks[co] = true
-            end
-            return co
-        end
-
-        function __pump_async_tasks()
-            memory.drain_pending()
-            local finished = {}
-            for co in pairs(__async_tasks) do
-                local ok, err = coroutine.resume(co)
-                if coroutine.status(co) == "dead" then
-                    finished[#finished + 1] = co
-                    if not ok then
-                        print("async task failed: " .. tostring(err))
-                    end
-                end
-            end
-            for _, co in ipairs(finished) do
-                __async_tasks[co] = nil
-            end
-        end
-        "#,
-    )
-    .exec()
-}
-
 fn parse_address(value: &str) -> mlua::Result<Address> {
     let value = value.trim();
     let (digits, radix) = value
@@ -1954,30 +1265,13 @@ mod tests {
     }
 
     #[test]
-    fn scheduler_preserves_fractional_time() {
-        let mut scheduler =
-            FixedUpdateScheduler::new(Duration::from_millis(10), Duration::from_millis(100), 4);
-        assert_eq!(scheduler.advance(Duration::from_millis(6)), 0);
-        assert_eq!(scheduler.advance(Duration::from_millis(6)), 1);
-        assert_eq!(scheduler.advance(Duration::from_millis(8)), 1);
-    }
-
-    #[test]
-    fn scheduler_drops_excessive_backlog() {
-        let mut scheduler =
-            FixedUpdateScheduler::new(Duration::from_millis(10), Duration::from_millis(100), 4);
-        assert_eq!(scheduler.advance(Duration::from_secs(1)), 4);
-        assert_eq!(scheduler.advance(Duration::ZERO), 0);
-    }
-
-    #[test]
     fn execution_hook_stops_runaway_script() {
         let lua = Lua::new();
-        let deadline = install_execution_hook(&lua);
+        let deadline = execution::install_hook(&lua);
         lua.load("function OnUpdate() while true do end end")
             .exec()
             .unwrap();
-        let error = call_optional_budgeted(
+        let error = execution::call_budgeted(
             &lua,
             &deadline,
             "OnUpdate",

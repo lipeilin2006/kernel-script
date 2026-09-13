@@ -5,6 +5,7 @@ members = [
     "ks-service",
     "ks-gui",
     "ks-installer",
+    "ks-test",
 ]
 resolver = "2"
 
@@ -21,7 +22,7 @@ egui = { version = "0.29", default-features = false }
 eframe = { version = "0.27.2", default-features = false, features = ["default_fonts", "glow"] }
 windows-sys = "0.61.2"
 windows-service = "0.8.1"
-mlua = { version = "0.12.0", features = ["luau-jit", "vendored", "send", "async"] }
+mlua = { version = "0.12.0", features = ["luau-jit", "vendored", "send"] }
 tokio = "1.53.1"
 bytes = "1.10.1"
 encoding_rs = "0.8"

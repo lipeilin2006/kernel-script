@@ -26,7 +26,10 @@ pub fn get_window_rects_by_pid(pid: u32) -> Vec<WindowRect> {
         hwnds: Vec::new(),
     };
     unsafe {
-        EnumWindows(Some(enum_windows_callback), &mut ctx as *mut EnumCtx as isize);
+        EnumWindows(
+            Some(enum_windows_callback),
+            &mut ctx as *mut EnumCtx as isize,
+        );
     }
     let mut rects = Vec::with_capacity(ctx.hwnds.len());
     for hwnd in ctx.hwnds {

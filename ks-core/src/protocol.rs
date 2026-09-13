@@ -16,6 +16,7 @@ pub const IOCTL_WRITE_MEMORY_MDL: u32 = 0x0022_2028;
 pub const IOCTL_READ_MEMORY_MDL_RVA: u32 = 0x0022_202C;
 pub const IOCTL_WRITE_MEMORY_MDL_RVA: u32 = 0x0022_2030;
 pub const IOCTL_BATCH_READ_MEMORY: u32 = 0x0022_2034;
+pub const IOCTL_TRAVERSE_POINTER_CHAIN: u32 = 0x0022_2038;
 
 #[repr(C)]
 pub struct MemoryReadRequest {
@@ -97,6 +98,8 @@ pub enum MessageType {
     GetProcessIdResponse = 8,
     BatchReadMemory = 19,
     BatchReadMemoryResponse = 20,
+    TraversePointerChain = 21,
+    TraversePointerChainResponse = 22,
     Error = 0xFFFF,
     ErrorDetail = 0xFFFE,
 }
@@ -122,6 +125,8 @@ impl MessageType {
             8 => Ok(Self::GetProcessIdResponse),
             19 => Ok(Self::BatchReadMemory),
             20 => Ok(Self::BatchReadMemoryResponse),
+            21 => Ok(Self::TraversePointerChain),
+            22 => Ok(Self::TraversePointerChainResponse),
             0xFFFF => Ok(Self::Error),
             0xFFFE => Ok(Self::ErrorDetail),
             _ => Err(ProtocolError::UnknownMessageType),
@@ -349,6 +354,11 @@ pub enum Request<'a> {
         size: u32,
         addresses: &'a [u8],
     },
+    TraversePointerChain {
+        pid: u64,
+        base: u64,
+        offsets: &'a [u8],
+    },
 }
 
 #[cfg(feature = "alloc")]
@@ -362,6 +372,7 @@ pub enum Response<'a> {
     ProcessId(u64),
     ProcessBase(u64),
     BatchReadMemory(&'a [u8]),
+    PointerChainResult(u64),
 }
 
 #[cfg(feature = "alloc")]
@@ -465,6 +476,7 @@ impl<'a> WireEncode for Request<'a> {
             Self::ReadProcessMemory(_) => MessageType::ReadProcessMemory,
             Self::WriteProcessMemory { .. } => MessageType::WriteProcessMemory,
             Self::BatchReadMemory { .. } => MessageType::BatchReadMemory,
+            Self::TraversePointerChain { .. } => MessageType::TraversePointerChain,
         }
     }
     fn encoded_len(&self) -> Result<usize, ProtocolError> {
@@ -491,7 +503,20 @@ impl<'a> WireEncode for Request<'a> {
                 .checked_add(data.len())
                 .ok_or(ProtocolError::TooLarge)?,
             Self::BatchReadMemory { addresses, .. } => {
-                16 + addresses.len()
+                if addresses.is_empty() || addresses.len() % 8 != 0 {
+                    return Err(ProtocolError::InvalidPayload);
+                }
+                16usize
+                    .checked_add(addresses.len())
+                    .ok_or(ProtocolError::TooLarge)?
+            }
+            Self::TraversePointerChain { offsets, .. } => {
+                if offsets.is_empty() || offsets.len() % 8 != 0 {
+                    return Err(ProtocolError::InvalidPayload);
+                }
+                20usize
+                    .checked_add(offsets.len())
+                    .ok_or(ProtocolError::TooLarge)?
             }
         };
         if n > MAX_FRAME_SIZE - HEADER_SIZE {
@@ -583,12 +608,23 @@ impl<'a> WireEncode for Request<'a> {
                 out[26..30].copy_from_slice(&(data.len() as u32).to_le_bytes());
                 out[30..total].copy_from_slice(data);
             }
-            Self::BatchReadMemory { pid, size, addresses } => {
+            Self::BatchReadMemory {
+                pid,
+                size,
+                addresses,
+            } => {
                 out[10..18].copy_from_slice(&pid.to_le_bytes());
                 out[18..22].copy_from_slice(&size.to_le_bytes());
                 let count = (addresses.len() / 8) as u32;
                 out[22..26].copy_from_slice(&count.to_le_bytes());
                 out[26..total].copy_from_slice(addresses);
+            }
+            Self::TraversePointerChain { pid, base, offsets } => {
+                out[10..18].copy_from_slice(&pid.to_le_bytes());
+                out[18..26].copy_from_slice(&base.to_le_bytes());
+                let count = (offsets.len() / 8) as u32;
+                out[26..30].copy_from_slice(&count.to_le_bytes());
+                out[30..total].copy_from_slice(offsets);
             }
         }
         Ok(total)
@@ -683,7 +719,9 @@ impl<'a> WireDecode<'a> for Request<'a> {
                 let size = u32::from_le_bytes(p[8..12].try_into().unwrap());
                 let count = u32::from_le_bytes(p[12..16].try_into().unwrap()) as usize;
                 let expected = 16 + count * 8;
-                if p.len() != expected || count > MAX_BATCH_ENTRIES || size == 0
+                if p.len() != expected
+                    || count > MAX_BATCH_ENTRIES
+                    || size == 0
                     || size > MAX_DRIVER_TRANSFER_SIZE as u32
                 {
                     return Err(ProtocolError::InvalidPayload);
@@ -692,6 +730,20 @@ impl<'a> WireDecode<'a> for Request<'a> {
                     pid,
                     size,
                     addresses: &p[16..],
+                })
+            }
+            MessageType::TraversePointerChain if p.len() >= 20 => {
+                let pid = u64::from_le_bytes(p[..8].try_into().unwrap());
+                let base = u64::from_le_bytes(p[8..16].try_into().unwrap());
+                let count = u32::from_le_bytes(p[16..20].try_into().unwrap()) as usize;
+                let expected = 20 + count * 8;
+                if p.len() != expected || count > 32 {
+                    return Err(ProtocolError::InvalidPayload);
+                }
+                Ok(Self::TraversePointerChain {
+                    pid,
+                    base,
+                    offsets: if count > 0 { &p[20..] } else { &[] },
                 })
             }
             _ => Err(ProtocolError::InvalidPayload),
@@ -711,6 +763,7 @@ impl<'a> WireEncode for Response<'a> {
             Self::ProcessId(_) => MessageType::GetProcessIdResponse,
             Self::ProcessBase(_) => MessageType::GetProcessBaseResponse,
             Self::BatchReadMemory(_) => MessageType::BatchReadMemoryResponse,
+            Self::PointerChainResult(_) => MessageType::TraversePointerChainResponse,
         }
     }
     fn encoded_len(&self) -> Result<usize, ProtocolError> {
@@ -723,6 +776,7 @@ impl<'a> WireEncode for Response<'a> {
             Self::ProcessId(_) => 8,
             Self::ProcessBase(_) => 8,
             Self::BatchReadMemory(v) => v.len(),
+            Self::PointerChainResult(_) => 8,
         };
         let total = HEADER_SIZE
             .checked_add(payload_len)
@@ -750,6 +804,7 @@ impl<'a> WireEncode for Response<'a> {
             Self::ProcessId(pid) => out[10..18].copy_from_slice(&pid.to_le_bytes()),
             Self::ProcessBase(base) => out[10..18].copy_from_slice(&base.to_le_bytes()),
             Self::BatchReadMemory(v) => out[10..total].copy_from_slice(v),
+            Self::PointerChainResult(addr) => out[10..18].copy_from_slice(&addr.to_le_bytes()),
         }
         Ok(total)
     }
@@ -775,6 +830,9 @@ impl<'a> WireDecode<'a> for Response<'a> {
                 u64::from_le_bytes(payload.try_into().unwrap()),
             )),
             MessageType::BatchReadMemoryResponse => Ok(Self::BatchReadMemory(payload)),
+            MessageType::TraversePointerChainResponse if payload.len() == 8 => Ok(
+                Self::PointerChainResult(u64::from_le_bytes(payload.try_into().unwrap())),
+            ),
             _ => Err(ProtocolError::InvalidPayload),
         }
     }

@@ -1,12 +1,11 @@
 # Kernel Script Luau API
 
 本文档描述 `ks-gui` 当前实际注册到 Luau VM 的 API。每个 `scripts/*.lua`
-脚本在独立 Luau VM 中运行，启用 JIT 编译；所有脚本共享 `shared` 标量存储，
-但不共享 Luau table、function、thread 或 userdata。
+脚本在独立 Luau VM 中运行，启用 JIT 编译。
 
 ## Lifecycle
 
-可选的生命周期函数由 GUI 按帧调用：
+可选的生命周期函数，由 GUI 每帧调用：
 
 ```lua
 function OnStart()
@@ -28,112 +27,27 @@ end
 - `OnUpdate` 在逻辑刷新阶段调用（60 Hz）。
 - `OnRender` 在 GUI 渲染阶段调用。
 - `OnDestroy` 在热重载或 GUI 退出时调用。
-- 不要在 `OnRender` 中等待 IPC。
-- 不要在 `ui.window` 的 callback 中调用 `await_async` 或 `coroutine.yield`。
-- 网络和驱动请求必须在 `start_async` coroutine 中执行。
-
-## Async Tasks
-
-### start_async
-
-启动一个 Lua coroutine，并由 GUI 每帧自动恢复。
-
-```lua
-local co = start_async(function(arg)
-    print(arg)
-end, "hello")
-```
-
-返回值是 coroutine 对象，通常不需要直接操作。
-
-### await_async
-
-等待异步任务完成。等待期间只挂起当前 Lua coroutine，不阻塞 GUI 线程。
-
-```lua
-local value = await_async(memory.async_read_i32(pid, address))
-```
-
-任务失败时会在 coroutine 内抛出 Lua error，应使用 `pcall` 捕获：
-
-```lua
-start_async(function()
-    local ok, result = pcall(function()
-        return await_async(memory.async_read_i32(pid, address))
-    end)
-    if ok then
-        print("value:", result)
-    else
-        print("request failed:", result)
-    end
-end)
-```
-
-### memory.poll_async
-
-非阻塞地查询任务结果。任务未完成时返回 `nil`。
-
-```lua
-local task_id = memory.async_list_processes()
-local result = memory.poll_async(task_id)
-if result then
-    if result.error then
-        print("failed:", result.error)
-    else
-        local value = result.value
-    end
-end
-```
-
-成功结果：
-
-```lua
-{ done = true, value = ... }
-```
-
-失败结果：
-
-```lua
-{ done = true, error = "error message" }
-```
+- 所有内存 API 调用都是同步的，阻塞 Lua 线程约 60-100μs。
+- 如果延迟敏感，不要在 `ui.window` 回调中调用内存 API。
 
 ## Process API
 
-### memory.async_list_processes
+### memory.get_pid
 
-异步列出所有进程。
-
-```lua
-local processes = await_async(memory.async_list_processes())
-for _, process in ipairs(processes) do
-    print(process.pid, process.name)
-end
-```
-
-每个进程记录包含：
+根据可执行文件名获取 PID，比较时不区分大小写。
 
 ```lua
-{ pid = 1234, parent_pid = 1000, thread_count = 12, name = "notepad.exe" }
-```
-
-进程枚举由 `ks-service` 使用 Windows Toolhelp API 完成。
-
-### memory.async_get_pid
-
-根据可执行文件名异步获取 PID，比较时不区分大小写。
-
-```lua
-local pid = await_async(memory.async_get_pid("notepad.exe"))
+local pid = memory.get_pid("notepad.exe")
 ```
 
 进程名要求：非空、最多 255 字节、不包含 NUL 字节。
 
-### memory.async_get_process_base
+### memory.get_process_base
 
-根据 PID 异步获取进程主模块基地址。
+根据 PID 获取进程主模块基地址。
 
 ```lua
-local base = await_async(memory.async_get_process_base(pid))
+local base = memory.get_process_base(pid)
 print(string.format("base = 0x%X", base))
 ```
 
@@ -157,20 +71,20 @@ local b = "0x7FF812345000"
 地址 `0` 会提交给后台请求，最终由 service/driver 返回错误；它不会在 GUI
 渲染回调入口同步抛错。负数地址和不支持的 Lua 类型会在参数转换阶段拒绝。
 
-### memory.async_read_i32
+### memory.read_i32
 
-异步读取一个 32 位有符号整数。
+读取一个 32 位有符号整数。
 
 ```lua
-local value = await_async(memory.async_read_i32(pid, "0x1407FFF0"))
+local value = memory.read_i32(pid, "0x1407FFF0")
 ```
 
-### memory.async_read_bytes
+### memory.read_bytes
 
-异步读取字节数组。
+读取字节数组。
 
 ```lua
-local data = await_async(memory.async_read_bytes(pid, address, 16))
+local data = memory.read_bytes(pid, address, 16)
 for index, byte in ipairs(data) do
     print(index, byte)
 end
@@ -178,22 +92,22 @@ end
 
 当前 driver 单次读取上限为 4096 字节。
 
-### memory.async_write_i32
+### memory.write_i32
 
-异步写入一个 32 位有符号整数。
+写入一个 32 位有符号整数。
 
 ```lua
-await_async(memory.async_write_i32(pid, address, 123456789))
+memory.write_i32(pid, address, 123456789)
 ```
 
-### memory.async_write_bytes
+### memory.write_bytes
 
-异步写入 Lua 字节数组。
+写入 Lua 字节数组。
 
 ```lua
-await_async(memory.async_write_bytes(pid, address, {
+memory.write_bytes(pid, address, {
     0x15, 0xCD, 0x5B, 0x07
-}))
+})
 ```
 
 每个元素应为可转换为字节的整数，数组最大为 4096 字节。
@@ -208,22 +122,22 @@ absolute_address = process_image_base + relative_address
 
 `relative_address` 是无符号相对偏移，地址相加发生溢出时请求失败。
 
-### memory.async_read_rva
+### memory.read_rva
 
 根据 PID 自动获取 image base，并读取 `base + relative_address` 处的数据。
 
 ```lua
-local data = await_async(memory.async_read_rva(pid, 0x1234, 4))
+local data = memory.read_rva(pid, 0x1234, 4)
 ```
 
-### memory.async_write_rva
+### memory.write_rva
 
 根据 PID 自动获取 image base，并写入 `base + relative_address` 处的数据。
 
 ```lua
-await_async(memory.async_write_rva(pid, 0x1234, {
+memory.write_rva(pid, 0x1234, {
     0x15, 0xCD, 0x5B, 0x07
-}))
+})
 ```
 
 RVA 读写同样受 4096 字节单次 driver 传输限制。
@@ -237,39 +151,39 @@ MDL 读写通过内核 MDL 重映射访问目标进程内存：附加到目标�
 
 用法与普通读写完全一致，区分仅在于：
 
-- `async_read_mdl*` / `async_write_mdl*` 是独立的 API，与普通
-  `async_read*` / `async_write*` 互不影响。
+- `read_mdl*` / `write_mdl*` 是独立的 API，与普通
+  `read*` / `write*` 互不影响。
 - MDL 写入的是共享物理页：修改映像代码段会影响所有映射该模块的进程
   （写时复制页面除外）。
 - 同样受 4096 字节单次传输限制。
 
-### memory.async_read_mdl
+### memory.read_mdl
 
 ```lua
-local data = await_async(memory.async_read_mdl(pid, address, 16))
+local data = memory.read_mdl(pid, address, 16)
 ```
 
-### memory.async_write_mdl
+### memory.write_mdl
 
 ```lua
 -- 修改只读内存/代码段
-await_async(memory.async_write_mdl(pid, address, {
+memory.write_mdl(pid, address, {
     0x90, 0x90, 0x90, 0xC3
-}))
+})
 ```
 
-### memory.async_read_mdl_rva
+### memory.read_mdl_rva
 
 ```lua
-local data = await_async(memory.async_read_mdl_rva(pid, 0x1234, 4))
+local data = memory.read_mdl_rva(pid, 0x1234, 4)
 ```
 
-### memory.async_write_mdl_rva
+### memory.write_mdl_rva
 
 ```lua
-await_async(memory.async_write_mdl_rva(pid, 0x1234, {
+memory.write_mdl_rva(pid, 0x1234, {
     0x15, 0xCD, 0x5B, 0x07
-}))
+})
 ```
 
 ## Batch Read API（批量读取）
@@ -282,16 +196,16 @@ IPC 开销，避免 Lua Table 分配。
 
 无效地址（null 或不可读）会被跳过并零填充，不会导致整个 batch 失败。
 
-### memory.async_batch_read
+### memory.batch_read
 
 从目标进程读取多个内存区域，所有条目共享同一个 `size`。返回单个平铺字节
 缓冲区，各条目数据紧密排列。
 
 ```lua
-local raw = await_async(memory.async_batch_read(pid, 256, {
+local raw = memory.batch_read(pid, 256, {
     0x1407FFF0,
     0x14080000,
-}))
+})
 ```
 
 ### memory.batch_offset
@@ -304,6 +218,25 @@ local offsets = memory.batch_offset({ 0x100, 0x100, 0x100 })
 -- offsets[1] = 0, offsets[2] = 256, offsets[3] = 512, offsets.total = 768
 ```
 
+### memory.traverse_pointer_chain
+
+使用单次 IPC 往返遍历目标进程中的指针链。从 `base` 开始，读取
+`base + offsets[1]` 处的指针，再读取 `result + offsets[2]` 处的指针，
+依此类推。返回最终地址（`u64`）。
+
+```lua
+local base = memory.get_process_base(pid)
+local addr = memory.traverse_pointer_chain(pid, base, {
+    0x1000,  -- base + 0x1000
+    0x30,    -- (base + 0x1000) + 0x30
+    0x80,    -- ... + 0x80
+})
+print(addr)
+```
+
+**最大偏移数**：每次调用最多 32 个。如果链中任何指针为 null 或不可读，
+则返回 `0`。
+
 ### 示例：零分配实体扫描
 
 ```lua
@@ -311,51 +244,18 @@ local ENTITY_SIZE = 0x100
 local FIELD_HP_OFFSET = 0x40
 local FIELD_POS_OFFSET = 0x4C
 
-start_async(function()
-    local raw = await_async(memory.async_batch_read(pid, ENTITY_SIZE, entities))
-    local offsets = memory.batch_offset({ ENTITY_SIZE })
-    for i = 1, #entities do
-        local base = (i - 1) * ENTITY_SIZE
-        local hp = string.unpack("<i4", raw, base + FIELD_HP_OFFSET)
-        local x, y, z = string.unpack("<fff", raw, base + FIELD_POS_OFFSET)
-        -- ... 绘制逻辑（每个字段无 Table 分配）
-    end
-end)
+local raw = memory.batch_read(pid, ENTITY_SIZE, entities)
+local offsets = memory.batch_offset({ ENTITY_SIZE })
+for i = 1, #entities do
+    local base = (i - 1) * ENTITY_SIZE
+    local hp = string.unpack("<i4", raw, base + FIELD_HP_OFFSET)
+    local x, y, z = string.unpack("<fff", raw, base + FIELD_POS_OFFSET)
+    -- ... 绘制逻辑（每个字段无 Table 分配）
+end
 ```
 
 响应是单个 Luau byte string。`string.unpack` 直接在缓冲区上按偏移读取字段
 ——零中间 Table 分配，GC 压力极低。
-
-## Shared Globals
-
-多个 Luau VM 通过 Rust 侧共享存储交换简单值。
-
-### shared.set
-
-```lua
-shared.set("selected_pid", 1234)
-shared.set("target_address", "0x7FF812345000")
-shared.set("enabled", true)
-```
-
-支持的值类型：`nil`、boolean、integer、有限 number、string。
-不支持共享 Lua table、function、thread 或 userdata。
-
-### shared.get
-
-```lua
-local pid = shared.get("selected_pid")
-```
-
-不存在的 key 返回 `nil`。
-
-### shared.delete
-
-```lua
-shared.delete("selected_pid")
-```
-
-共享 key 最大为 128 字节。
 
 ## 窗口查询 API
 
@@ -626,54 +526,30 @@ ui.add_space(8)
 
 ## Complete Example
 
-### 轮询模式（推荐）
-
 ```lua
 local state = {
     process_name = "notepad.exe",
     pid = 0,
-    pid_task = nil,
     base = 0,
-    base_task = nil,
     rects = nil,
     status = "就绪",
 }
 
 function OnUpdate(dt)
-    if state.pid_task then
-        local result = memory.poll_async(state.pid_task)
-        if result then
-            state.pid_task = nil
-            if result.error then
-                state.status = "失败: " .. result.error
-            else
-                state.pid = result.value
-                shared.set("selected_pid", state.pid)
-                state.base_task = memory.async_get_process_base(state.pid)
-            end
-        end
-    end
-
-    if state.base_task then
-        local result = memory.poll_async(state.base_task)
-        if result then
-            state.base_task = nil
-            if result.error then
-                state.status = "基址失败: " .. result.error
-            else
-                state.base = result.value
-                state.status = string.format("已附加 0x%X", state.base)
-                state.rects = memory.get_window_rect(state.pid)
-            end
-        end
-    end
+    -- 所有内存调用都是同步的（每次约 60-100μs）
 end
 
 function OnRender()
     ui.window("Kernel Script", function()
-        if ui.button("附加") and not state.pid_task then
-            state.pid_task = memory.async_get_pid(state.process_name)
-            state.status = "正在查找 " .. state.process_name .. "..."
+        if ui.button("附加") then
+            state.pid = memory.get_pid(state.process_name)
+            if state.pid > 0 then
+                state.base = memory.get_process_base(state.pid)
+                state.status = string.format("已附加 0x%X", state.base)
+                state.rects = memory.get_window_rect(state.pid)
+            else
+                state.status = "未找到进程"
+            end
         end
         state.process_name = select(
             1, ui.text_edit(state.process_name, false, false, false)
@@ -690,23 +566,24 @@ function OnRender()
 end
 ```
 
-## IPC 批量流水线
+## IPC 架构
 
-GUI 到 service 的 IPC 使用批量流水线实现高吞吐：
+GUI 到 service 的 IPC 使用同步阻塞 Named Pipe 调用：
 
-1. **GUI 侧**：`connection_task` 从 `mpsc` channel 一次性拉取所有 pending 请求，批量写入管道。
-2. **Service 侧**：`handle_client` 从管道 decoder 读取所有可用帧，每帧 `spawn_blocking` 并发执行。所有 task 在 Tokio blocking pool 上并行运行。结果按顺序收集后批量写回管道。
-3. **零锁 IOCTL**：驱动 handle 以 `Arc<DriverHandle>` 共享。每个 blocking task 直接调用 `DeviceIoControl`，无需获取 mutex。Windows I/O manager 内部序列化 IRP。
+1. **GUI 侧**：每次内存 API 调用打开一个阻塞管道连接（或复用线程本地连接），
+   写入帧请求，同步读取响应。
+2. **Service 侧**：`handle_client` 从管道 decoder 读取帧，
+   每帧 `spawn_blocking` 在 Tokio blocking pool 上并发执行。
+3. **零锁 IOCTL**：驱动 handle 以 `Arc<DriverHandle>` 共享。每个 blocking task
+   直接调用 `DeviceIoControl`，无需获取 mutex。Windows I/O manager 内部序列化 IRP。
 
-这意味着 30 个并发读取只需要 ~1 次管道往返，而非 30 次串行往返，
-从而实现实时链表遍历和实体扫描。
+往返延迟：每次调用约 60-100μs。在 60fps（16.6ms 帧预算）下，每帧可以轻松
+执行 100+ 次同步内存读取。
 
 ## Runtime Constraints
 
 - Lua VM 只在 GUI Lua 线程访问。
-- 后台 Tokio task 只传递 task ID 和 owned plain data。
-- `OnRender` 不得执行同步网络或 driver 操作。
-- `OnUpdate` 不得等待 Future；使用 coroutine 或 `poll_async`。
+- 所有内存 API 调用都是同步的，阻塞 Lua 线程约 60-100μs。
 - 单次内存读写最多 4096 字节。
 - 批量读取限制：最多 256 个条目，总计 4096 字节。
 - 进程列表由 service 在用户态枚举。

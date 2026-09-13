@@ -1,0 +1,11 @@
+[package]
+name = "ks-test"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+ks-core = { workspace = true, features = ["alloc"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "io-util", "net"] }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }

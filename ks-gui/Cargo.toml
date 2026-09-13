@@ -11,11 +11,12 @@ egui.workspace = true
 glow = "0.13"
 mlua.workspace = true
 notify.workspace = true
-tokio = { workspace = true, features = ["rt-multi-thread", "net", "io-util", "sync", "time"] }
 tracing.workspace = true
 tracing-subscriber.workspace = true
 windows-sys = { workspace = true, features = [
     "Win32_Foundation",
     "Win32_UI_WindowsAndMessaging",
     "Win32_Graphics_Dwm",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
 ] }

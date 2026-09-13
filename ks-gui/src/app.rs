@@ -6,8 +6,10 @@ use std::rc::Rc;
 use std::time::Instant;
 
 use egui::FontFamily;
-use egui_overlay::egui_render_three_d::{ThreeDConfig, ThreeDBackend};
-use egui_overlay::egui_window_glfw_passthrough::{self as glfw_passthrough, GlfwBackend, GlfwConfig};
+use egui_overlay::egui_render_three_d::{ThreeDBackend, ThreeDConfig};
+use egui_overlay::egui_window_glfw_passthrough::{
+    self as glfw_passthrough, GlfwBackend, GlfwConfig,
+};
 use egui_overlay::EguiOverlay;
 
 use crate::lua_runtime::{DrawCommand, LuaRuntimeManager};
@@ -47,8 +49,13 @@ struct KernelScriptApp {
 
 impl KernelScriptApp {
     fn new() -> Result<Self, Box<dyn Error>> {
+        let exe_dir = std::env::current_exe()?
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+        let script_dir = exe_dir.join("scripts");
         Ok(Self {
-            runtime: LuaRuntimeManager::new(std::path::PathBuf::from("scripts"))?,
+            runtime: LuaRuntimeManager::new(script_dir)?,
             fonts_installed: false,
         })
     }
@@ -61,6 +68,9 @@ impl EguiOverlay for KernelScriptApp {
         default_gfx_backend: &mut ThreeDBackend,
         glfw_backend: &mut GlfwBackend,
     ) {
+        // The overlay has no ordinary widget invalidation to drive repainting.
+        // Request every frame so cached ESP data is rendered at display rate.
+        ctx.request_repaint();
         if !self.fonts_installed {
             let _ = install_chinese_font(ctx);
             let mut style = (*ctx.style()).clone();
@@ -70,7 +80,10 @@ impl EguiOverlay for KernelScriptApp {
             self.fonts_installed = true;
             unsafe {
                 use glow::HasContext;
-                default_gfx_backend.glow_backend.glow_context.clear_color(0.0, 0.0, 0.0, 0.0);
+                default_gfx_backend
+                    .glow_backend
+                    .glow_context
+                    .clear_color(0.0, 0.0, 0.0, 0.0);
             }
         }
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -92,29 +105,88 @@ impl EguiOverlay for KernelScriptApp {
             ));
             for cmd in commands {
                 match cmd {
-                    DrawCommand::Line { x1, y1, x2, y2, color, thickness } => {
-                        let c = egui::Color32::from_rgba_unmultiplied(color[0], color[1], color[2], color[3]);
-                        painter.line_segment([egui::pos2(x1, y1), egui::pos2(x2, y2)], egui::Stroke::new(thickness, c));
+                    DrawCommand::Line {
+                        x1,
+                        y1,
+                        x2,
+                        y2,
+                        color,
+                        thickness,
+                    } => {
+                        let c = egui::Color32::from_rgba_unmultiplied(
+                            color[0], color[1], color[2], color[3],
+                        );
+                        painter.line_segment(
+                            [egui::pos2(x1, y1), egui::pos2(x2, y2)],
+                            egui::Stroke::new(thickness, c),
+                        );
                     }
-                    DrawCommand::Rect { x, y, w, h, color, thickness } => {
-                        let c = egui::Color32::from_rgba_unmultiplied(color[0], color[1], color[2], color[3]);
-                        painter.rect_stroke(egui::Rect::from_min_size(egui::pos2(x, y), egui::vec2(w, h)), 0.0, egui::Stroke::new(thickness, c));
+                    DrawCommand::Rect {
+                        x,
+                        y,
+                        w,
+                        h,
+                        color,
+                        thickness,
+                    } => {
+                        let c = egui::Color32::from_rgba_unmultiplied(
+                            color[0], color[1], color[2], color[3],
+                        );
+                        painter.rect_stroke(
+                            egui::Rect::from_min_size(egui::pos2(x, y), egui::vec2(w, h)),
+                            0.0,
+                            egui::Stroke::new(thickness, c),
+                        );
                     }
                     DrawCommand::FilledRect { x, y, w, h, color } => {
-                        let c = egui::Color32::from_rgba_unmultiplied(color[0], color[1], color[2], color[3]);
-                        painter.rect_filled(egui::Rect::from_min_size(egui::pos2(x, y), egui::vec2(w, h)), 0.0, c);
+                        let c = egui::Color32::from_rgba_unmultiplied(
+                            color[0], color[1], color[2], color[3],
+                        );
+                        painter.rect_filled(
+                            egui::Rect::from_min_size(egui::pos2(x, y), egui::vec2(w, h)),
+                            0.0,
+                            c,
+                        );
                     }
-                    DrawCommand::Circle { x, y, radius, color, thickness } => {
-                        let c = egui::Color32::from_rgba_unmultiplied(color[0], color[1], color[2], color[3]);
-                        painter.circle_stroke(egui::pos2(x, y), radius, egui::Stroke::new(thickness, c));
+                    DrawCommand::Circle {
+                        x,
+                        y,
+                        radius,
+                        color,
+                        thickness,
+                    } => {
+                        let c = egui::Color32::from_rgba_unmultiplied(
+                            color[0], color[1], color[2], color[3],
+                        );
+                        painter.circle_stroke(
+                            egui::pos2(x, y),
+                            radius,
+                            egui::Stroke::new(thickness, c),
+                        );
                     }
-                    DrawCommand::FilledCircle { x, y, radius, color } => {
-                        let c = egui::Color32::from_rgba_unmultiplied(color[0], color[1], color[2], color[3]);
+                    DrawCommand::FilledCircle {
+                        x,
+                        y,
+                        radius,
+                        color,
+                    } => {
+                        let c = egui::Color32::from_rgba_unmultiplied(
+                            color[0], color[1], color[2], color[3],
+                        );
                         painter.circle_filled(egui::pos2(x, y), radius, c);
                     }
-                    DrawCommand::Text { x, y, text, color, size } => {
-                        let c = egui::Color32::from_rgba_unmultiplied(color[0], color[1], color[2], color[3]);
-                        let galley = ctx.fonts(|f| f.layout_no_wrap(text, egui::FontId::proportional(size), c));
+                    DrawCommand::Text {
+                        x,
+                        y,
+                        text,
+                        color,
+                        size,
+                    } => {
+                        let c = egui::Color32::from_rgba_unmultiplied(
+                            color[0], color[1], color[2], color[3],
+                        );
+                        let galley = ctx
+                            .fonts(|f| f.layout_no_wrap(text, egui::FontId::proportional(size), c));
                         painter.galley(egui::pos2(x, y), galley, egui::Color32::TRANSPARENT);
                     }
                 }
