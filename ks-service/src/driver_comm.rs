@@ -2,6 +2,7 @@ use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
+use ks_core::crypto::{self, xor_u64};
 use ks_core::protocol::{
     MemoryReadRequest, MemoryWriteRequest, IOCTL_BATCH_READ_MEMORY, IOCTL_PING, IOCTL_READ_MEMORY,
     IOCTL_TRAVERSE_POINTER_CHAIN, IOCTL_WRITE_MEMORY, IOCTL_WRITE_MEMORY_BATCH, MAX_BATCH_ENTRIES,
@@ -9,7 +10,46 @@ use ks_core::protocol::{
 };
 
 const DRIVER_PATH: &str = "\\\\.\\KernelScriptProfiler";
+const KEY_REGISTRY_PATH: &str = "SYSTEM\\CurrentControlSet\\Control\\KernelScript";
+const KEY_VALUE_NAME: &str = "IoctlKey";
 
+fn ioctl_key() -> &'static [u8; crypto::KEY_LEN] {
+    static KEY: OnceLock<[u8; crypto::KEY_LEN]> = OnceLock::new();
+    KEY.get_or_init(|| {
+        let mut key = crypto::FALLBACK_KEY;
+        let path: Vec<u16> = KEY_REGISTRY_PATH.encode_utf16().chain([0]).collect();
+        let value: Vec<u16> = KEY_VALUE_NAME.encode_utf16().chain([0]).collect();
+        unsafe {
+            use windows_sys::Win32::System::Registry::{
+                RegCloseKey, RegOpenKeyExW, RegQueryValueExW, HKEY_LOCAL_MACHINE, KEY_READ,
+                REG_BINARY,
+            };
+            let mut handle = core::ptr::null_mut();
+            if RegOpenKeyExW(HKEY_LOCAL_MACHINE, path.as_ptr(), 0, KEY_READ, &mut handle) == 0 {
+                let mut kind = 0;
+                let mut size = crypto::KEY_LEN as u32;
+                let status = RegQueryValueExW(
+                    handle,
+                    value.as_ptr(),
+                    core::ptr::null_mut(),
+                    &mut kind,
+                    key.as_mut_ptr(),
+                    &mut size,
+                );
+                if status != 0 || kind != REG_BINARY || size != crypto::KEY_LEN as u32 {
+                    key = crypto::FALLBACK_KEY;
+                }
+                RegCloseKey(handle);
+            }
+        }
+        key
+    })
+}
+
+#[inline]
+fn protect(value: u64, field: usize) -> u64 {
+    xor_u64(value, ioctl_key(), field)
+}
 #[derive(Debug)]
 pub enum DriverError {
     ConnectionFailed,
@@ -134,8 +174,8 @@ pub fn read_memory(
     let mut buffer = [0u8; 8 + MAX_DRIVER_TRANSFER_SIZE + 4];
 
     let request = MemoryReadRequest {
-        process_id,
-        address,
+        process_id: protect(process_id, crypto::PID),
+        address: protect(address, crypto::ADDRESS),
         size,
     };
 
@@ -195,8 +235,8 @@ pub fn write_memory(
     let mut buffer = [0u8; 8 + MAX_DRIVER_TRANSFER_SIZE + 4];
 
     let mut request = MemoryWriteRequest {
-        process_id,
-        address,
+        process_id: protect(process_id, crypto::PID),
+        address: protect(address, crypto::ADDRESS),
         size: data.len() as u64,
         data: [0u8; MAX_DRIVER_TRANSFER_SIZE],
     };
@@ -228,7 +268,9 @@ pub fn get_process_base(handle: &DriverHandle, process_id: u64) -> Result<u64, D
     if process_id == 0 {
         return Err(DriverError::ResponseParseFailed);
     }
-    let request = ks_core::protocol::ProcessBaseRequest { process_id };
+    let request = ks_core::protocol::ProcessBaseRequest {
+        process_id: protect(process_id, crypto::PID),
+    };
     let mut output = [0u8; 8];
     let mut returned = 0u32;
     let result = unsafe {
@@ -250,7 +292,7 @@ pub fn get_process_base(handle: &DriverHandle, process_id: u64) -> Result<u64, D
     if returned != output.len() as u32 {
         return Err(DriverError::ResponseParseFailed);
     }
-    Ok(u64::from_le_bytes(output))
+    Ok(protect(u64::from_le_bytes(output), crypto::BASE))
 }
 
 pub fn read_memory_rva(
@@ -263,8 +305,8 @@ pub fn read_memory_rva(
         return Err(DriverError::ResponseParseFailed);
     }
     let request = ks_core::protocol::MemoryRvaReadRequest {
-        process_id,
-        relative_address,
+        process_id: protect(process_id, crypto::PID),
+        relative_address: protect(relative_address, crypto::RVA),
         size,
     };
     let mut buffer = [0u8; 8 + MAX_DRIVER_TRANSFER_SIZE + 4];
@@ -319,8 +361,8 @@ pub fn write_memory_rva(
         return Err(DriverError::ResponseParseFailed);
     }
     let mut request = ks_core::protocol::MemoryRvaWriteRequest {
-        process_id,
-        relative_address,
+        process_id: protect(process_id, crypto::PID),
+        relative_address: protect(relative_address, crypto::RVA),
         size: data.len() as u64,
         data: [0; MAX_DRIVER_TRANSFER_SIZE],
     };
@@ -419,8 +461,15 @@ fn read_memory_via(
     let mut bytes_returned = 0u32;
     let mut buffer = [0u8; 8 + MAX_DRIVER_TRANSFER_SIZE + 4];
     let request = MemoryReadRequest {
-        process_id,
-        address,
+        process_id: protect(process_id, crypto::PID),
+        address: protect(
+            address,
+            if ioctl == ks_core::protocol::IOCTL_READ_MEMORY_MDL_RVA {
+                crypto::RVA
+            } else {
+                crypto::ADDRESS
+            },
+        ),
         size,
     };
     let result = unsafe {
@@ -474,8 +523,15 @@ fn write_memory_via(
     let mut bytes_returned = 0u32;
     let mut buffer = [0u8; 8 + MAX_DRIVER_TRANSFER_SIZE + 4];
     let mut request = MemoryWriteRequest {
-        process_id,
-        address,
+        process_id: protect(process_id, crypto::PID),
+        address: protect(
+            address,
+            if ioctl == ks_core::protocol::IOCTL_WRITE_MEMORY_MDL_RVA {
+                crypto::RVA
+            } else {
+                crypto::ADDRESS
+            },
+        ),
         size: data.len() as u64,
         data: [0u8; MAX_DRIVER_TRANSFER_SIZE],
     };
@@ -515,12 +571,12 @@ pub fn batch_read_memory(
     }
     let input_size = 16 + addresses.len() * 8;
     let mut input = vec![0u8; input_size];
-    input[..8].copy_from_slice(&process_id.to_le_bytes());
+    input[..8].copy_from_slice(&protect(process_id, crypto::PID).to_le_bytes());
     input[8..12].copy_from_slice(&size.to_le_bytes());
     input[12..16].copy_from_slice(&(addresses.len() as u32).to_le_bytes());
     for (i, &addr) in addresses.iter().enumerate() {
         let off = 16 + i * 8;
-        input[off..off + 8].copy_from_slice(&addr.to_le_bytes());
+        input[off..off + 8].copy_from_slice(&protect(addr, crypto::ADDRESS).to_le_bytes());
     }
 
     let mut bytes_returned = 0u32;
@@ -561,12 +617,12 @@ pub fn traverse_pointer_chain(
     }
     let input_size = 20 + offsets.len() * 8;
     let mut input = vec![0u8; input_size];
-    input[..8].copy_from_slice(&process_id.to_le_bytes());
-    input[8..16].copy_from_slice(&base.to_le_bytes());
+    input[..8].copy_from_slice(&protect(process_id, crypto::PID).to_le_bytes());
+    input[8..16].copy_from_slice(&protect(base, crypto::BASE).to_le_bytes());
     input[16..20].copy_from_slice(&(offsets.len() as u32).to_le_bytes());
     for (i, &offset) in offsets.iter().enumerate() {
         let off = 20 + i * 8;
-        input[off..off + 8].copy_from_slice(&offset.to_le_bytes());
+        input[off..off + 8].copy_from_slice(&protect(offset, crypto::OFFSET).to_le_bytes());
     }
 
     let mut result_ptr: u64 = 0;
@@ -591,7 +647,7 @@ pub fn traverse_pointer_chain(
     if bytes_returned != 8 {
         return Err(DriverError::ResponseParseFailed);
     }
-    Ok(result_ptr)
+    Ok(protect(result_ptr, crypto::RESULT))
 }
 
 /// Service-side memory lock table.
@@ -602,6 +658,7 @@ pub fn traverse_pointer_chain(
 /// state and performs no background writes of its own.
 #[derive(Clone)]
 struct LockEntry {
+    id: u64,
     pid: u64,
     address: u64,
     data: Vec<u8>,
@@ -617,15 +674,12 @@ fn lock_table() -> &'static Mutex<Vec<LockEntry>> {
     LOCKS.get_or_init(|| Mutex::new(Vec::new()))
 }
 
-fn lock_insert(pid: u64, address: u64, data: &[u8]) -> Result<(), DriverError> {
-    if pid == 0 || address == 0 || data.is_empty() || data.len() > MAX_MEMORY_LOCK_SIZE {
+fn lock_insert(id: u64, pid: u64, address: u64, data: &[u8]) -> Result<(), DriverError> {
+    if id == 0 || pid == 0 || address == 0 || data.is_empty() || data.len() > MAX_MEMORY_LOCK_SIZE {
         return Err(DriverError::ResponseParseFailed);
     }
     let mut table = lock_table().lock().expect("lock table poisoned");
-    if let Some(entry) = table
-        .iter_mut()
-        .find(|entry| entry.pid == pid && entry.address == address)
-    {
+    if let Some(entry) = table.iter_mut().find(|entry| entry.id == id) {
         entry.data = data.to_vec();
     } else {
         if table.len() >= MAX_MEMORY_LOCKS {
@@ -633,6 +687,7 @@ fn lock_insert(pid: u64, address: u64, data: &[u8]) -> Result<(), DriverError> {
             return Err(DriverError::ResponseParseFailed);
         }
         table.push(LockEntry {
+            id,
             pid,
             address,
             data: data.to_vec(),
@@ -642,11 +697,11 @@ fn lock_insert(pid: u64, address: u64, data: &[u8]) -> Result<(), DriverError> {
     Ok(())
 }
 
-fn lock_remove(pid: u64, address: u64) {
+fn lock_remove(id: u64) {
     lock_table()
         .lock()
         .expect("lock table poisoned")
-        .retain(|entry| !(entry.pid == pid && entry.address == address));
+        .retain(|entry| entry.id != id);
     LOCKS_VERSION.fetch_add(1, Ordering::Release);
 }
 
@@ -714,8 +769,8 @@ fn encode_batch_write(entries: &[(u64, u64, &[u8])]) -> Vec<u8> {
     input.extend_from_slice(&(entries.len() as u32).to_le_bytes());
     input.extend_from_slice(&0u32.to_le_bytes());
     for (pid, address, data) in entries {
-        input.extend_from_slice(&pid.to_le_bytes());
-        input.extend_from_slice(&address.to_le_bytes());
+        input.extend_from_slice(&protect(*pid, crypto::PID).to_le_bytes());
+        input.extend_from_slice(&protect(*address, crypto::ADDRESS).to_le_bytes());
         input.extend_from_slice(&(data.len() as u32).to_le_bytes());
         input.extend_from_slice(&0u32.to_le_bytes());
         input.extend_from_slice(data);
@@ -807,8 +862,10 @@ impl BatchWriteBuffers {
             .extend_from_slice(&(self.count as u32).to_le_bytes());
         self.input.extend_from_slice(&0u32.to_le_bytes());
         for entry in table.iter().take(self.count) {
-            self.input.extend_from_slice(&entry.pid.to_le_bytes());
-            self.input.extend_from_slice(&entry.address.to_le_bytes());
+            self.input
+                .extend_from_slice(&protect(entry.pid, crypto::PID).to_le_bytes());
+            self.input
+                .extend_from_slice(&protect(entry.address, crypto::ADDRESS).to_le_bytes());
             self.input
                 .extend_from_slice(&(entry.data.len() as u32).to_le_bytes());
             self.input.extend_from_slice(&0u32.to_le_bytes());
@@ -847,15 +904,17 @@ impl BatchWriteBuffers {
 
 pub fn lock_memory(
     _handle: &DriverHandle,
+    id: u64,
     pid: u64,
     address: u64,
     data: &[u8],
 ) -> Result<(), DriverError> {
-    lock_insert(pid, address, data)
+    lock_insert(id, pid, address, data)
 }
 
 pub fn lock_memory_rva(
     handle: &DriverHandle,
+    id: u64,
     pid: u64,
     relative_address: u64,
     data: &[u8],
@@ -864,24 +923,16 @@ pub fn lock_memory_rva(
     let Some(address) = base.checked_add(relative_address) else {
         return Err(DriverError::ResponseParseFailed);
     };
-    lock_insert(pid, address, data)
+    lock_insert(id, pid, address, data)
 }
 
-pub fn unlock_memory(_handle: &DriverHandle, pid: u64, address: u64) -> Result<(), DriverError> {
-    lock_remove(pid, address);
+pub fn unlock_memory(_handle: &DriverHandle, id: u64) -> Result<(), DriverError> {
+    lock_remove(id);
     Ok(())
 }
 
-pub fn unlock_memory_rva(
-    handle: &DriverHandle,
-    pid: u64,
-    relative_address: u64,
-) -> Result<(), DriverError> {
-    let base = get_process_base(handle, pid)?;
-    let Some(address) = base.checked_add(relative_address) else {
-        return Err(DriverError::ResponseParseFailed);
-    };
-    lock_remove(pid, address);
+pub fn unlock_memory_rva(_handle: &DriverHandle, id: u64) -> Result<(), DriverError> {
+    lock_remove(id);
     Ok(())
 }
 

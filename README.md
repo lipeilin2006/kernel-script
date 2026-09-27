@@ -46,6 +46,8 @@ Luau script
 - EgUI/GLFW transparent overlay with cached draw commands.
 - User-mode process enumeration in `ks-service`.
 - SYSTEM-only driver device access with first-opener process binding.
+- Driver IOCTL sensitive integer fields are sent as plain little-endian values.
+  Sizes, counts, and memory data use the same explicit wire representation.
 - Explicit little-endian framed IPC protocol shared through `ks-core`.
 - Launcher randomizes SCM service names per start and restores the canonical
   component file names after a full stop.

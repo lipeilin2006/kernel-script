@@ -8,6 +8,43 @@
  */
 #include <ntifs.h>
 
+int ks_load_ioctl_key(PUNICODE_STRING registry_path, UCHAR *key)
+{
+    UNICODE_STRING path;
+    UNICODE_STRING value_name;
+    OBJECT_ATTRIBUTES attributes;
+    HANDLE handle = NULL;
+    UCHAR storage[sizeof(KEY_VALUE_PARTIAL_INFORMATION) + 32] = {0};
+    PKEY_VALUE_PARTIAL_INFORMATION value =
+        (PKEY_VALUE_PARTIAL_INFORMATION)storage;
+    NTSTATUS status;
+
+    UNREFERENCED_PARAMETER(registry_path);
+    RtlInitUnicodeString(
+        &path,
+        L"\\Registry\\Machine\\SYSTEM\\CurrentControlSet\\Control\\KernelScript");
+    RtlInitUnicodeString(&value_name, L"IoctlKey");
+    InitializeObjectAttributes(
+        &attributes, &path, OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE,
+        NULL, NULL);
+
+    status = ZwOpenKey(&handle, KEY_QUERY_VALUE, &attributes);
+    if (!NT_SUCCESS(status)) {
+        return 0;
+    }
+    ULONG returned = 0;
+    status = ZwQueryValueKey(
+        handle, &value_name, KeyValuePartialInformation,
+        value, sizeof(storage), &returned);
+    ObCloseHandle(handle, KernelMode);
+    if (!NT_SUCCESS(status) || value->Type != REG_BINARY ||
+        value->DataLength != 32) {
+        return 0;
+    }
+    RtlCopyMemory(key, value->Data, 32);
+    return 1;
+}
+
 static const GUID KS_DEVICE_CLASS_GUID = {
     0x7d7f1e42, 0x3c5f, 0x4c3d,
     { 0x9a, 0x81, 0x4d, 0x6e, 0x3b, 0x5f, 0x19, 0x72 }

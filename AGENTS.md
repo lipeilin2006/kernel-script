@@ -98,11 +98,11 @@ memory.batch_read(pid, size, addresses)
 memory.batch_offset(sizes)
 memory.batch_write(pid, writes)
 memory.traverse_pointer_chain(pid, base, offsets)
-memory.lock(pid, address, data)
-memory.unlock(pid, address)
+memory.lock(id, pid, address, data)
+memory.unlock(id)
 memory.unlock_all(pid)
-memory.lock_rva(pid, relative_address, data)
-memory.unlock_rva(pid, relative_address)
+memory.lock_rva(id, pid, relative_address, data)
+memory.unlock_rva(id)
 keyboard.is_key_down(key)
 keyboard.is_key_up(key)
 keyboard.is_key_press(key)
@@ -181,6 +181,10 @@ The secure device wrapper uses `WdmlibIoCreateDeviceSecure` and links the WDK
 `wdmsec` and `BufferOverflowK` libraries. Keep this dependency in the WDK-only
 driver build path.
 
+All driver memory traffic uses the ordinary memory IOCTLs with plain,
+explicit little-endian fields. Sensitive integer fields, sizes, counts, and
+data are transmitted without obfuscation.
+
 Memory locks live entirely in `ks-service` (`driver_comm.rs`): a dedicated
 OS thread (`lock_rewrite_loop`, spawned by `run_lock_worker`) applies every
 entry with a single `IOCTL_WRITE_MEMORY_BATCH` per sweep in a continuous
@@ -239,9 +243,11 @@ Before considering a change complete:
   identical `IOCTL_WRITE_MEMORY` path from the service process was stable.
   Locks must stay service-side (`run_lock_worker` in `driver_comm.rs`);
   do not reintroduce kernel background writers.
-- The driver exposes normal memory I/O (`IOCTL_READ_MEMORY`/`IOCTL_WRITE_MEMORY`
-  and their RVA variants) alongside separate MDL-remap I/O
-  (`IOCTL_READ_MEMORY_MDL`/`IOCTL_WRITE_MEMORY_MDL` and their RVA variants).
+- The driver internally exposes normal memory I/O
+  (`IOCTL_READ_MEMORY`/`IOCTL_WRITE_MEMORY` and their RVA variants) alongside
+  separate MDL-remap I/O (`IOCTL_READ_MEMORY_MDL`/`IOCTL_WRITE_MEMORY_MDL`
+  and their RVA variants); callers must use the plain little-endian field
+  encoding because that encoding is now the normal IOCTL ABI.
   MDL access attaches to the target, probes the MDL with read access only,
   locks pages, and maps them into kernel space so writes bypass user-mode
   page protection (code sections, read-only data). MDL writes hit the shared

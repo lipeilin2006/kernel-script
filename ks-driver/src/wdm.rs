@@ -71,6 +71,7 @@ extern "system" {
     pub fn ks_get_input_buffer_length(irp: *mut IRP) -> u32;
     pub fn ks_get_output_buffer_length(irp: *mut IRP) -> u32;
     pub fn ks_get_system_buffer(irp: *mut IRP) -> Pvoid;
+    pub fn ks_load_ioctl_key(registry_path: *mut UNICODE_STRING, key: *mut u8) -> i32;
     pub fn ks_copy_process_memory(
         source_process: isize,
         source_address: Pvoid,

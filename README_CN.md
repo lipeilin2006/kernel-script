@@ -41,6 +41,8 @@ Luau 脚本
 - EgUI/GLFW 透明覆盖层和缓存绘制命令。
 - `ks-service` 在用户态使用 Toolhelp 枚举进程。
 - SYSTEM-only driver 设备访问和首次打开进程绑定。
+- Driver IOCTL 的敏感整数按显式小端序明文传输，包括 PID、地址、RVA、基址和指针
+  字段；大小、数量和数据继续使用相同的显式线格式。
 - `ks-core` 提供显式小端序的分帧 IPC 协议。
 - launcher 每次启动随机化 SCM 服务名，全部停止后恢复组件原始文件名。
 

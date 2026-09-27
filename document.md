@@ -248,11 +248,9 @@ end
 
 ## Memory Lock API
 
-Memory lock maintains a periodic write that continuously rewrites a byte
-pattern to a target address as fast as the driver round trip allows. Locks
-are identified by a composite key
-`(pid, absolute_address)`. Locking the same pair again updates the data
-without creating a duplicate entry.
+Memory lock continuously rewrites a byte pattern to a target address as fast
+as the batch driver round trip allows. Each lock has an explicit stable `id`;
+locking the same id again updates its PID, address, and data.
 
 The lock table lives in `ks-service`: a dedicated rewrite thread replays
 every entry through one batch write (`IOCTL_WRITE_MEMORY_BATCH`) in a
@@ -266,16 +264,17 @@ Locks a byte pattern to an absolute address. The service rewrites `data` to
 `address` in the target process continuously until unlocked.
 
 ```lua
-memory.lock(pid, address, {0x90, 0x90, 0x90, 0xC3})
+memory.lock(1, pid, address, {0x90, 0x90, 0x90, 0xC3})
+memory.lock(1, pid, new_address, {0x90, 0x90, 0x90, 0xC3}) -- moves lock 1
 ```
 
 ### memory.unlock
 
-Removes a lock by `(pid, address)`. Does **not** restore the original value;
-it only stops subsequent periodic writes.
+Removes a lock by `id`. Does **not** restore the original value; it only stops
+subsequent periodic writes.
 
 ```lua
-memory.unlock(pid, address)
+memory.unlock(1)
 ```
 
 ### memory.unlock_all
@@ -292,15 +291,15 @@ Locks a byte pattern at `base + relative_address`. The service resolves the
 image base when the lock is created (same base as `get_process_base`).
 
 ```lua
-memory.lock_rva(pid, 0x1234, {0x90, 0x90})
+memory.lock_rva(2, pid, 0x1234, {0x90, 0x90})
 ```
 
 ### memory.unlock_rva
 
-Removes a lock identified by `(pid, relative_address)`.
+Removes a lock by `id`; the original PID and RVA are not needed.
 
 ```lua
-memory.unlock_rva(pid, 0x1234)
+memory.unlock_rva(2)
 ```
 
 Constraints:
@@ -795,3 +794,7 @@ can comfortably fit 100+ synchronous memory reads per frame.
 - Transport uses the `\\.\pipe\KernelScript` Named Pipe.
 - Named Pipe and driver device access are controlled by Windows security
   descriptors.
+- Driver requests use the ordinary memory IOCTL constants. Sensitive integer
+  fields (PID, absolute address, RVA/base/pointer offsets, including batch and
+  pointer-chain entries) are plain little-endian values. Sizes, counts, and
+  memory data remain plaintext in the same explicitly encoded layouts.

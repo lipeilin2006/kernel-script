@@ -1122,17 +1122,19 @@ fn register_memory_api(lua: &Lua) -> mlua::Result<()> {
 
     module.set(
         "lock",
-        lua.create_function(|_, (pid, address, data): (u64, Address, Vec<u8>)| {
-            if data.is_empty() || data.len() > ks_core::protocol::MAX_DRIVER_TRANSFER_SIZE {
-                return Err(mlua::Error::runtime("invalid lock size"));
-            }
-            crate::sync_ipc::lock(pid, address.get(), &data).map_err(mlua::Error::runtime)
-        })?,
+        lua.create_function(
+            |_, (id, pid, address, data): (u64, u64, Address, Vec<u8>)| {
+                if data.is_empty() || data.len() > ks_core::protocol::MAX_DRIVER_TRANSFER_SIZE {
+                    return Err(mlua::Error::runtime("invalid lock size"));
+                }
+                crate::sync_ipc::lock(id, pid, address.get(), &data).map_err(mlua::Error::runtime)
+            },
+        )?,
     )?;
     module.set(
         "unlock",
-        lua.create_function(|_, (pid, address): (u64, Address)| {
-            crate::sync_ipc::unlock(pid, address.get()).map_err(mlua::Error::runtime)
+        lua.create_function(|_, id: u64| {
+            crate::sync_ipc::unlock(id).map_err(mlua::Error::runtime)
         })?,
     )?;
     module.set(
@@ -1143,17 +1145,20 @@ fn register_memory_api(lua: &Lua) -> mlua::Result<()> {
     )?;
     module.set(
         "lock_rva",
-        lua.create_function(|_, (pid, relative_address, data): (u64, u64, Vec<u8>)| {
-            if data.is_empty() || data.len() > ks_core::protocol::MAX_DRIVER_TRANSFER_SIZE {
-                return Err(mlua::Error::runtime("invalid lock size"));
-            }
-            crate::sync_ipc::lock_rva(pid, relative_address, &data).map_err(mlua::Error::runtime)
-        })?,
+        lua.create_function(
+            |_, (id, pid, relative_address, data): (u64, u64, u64, Vec<u8>)| {
+                if data.is_empty() || data.len() > ks_core::protocol::MAX_DRIVER_TRANSFER_SIZE {
+                    return Err(mlua::Error::runtime("invalid lock size"));
+                }
+                crate::sync_ipc::lock_rva(id, pid, relative_address, &data)
+                    .map_err(mlua::Error::runtime)
+            },
+        )?,
     )?;
     module.set(
         "unlock_rva",
-        lua.create_function(|_, (pid, relative_address): (u64, u64)| {
-            crate::sync_ipc::unlock_rva(pid, relative_address).map_err(mlua::Error::runtime)
+        lua.create_function(|_, id: u64| {
+            crate::sync_ipc::unlock_rva(id).map_err(mlua::Error::runtime)
         })?,
     )?;
 

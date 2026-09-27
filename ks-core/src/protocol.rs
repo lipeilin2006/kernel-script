@@ -36,6 +36,7 @@ pub const MAX_MEMORY_LOCKS: usize = 64;
 /// Validates a pipe-level batch-write entries payload (`u64 address, u32
 /// size, u32 pad, data[size]` per entry) and returns the entry count. The
 /// leading `u64 pid` is not part of `entries`.
+#[cfg(feature = "alloc")]
 fn batch_write_entry_count(entries: &[u8]) -> Option<usize> {
     if entries.len() < 16 {
         return None;
@@ -226,24 +227,24 @@ pub enum Request<'a> {
     },
     LockMemory {
         pid: u64,
+        id: u64,
         address: u64,
         data: &'a [u8],
     },
     UnlockMemory {
-        pid: u64,
-        address: u64,
+        id: u64,
     },
     ClearMemoryLocks {
         pid: u64,
     },
     LockMemoryRva {
         pid: u64,
+        id: u64,
         relative_address: u64,
         data: &'a [u8],
     },
     UnlockMemoryRva {
-        pid: u64,
-        relative_address: u64,
+        id: u64,
     },
 }
 
@@ -419,14 +420,15 @@ impl<'a> WireEncode for Request<'a> {
                     .checked_add(offsets.len())
                     .ok_or(ProtocolError::TooLarge)?
             }
-            Self::LockMemory { data, .. } => 20usize
+            Self::LockMemory { data, .. } => 28usize
                 .checked_add(data.len())
                 .ok_or(ProtocolError::TooLarge)?,
-            Self::UnlockMemory { .. } | Self::ClearMemoryLocks { .. } => 16,
-            Self::LockMemoryRva { data, .. } => 20usize
+            Self::UnlockMemory { .. } => 8,
+            Self::ClearMemoryLocks { .. } => 8,
+            Self::LockMemoryRva { data, .. } => 28usize
                 .checked_add(data.len())
                 .ok_or(ProtocolError::TooLarge)?,
-            Self::UnlockMemoryRva { .. } => 16,
+            Self::UnlockMemoryRva { .. } => 8,
         };
         if n > MAX_FRAME_SIZE - HEADER_SIZE {
             Err(ProtocolError::TooLarge)
@@ -543,35 +545,38 @@ impl<'a> WireEncode for Request<'a> {
                 out[26..30].copy_from_slice(&count.to_le_bytes());
                 out[30..total].copy_from_slice(offsets);
             }
-            Self::LockMemory { pid, address, data } => {
+            Self::LockMemory {
+                pid,
+                id,
+                address,
+                data,
+            } => {
                 out[10..18].copy_from_slice(&pid.to_le_bytes());
-                out[18..26].copy_from_slice(&address.to_le_bytes());
-                out[26..30].copy_from_slice(&(data.len() as u32).to_le_bytes());
-                out[30..total].copy_from_slice(data);
+                out[18..26].copy_from_slice(&id.to_le_bytes());
+                out[26..34].copy_from_slice(&address.to_le_bytes());
+                out[34..38].copy_from_slice(&(data.len() as u32).to_le_bytes());
+                out[38..total].copy_from_slice(data);
             }
-            Self::UnlockMemory { pid, address } => {
-                out[10..18].copy_from_slice(&pid.to_le_bytes());
-                out[18..26].copy_from_slice(&address.to_le_bytes());
+            Self::UnlockMemory { id } => {
+                out[10..18].copy_from_slice(&id.to_le_bytes());
             }
             Self::ClearMemoryLocks { pid } => {
                 out[10..18].copy_from_slice(&pid.to_le_bytes());
             }
             Self::LockMemoryRva {
                 pid,
+                id,
                 relative_address,
                 data,
             } => {
                 out[10..18].copy_from_slice(&pid.to_le_bytes());
-                out[18..26].copy_from_slice(&relative_address.to_le_bytes());
-                out[26..30].copy_from_slice(&(data.len() as u32).to_le_bytes());
-                out[30..total].copy_from_slice(data);
+                out[18..26].copy_from_slice(&id.to_le_bytes());
+                out[26..34].copy_from_slice(&relative_address.to_le_bytes());
+                out[34..38].copy_from_slice(&(data.len() as u32).to_le_bytes());
+                out[38..total].copy_from_slice(data);
             }
-            Self::UnlockMemoryRva {
-                pid,
-                relative_address,
-            } => {
-                out[10..18].copy_from_slice(&pid.to_le_bytes());
-                out[18..26].copy_from_slice(&relative_address.to_le_bytes());
+            Self::UnlockMemoryRva { id } => {
+                out[10..18].copy_from_slice(&id.to_le_bytes());
             }
         }
         Ok(total)
@@ -700,38 +705,38 @@ impl<'a> WireDecode<'a> for Request<'a> {
                     offsets: if count > 0 { &p[20..] } else { &[] },
                 })
             }
-            MessageType::LockMemory if p.len() >= 20 => {
-                let size = u32::from_le_bytes(p[16..20].try_into().unwrap()) as usize;
-                if size == 0 || size > MAX_DRIVER_TRANSFER_SIZE || p.len() != 20 + size {
+            MessageType::LockMemory if p.len() >= 28 => {
+                let size = u32::from_le_bytes(p[24..28].try_into().unwrap()) as usize;
+                if size == 0 || size > MAX_DRIVER_TRANSFER_SIZE || p.len() != 28 + size {
                     return Err(ProtocolError::InvalidPayload);
                 }
                 Ok(Self::LockMemory {
                     pid: u64::from_le_bytes(p[..8].try_into().unwrap()),
-                    address: u64::from_le_bytes(p[8..16].try_into().unwrap()),
-                    data: &p[20..],
+                    id: u64::from_le_bytes(p[8..16].try_into().unwrap()),
+                    address: u64::from_le_bytes(p[16..24].try_into().unwrap()),
+                    data: &p[28..],
                 })
             }
-            MessageType::UnlockMemory if p.len() == 16 => Ok(Self::UnlockMemory {
-                pid: u64::from_le_bytes(p[..8].try_into().unwrap()),
-                address: u64::from_le_bytes(p[8..16].try_into().unwrap()),
+            MessageType::UnlockMemory if p.len() == 8 => Ok(Self::UnlockMemory {
+                id: u64::from_le_bytes(p.try_into().unwrap()),
             }),
             MessageType::ClearMemoryLocks if p.len() == 8 => Ok(Self::ClearMemoryLocks {
                 pid: u64::from_le_bytes(p.try_into().unwrap()),
             }),
-            MessageType::LockMemoryRva if p.len() >= 20 => {
-                let size = u32::from_le_bytes(p[16..20].try_into().unwrap()) as usize;
-                if size == 0 || size > MAX_DRIVER_TRANSFER_SIZE || p.len() != 20 + size {
+            MessageType::LockMemoryRva if p.len() >= 28 => {
+                let size = u32::from_le_bytes(p[24..28].try_into().unwrap()) as usize;
+                if size == 0 || size > MAX_DRIVER_TRANSFER_SIZE || p.len() != 28 + size {
                     return Err(ProtocolError::InvalidPayload);
                 }
                 Ok(Self::LockMemoryRva {
                     pid: u64::from_le_bytes(p[..8].try_into().unwrap()),
-                    relative_address: u64::from_le_bytes(p[8..16].try_into().unwrap()),
-                    data: &p[20..],
+                    id: u64::from_le_bytes(p[8..16].try_into().unwrap()),
+                    relative_address: u64::from_le_bytes(p[16..24].try_into().unwrap()),
+                    data: &p[28..],
                 })
             }
-            MessageType::UnlockMemoryRva if p.len() == 16 => Ok(Self::UnlockMemoryRva {
-                pid: u64::from_le_bytes(p[..8].try_into().unwrap()),
-                relative_address: u64::from_le_bytes(p[8..16].try_into().unwrap()),
+            MessageType::UnlockMemoryRva if p.len() == 8 => Ok(Self::UnlockMemoryRva {
+                id: u64::from_le_bytes(p.try_into().unwrap()),
             }),
             _ => Err(ProtocolError::InvalidPayload),
         }

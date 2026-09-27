@@ -12,7 +12,19 @@ use ks_core::protocol::{
 };
 use zerocopy::{FromBytes, Immutable, KnownLayout};
 
+use ks_core::crypto::{self, xor_u64};
 use ks_core::protocol::READ_RESPONSE_SIZE;
+
+use core::cell::UnsafeCell;
+
+struct IoctlKey(UnsafeCell<[u8; crypto::KEY_LEN]>);
+unsafe impl Sync for IoctlKey {}
+static IOCTL_KEY: IoctlKey = IoctlKey(UnsafeCell::new(crypto::FALLBACK_KEY));
+
+#[inline]
+fn crypt(value: u64, field: usize) -> u64 {
+    unsafe { xor_u64(value, &*IOCTL_KEY.0.get(), field) }
+}
 
 unsafe fn request_from_system<'a, T>(
     system: *const u8,
@@ -92,11 +104,12 @@ const DOS_NAME: &[u16] = &[
     0,
 ];
 
-pub fn driver_entry(driver: *mut DRIVER_OBJECT, _registry: *mut UNICODE_STRING) -> NTSTATUS {
+pub fn driver_entry(driver: *mut DRIVER_OBJECT, registry: *mut UNICODE_STRING) -> NTSTATUS {
     if driver.is_null() {
         return STATUS_INVALID_PARAMETER;
     }
     unsafe {
+        let _ = ks_load_ioctl_key(registry, IOCTL_KEY.0.get() as *mut u8);
         let device_name = unicode_string(DEVICE_NAME);
         let dos_name = unicode_string(DOS_NAME);
         let mut device = ptr::null_mut();
@@ -193,18 +206,22 @@ unsafe extern "system" fn dispatch_device_control(
                             Ok(request) => request,
                             Err(status) => return complete(irp, status, 0),
                         };
-                    if request.process_id == 0
-                        || request.address == 0
+                    let process_id = crypt(request.process_id, crypto::PID);
+                    let address = crypt(request.address, crypto::ADDRESS);
+                    if process_id == 0
+                        || address == 0
                         || request.size == 0
                         || request.size > MAX_DRIVER_TRANSFER_SIZE as u64
                     {
                         (STATUS_INVALID_PARAMETER, 0)
                     } else {
                         read_ioctl(
-                            request,
+                            &request,
                             system,
                             output_length as usize,
-                            |pid, address, data| memory::read_process_memory(pid, address, data),
+                            move |_, _, data| {
+                                memory::read_process_memory(process_id, address, data)
+                            },
                         )
                     }
                 }
@@ -220,19 +237,21 @@ unsafe extern "system" fn dispatch_device_control(
                             Ok(request) => request,
                             Err(status) => return complete(irp, status, 0),
                         };
-                    if request.process_id == 0
-                        || request.address == 0
+                    let process_id = crypt(request.process_id, crypto::PID);
+                    let address = crypt(request.address, crypto::ADDRESS);
+                    if process_id == 0
+                        || address == 0
                         || request.size == 0
                         || request.size > MAX_DRIVER_TRANSFER_SIZE as u64
                     {
                         (STATUS_INVALID_PARAMETER, 0)
                     } else {
                         read_ioctl(
-                            request,
+                            &request,
                             system,
                             output_length as usize,
-                            |pid, address, data| {
-                                memory::read_process_memory_mdl(pid, address, data)
+                            move |_, _, data| {
+                                memory::read_process_memory_mdl(process_id, address, data)
                             },
                         )
                     }
@@ -247,16 +266,18 @@ unsafe extern "system" fn dispatch_device_control(
                             Ok(request) => request,
                             Err(status) => return complete(irp, status, 0),
                         };
-                    if request.process_id == 0
-                        || request.address == 0
+                    let process_id = crypt(request.process_id, crypto::PID);
+                    let address = crypt(request.address, crypto::ADDRESS);
+                    if process_id == 0
+                        || address == 0
                         || request.size == 0
                         || request.size > MAX_DRIVER_TRANSFER_SIZE as u64
                     {
                         (STATUS_INVALID_PARAMETER, 0)
                     } else {
                         let result = memory::write_process_memory(
-                            request.process_id,
-                            request.address,
+                            process_id,
+                            address,
                             &request.data[..request.size as usize],
                         );
                         match result {
@@ -275,16 +296,18 @@ unsafe extern "system" fn dispatch_device_control(
                             Ok(request) => request,
                             Err(status) => return complete(irp, status, 0),
                         };
-                    if request.process_id == 0
-                        || request.address == 0
+                    let process_id = crypt(request.process_id, crypto::PID);
+                    let address = crypt(request.address, crypto::ADDRESS);
+                    if process_id == 0
+                        || address == 0
                         || request.size == 0
                         || request.size > MAX_DRIVER_TRANSFER_SIZE as u64
                     {
                         (STATUS_INVALID_PARAMETER, 0)
                     } else {
                         let result = memory::write_process_memory_mdl(
-                            request.process_id,
-                            request.address,
+                            process_id,
+                            address,
                             &request.data[..request.size as usize],
                         );
                         match result {
@@ -312,17 +335,20 @@ unsafe extern "system" fn dispatch_device_control(
                             Ok(request) => request,
                             Err(status) => return complete(irp, status, 0),
                         };
-                    if request.process_id == 0
+                    let process_id = crypt(request.process_id, crypto::PID);
+                    if process_id == 0
                         || request.size == 0
                         || request.size > MAX_DRIVER_TRANSFER_SIZE as u64
                     {
                         (STATUS_INVALID_PARAMETER, 0)
                     } else {
                         read_rva_ioctl(
-                            request,
+                            &request,
                             system,
                             output_length as usize,
-                            |pid, address, data| memory::read_process_memory(pid, address, data),
+                            move |_, address, data| {
+                                memory::read_process_memory(process_id, address, data)
+                            },
                         )
                     }
                 }
@@ -338,18 +364,19 @@ unsafe extern "system" fn dispatch_device_control(
                             Ok(request) => request,
                             Err(status) => return complete(irp, status, 0),
                         };
-                    if request.process_id == 0
+                    let process_id = crypt(request.process_id, crypto::PID);
+                    if process_id == 0
                         || request.size == 0
                         || request.size > MAX_DRIVER_TRANSFER_SIZE as u64
                     {
                         (STATUS_INVALID_PARAMETER, 0)
                     } else {
                         read_rva_ioctl(
-                            request,
+                            &request,
                             system,
                             output_length as usize,
-                            |pid, address, data| {
-                                memory::read_process_memory_mdl(pid, address, data)
+                            move |_, address, data| {
+                                memory::read_process_memory_mdl(process_id, address, data)
                             },
                         )
                     }
@@ -364,14 +391,15 @@ unsafe extern "system" fn dispatch_device_control(
                             Ok(request) => request,
                             Err(status) => return complete(irp, status, 0),
                         };
-                    if request.process_id == 0
+                    let process_id = crypt(request.process_id, crypto::PID);
+                    if process_id == 0
                         || request.size == 0
                         || request.size > MAX_DRIVER_TRANSFER_SIZE as u64
                     {
                         (STATUS_INVALID_PARAMETER, 0)
                     } else {
-                        write_rva_ioctl(request, |pid, address, data| {
-                            memory::write_process_memory(pid, address, data)
+                        write_rva_ioctl(&request, move |_, address, data| {
+                            memory::write_process_memory(process_id, address, data)
                         })
                     }
                 }
@@ -385,14 +413,15 @@ unsafe extern "system" fn dispatch_device_control(
                             Ok(request) => request,
                             Err(status) => return complete(irp, status, 0),
                         };
-                    if request.process_id == 0
+                    let process_id = crypt(request.process_id, crypto::PID);
+                    if process_id == 0
                         || request.size == 0
                         || request.size > MAX_DRIVER_TRANSFER_SIZE as u64
                     {
                         (STATUS_INVALID_PARAMETER, 0)
                     } else {
-                        write_rva_ioctl(request, |pid, address, data| {
-                            memory::write_process_memory_mdl(pid, address, data)
+                        write_rva_ioctl(&request, move |_, address, data| {
+                            memory::write_process_memory_mdl(process_id, address, data)
                         })
                     }
                 }
@@ -401,7 +430,7 @@ unsafe extern "system" fn dispatch_device_control(
                 if input_length < 16 {
                     (STATUS_BUFFER_TOO_SMALL, 0)
                 } else {
-                    let pid = ptr::read_unaligned(system as *const u64);
+                    let pid = crypt(ptr::read_unaligned(system as *const u64), crypto::PID);
                     let size = ptr::read_unaligned(system.add(8) as *const u32);
                     let count = ptr::read_unaligned(system.add(12) as *const u32) as usize;
                     let input_size = count.checked_mul(8).and_then(|value| value.checked_add(16));
@@ -422,7 +451,10 @@ unsafe extern "system" fn dispatch_device_control(
                         let mut entries = [(0u64, 0u32); MAX_BATCH_ENTRIES];
                         for i in 0..count {
                             let base = 16 + i * 8;
-                            let addr = ptr::read_unaligned(system.add(base) as *const u64);
+                            let addr = crypt(
+                                ptr::read_unaligned(system.add(base) as *const u64),
+                                crypto::ADDRESS,
+                            );
                             entries[i] = (addr, size);
                         }
                         match memory::batch_read_process_memory(
@@ -440,8 +472,11 @@ unsafe extern "system" fn dispatch_device_control(
                 if input_length < 16 || output_length < 8 {
                     (STATUS_BUFFER_TOO_SMALL, 0)
                 } else {
-                    let pid = ptr::read_unaligned(system as *const u64);
-                    let base = ptr::read_unaligned(system.add(8) as *const u64);
+                    let pid = crypt(ptr::read_unaligned(system as *const u64), crypto::PID);
+                    let base = crypt(
+                        ptr::read_unaligned(system.add(8) as *const u64),
+                        crypto::BASE,
+                    );
                     let count = if input_length >= 20 {
                         ptr::read_unaligned(system.add(16) as *const u32) as usize
                     } else {
@@ -459,11 +494,17 @@ unsafe extern "system" fn dispatch_device_control(
                     } else {
                         let mut offsets = [0u64; 32];
                         for i in 0..count {
-                            offsets[i] = ptr::read_unaligned(system.add(20 + i * 8) as *const u64);
+                            offsets[i] = crypt(
+                                ptr::read_unaligned(system.add(20 + i * 8) as *const u64),
+                                crypto::OFFSET,
+                            );
                         }
                         match memory::traverse_pointer_chain(pid, base, &offsets[..count]) {
                             Ok(result) => {
-                                ptr::write_unaligned(system as *mut u64, result);
+                                ptr::write_unaligned(
+                                    system as *mut u64,
+                                    crypt(result, crypto::RESULT),
+                                );
                                 (STATUS_SUCCESS, 8)
                             }
                             Err(status) => (status, 0),
@@ -510,8 +551,14 @@ unsafe extern "system" fn dispatch_device_control(
                             if header > input_end {
                                 break;
                             }
-                            let process_id = ptr::read_unaligned(system.add(offset) as *const u64);
-                            let address = ptr::read_unaligned(system.add(offset + 8) as *const u64);
+                            let process_id = crypt(
+                                ptr::read_unaligned(system.add(offset) as *const u64),
+                                crypto::PID,
+                            );
+                            let address = crypt(
+                                ptr::read_unaligned(system.add(offset + 8) as *const u64),
+                                crypto::ADDRESS,
+                            );
                             let size =
                                 ptr::read_unaligned(system.add(offset + 16) as *const u32) as usize;
                             offset = header;
@@ -574,15 +621,17 @@ unsafe fn read_rva_ioctl(
     output_len: usize,
     reader: impl FnOnce(u64, u64, &mut [u8]) -> Result<(), NTSTATUS>,
 ) -> (NTSTATUS, usize) {
-    let base = match resolve_base(request.process_id) {
+    let process_id = crypt(request.process_id, crypto::PID);
+    let relative_address = crypt(request.relative_address, crypto::RVA);
+    let base = match resolve_base(process_id) {
         Ok(base) => base,
         Err(status) => return (status, 0),
     };
-    let Some(address) = base.checked_add(request.relative_address) else {
+    let Some(address) = base.checked_add(relative_address) else {
         return (STATUS_INVALID_PARAMETER, 0);
     };
     let absolute = MemoryReadRequest {
-        process_id: request.process_id,
+        process_id,
         address,
         size: request.size,
     };
@@ -593,18 +642,16 @@ unsafe fn write_rva_ioctl(
     request: &MemoryRvaWriteRequest,
     writer: impl FnOnce(u64, u64, &[u8]) -> Result<(), NTSTATUS>,
 ) -> (NTSTATUS, usize) {
-    let base = match resolve_base(request.process_id) {
+    let process_id = crypt(request.process_id, crypto::PID);
+    let relative_address = crypt(request.relative_address, crypto::RVA);
+    let base = match resolve_base(process_id) {
         Ok(base) => base,
         Err(status) => return (status, 0),
     };
-    let Some(address) = base.checked_add(request.relative_address) else {
+    let Some(address) = base.checked_add(relative_address) else {
         return (STATUS_INVALID_PARAMETER, 0);
     };
-    match writer(
-        request.process_id,
-        address,
-        &request.data[..request.size as usize],
-    ) {
+    match writer(process_id, address, &request.data[..request.size as usize]) {
         Ok(()) => (STATUS_SUCCESS, 0),
         Err(status) => (status, 0),
     }
@@ -623,11 +670,12 @@ unsafe fn process_base_ioctl(system: *mut u8) -> (NTSTATUS, usize) {
         Ok(request) => request,
         Err(status) => return (status, 0),
     };
-    if request.process_id == 0 {
+    let process_id = crypt(request.process_id, crypto::PID);
+    if process_id == 0 {
         return (STATUS_INVALID_PARAMETER, 0);
     }
     let mut process = 0isize;
-    let status = PsLookupProcessByProcessId(pid_handle(request.process_id), &mut process);
+    let status = PsLookupProcessByProcessId(pid_handle(process_id), &mut process);
     if !nt_success(status) || process == 0 {
         return (status, 0);
     }
@@ -636,7 +684,7 @@ unsafe fn process_base_ioctl(system: *mut u8) -> (NTSTATUS, usize) {
     if base == 0 {
         return (STATUS_INVALID_PARAMETER, 0);
     }
-    ptr::write_unaligned(system as *mut u64, base);
+    ptr::write_unaligned(system as *mut u64, crypt(base, crypto::BASE));
     (STATUS_SUCCESS, 8)
 }
 

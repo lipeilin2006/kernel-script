@@ -362,8 +362,13 @@ pub fn traverse_pointer_chain(pid: u64, base: u64, offsets: &[u64]) -> Result<u6
     }
 }
 
-pub fn lock(pid: u64, address: u64, data: &[u8]) -> Result<(), String> {
-    let resp = ipc_send(&Request::LockMemory { pid, address, data })?;
+pub fn lock(id: u64, pid: u64, address: u64, data: &[u8]) -> Result<(), String> {
+    let resp = ipc_send(&Request::LockMemory {
+        pid,
+        id,
+        address,
+        data,
+    })?;
     match decode_ok(&resp)? {
         Response::LockComplete => Ok(()),
         Response::Error(code) => Err(format!("service error: {code}")),
@@ -372,8 +377,8 @@ pub fn lock(pid: u64, address: u64, data: &[u8]) -> Result<(), String> {
     }
 }
 
-pub fn unlock(pid: u64, address: u64) -> Result<(), String> {
-    let resp = ipc_send(&Request::UnlockMemory { pid, address })?;
+pub fn unlock(id: u64) -> Result<(), String> {
+    let resp = ipc_send(&Request::UnlockMemory { id })?;
     match decode_ok(&resp)? {
         Response::LockComplete => Ok(()),
         Response::Error(code) => Err(format!("service error: {code}")),
@@ -392,9 +397,10 @@ pub fn unlock_all(pid: u64) -> Result<(), String> {
     }
 }
 
-pub fn lock_rva(pid: u64, relative_address: u64, data: &[u8]) -> Result<(), String> {
+pub fn lock_rva(id: u64, pid: u64, relative_address: u64, data: &[u8]) -> Result<(), String> {
     let resp = ipc_send(&Request::LockMemoryRva {
         pid,
+        id,
         relative_address,
         data,
     })?;
@@ -406,11 +412,8 @@ pub fn lock_rva(pid: u64, relative_address: u64, data: &[u8]) -> Result<(), Stri
     }
 }
 
-pub fn unlock_rva(pid: u64, relative_address: u64) -> Result<(), String> {
-    let resp = ipc_send(&Request::UnlockMemoryRva {
-        pid,
-        relative_address,
-    })?;
+pub fn unlock_rva(id: u64) -> Result<(), String> {
+    let resp = ipc_send(&Request::UnlockMemoryRva { id })?;
     match decode_ok(&resp)? {
         Response::LockComplete => Ok(()),
         Response::Error(code) => Err(format!("service error: {code}")),

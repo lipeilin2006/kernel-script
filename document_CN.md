@@ -239,9 +239,8 @@ end
 
 ## Memory Lock API（内存锁定）
 
-Memory lock 维护一个周期性写入，以驱动往返允许的速度持续向目标地址重写指定
-字节模式。锁以 `(pid, absolute_address)` 复合键标识，对同一键重复 lock 会
-更新数据而不创建重复条目。
+Memory lock 以批量写往返允许的速度持续向目标地址重写指定字节模式。锁由显式
+`id` 唯一标识；使用相同 id 再次 lock 会更新 PID、地址和数据。
 
 锁表位于 `ks-service`：专用重写线程以连续自旋将每条锁通过一次批量写
 （`IOCTL_WRITE_MEMORY_BATCH`）重放。Driver 不
@@ -254,15 +253,16 @@ Memory lock 维护一个周期性写入，以驱动往返允许的速度持续�
 直到 unlock。
 
 ```lua
-memory.lock(pid, address, {0x90, 0x90, 0x90, 0xC3})
+memory.lock(1, pid, address, {0x90, 0x90, 0x90, 0xC3})
+memory.lock(1, pid, new_address, {0x90, 0x90, 0x90, 0xC3}) -- 移动锁 1
 ```
 
 ### memory.unlock
 
-按 `(pid, address)` 移除锁。**不**恢复原始值，仅停止后续周期性写入。
+按 `id` 移除锁。**不**恢复原始值，仅停止后续周期性写入。
 
 ```lua
-memory.unlock(pid, address)
+memory.unlock(1)
 ```
 
 ### memory.unlock_all
@@ -279,15 +279,15 @@ memory.unlock_all(pid)
 base（与 `get_process_base` 相同）。
 
 ```lua
-memory.lock_rva(pid, 0x1234, {0x90, 0x90})
+memory.lock_rva(2, pid, 0x1234, {0x90, 0x90})
 ```
 
 ### memory.unlock_rva
 
-按 `(pid, relative_address)` 移除锁。
+按 `id` 移除锁，不需要原来的 PID 或 RVA。
 
 ```lua
-memory.unlock_rva(pid, 0x1234)
+memory.unlock_rva(2)
 ```
 
 约束：
@@ -771,3 +771,6 @@ GUI 到 service 的 IPC 使用同步阻塞 Named Pipe 调用：
 - 坐标单位为 egui 逻辑点；物理像素需除以 `content_scale` 才能正确对齐。
 - 服务传输使用 `\\.\pipe\KernelScript` Named Pipe。
 - Named Pipe 和 driver device 的权限由 Windows 安全描述符控制。
+- Driver 使用普通内存 IOCTL 常量；PID、绝对地址、RVA/基址/指针偏移以及批量和
+  指针链条目中的敏感整数均按显式小端序明文传输。大小、数量和数据继续保持明文，
+  并使用相同的显式线格式。
