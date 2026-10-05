@@ -61,10 +61,8 @@ unsafe fn get_accurate_rect(hwnd: HWND) -> Option<WindowRect> {
         &mut rect as *mut RECT as *mut c_void,
         size_of::<RECT>() as u32,
     );
-    if hr != 0 {
-        if windows_sys::Win32::UI::WindowsAndMessaging::GetWindowRect(hwnd, &mut rect) == 0 {
-            return None;
-        }
+    if hr != 0 && windows_sys::Win32::UI::WindowsAndMessaging::GetWindowRect(hwnd, &mut rect) == 0 {
+        return None;
     }
     Some(WindowRect {
         x: rect.left,

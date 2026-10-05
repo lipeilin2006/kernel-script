@@ -17,12 +17,10 @@ required-features = ["wdk"]
 
 [features]
 default = []
-alloc = ["ks-core/alloc"]
 wdk = []
 
 [dependencies]
 ks-core.workspace = true
-zerocopy = { version = "0.8.56", default-features = false, features = ["derive"] }
 windows-sys = { workspace = true, features = [
     "Wdk_Foundation",
     "Wdk_Storage_FileSystem",

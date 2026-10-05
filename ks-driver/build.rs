@@ -65,7 +65,6 @@ fn main() {
     println!("cargo:rustc-link-search=native={}", wdk_lib.display());
     println!("cargo:rustc-link-lib=ntoskrnl");
     println!("cargo:rustc-link-lib=hal");
-    println!("cargo:rustc-link-lib=wdmsec");
     println!("cargo:rustc-link-lib=BufferOverflowK");
     println!("cargo:rustc-link-arg=/SUBSYSTEM:NATIVE");
     println!("cargo:rustc-link-arg=/DRIVER");

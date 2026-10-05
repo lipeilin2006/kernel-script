@@ -4,62 +4,110 @@
 
 ## Project Scope
 
-`kernel-script` is a Windows-only Rust workspace with four crates:
+`kernel-script` is a Windows-only Rust workspace with five crates:
 
-- `ks-core`: shared `no_std` protocol and ABI definitions.
-- `ks-driver`: `no_std` WDM kernel driver. It performs target-process memory reads and writes.
-- `ks-service`: SYSTEM user-mode service. It owns the Named Pipe IPC server, driver handle, driver request dispatch, the user-mode process enumeration, and the memory lock table with its periodic rewrite task.
-- `ks-gui`: user-mode egui/eframe OpenGL GUI and Lua runtime. It owns the Lua VM, synchronous Named Pipe IPC client, draw command pipeline, and the Lua config store (`config.json`, module `ks-gui/src/config_store.rs`).
-- `ks-launcher`: elevated egui GUI with ordered `Start Driver`, `Start Service`, and `Start GUI` actions.
-
-`ks-launcher` uses `sc.exe` to start the driver and service, then launches the
-GUI. It performs no file installation or copying; all errors and command output
-are written to its log file.
-
-Clicking a Start button renames that component's file (`ks-driver.sys`,
-`ks-service.exe`, or `ks-gui.exe`) to a fresh random name before the service
-registration or process spawn references it, and every service creation
-registers a fresh random SCM name (passed to `ks-service` through
-`--service-name` in binPath, because the windows-service dispatcher requires
-the registered name). Once a component stops, its file is renamed back to
-the canonical name (retried once per second until it succeeds; the driver
-image can stay locked for a short moment after the service reports
-STOPPED). All names
-live in `ks-launcher.state` next to the launcher so stop/cleanup works
-across restarts; do not delete that file while components are running.
+- `ks-core`: shared `no_std`, allocation-free protocol and ring-layout
+  definitions (postcard/serde/heapless only; no Windows API dependencies).
+- `ks-driver`: `no_std` WDM kernel driver (Native subsystem). It creates the
+  named section, the two named events, maps the ring into system space and
+  services requests from one worker system thread; the same thread also
+  replays the driver-side memory lock table between requests (polling the
+  request event while locks are held, blocking on it while the table is
+  empty). There is no device object, no IOCTL dispatch table and no IRP
+  path.
+- `ks-link`: user-mode client. Owns the section/event/mutex session, the
+  synchronous round trip, the Toolhelp process enumeration, and the
+  lock API surface (one round trip per mutation; the table lives in the
+  driver). It is pure Rust and is consumed through `ks-sdk`.
+- `ks-sdk`: the SDK facade. Re-exports the whole `ks-link` API at its
+  crate root and owns the driver lifecycle: `ks_sdk::start()` maps the
+  embedded target image (`ks-sdk/assets/ks-driver.sys`, `DRIVER_IMAGE`)
+  in-process and `ks_sdk::stop()` shuts the driver down again — the
+  in-process KDU mapper
+  (`ks-sdk/build.rs` compiles the KDU 1.5.0 map core plus
+  `ks-sdk/kdu/ks_bridge.cpp`; the packed provider database lives in
+  `ks-sdk/assets/drv64.dll`). Neither image is ever written to disk by
+  the SDK; `ks-gui` and `ks-test` depend on `ks-sdk`
+  (not `ks-link` directly), so everything downstream of `ks-sdk` shares
+  its MSVC/C++ build requirement.
+- `ks-gui`: user-mode egui/eframe OpenGL GUI and Lua runtime. It owns the
+   Lua VM, the synchronous `sync_ipc` facade over `ks-sdk` (the re-exported
+   link API), the draw command
+   pipeline, and the Lua config store (`config.json`, module
+   `ks-gui/src/config_store.rs`). Runs elevated (embedded
+   `requireAdministrator` manifest) because the driver's section DACL only
+    grants SYSTEM and Administrators. It also owns the driver lifecycle
+    (`ks-gui/src/driver.rs`): a startup probe silently reuses a live
+    driver or starts one through `ks_sdk::start()` on a background worker
+    at launch, the GUI's single `KernelScript` window shows the current
+    driver phase, a scrollable startup log (the lifecycle narrative plus
+    the `trying provider <id>` lines from the ks_sdk log sink) and the
+    `Stop` button (Stop only closes the overlay;
+    the `ks_sdk::stop()` shutdown runs after the render loop returns, in
+    `driver::finish_on_exit`), and `sync_ipc` is gated while a job can
+    close or replace the process-wide session (`ks_link::close_session`).
 
 The intended data flow is:
 
 ```text
 Lua (synchronous call)
-    -> ks-gui blocking Named Pipe IPC
-    -> ks-service Tokio Named Pipe server
-    -> driver worker / DeviceIoControl
-    -> ks-driver
+    -> ks-gui sync_ipc (blocking)
+    -> ks-sdk re-export -> ks-link ring round trip (mutex + section + events)
+    -> ks-driver worker system thread
+        -> request execution (target-process memory access, lock table
+           mutation)
+        -> between requests: rewrite one lock entry per loop pass
+           (table empty: sleep on the request event)
 ```
 
-Process enumeration and process-name-to-PID lookup are service responsibilities. Do not add process enumeration back to the kernel driver unless there is a documented kernel-only requirement.
+Process enumeration and process-name-to-PID lookup are `ks-link`
+responsibilities (exposed through `ks-sdk`); the memory lock table lives in
+the driver (see the lock
+rules below). There is no user-mode service anymore; do not reintroduce
+one.
 
 ## Workspace Rules
 
-- Keep `ks-core` dependency-free and `#![no_std]` compatible.
-- Do not add Tokio, Lua, GUI, or user-mode Windows APIs to `ks-core` or `ks-driver`.
-- Keep the driver limited to memory operations and the minimum required IOCTL surface.
-- The driver device uses an explicit SYSTEM-only DACL (`D:P(A;;GA;;;SY)`). The service runs as SYSTEM; administrators and standard users must not open the device directly.
-- The driver also binds the first successful device opener to its `EPROCESS`; subsequent create/control requests from another process are rejected. This is defense in depth, not a replacement for a service-specific DACL.
-- Use explicit little-endian wire encoding. Do not expose Rust struct layout on the TCP protocol.
-- Validate lengths, counts, addresses, PIDs, and frame sizes at every trust boundary.
-- Use `windows-sys` with narrow feature lists when possible.
-- Use `zerocopy` only for validated fixed-layout driver-local ABI views. Keep
-  `ks-core` dependency-free and keep TCP/Named Pipe payloads explicitly
-  little-endian and length-checked.
-- Do not reintroduce removed synchronous Lua APIs. GUI Lua IPC APIs must remain synchronous.
-- Do not call blocking network operations, `block_on`, or synchronous driver operations from the GUI render thread.
-- Lua VM objects must only be accessed by the GUI Lua thread. Never send `Lua`, `Thread`, `Function`, or registry keys to worker threads.
+- Keep `ks-core` `#![no_std]`, allocation-free and Windows-free. The only
+  allowed dependencies are `serde` (derive, `default-features = false`),
+  `postcard` and `heapless`.
+- Do not add user-mode Windows APIs to `ks-core` or `ks-driver`. Driver
+  externs live in `ks-driver/src/wdm.rs` only.
+- The driver performs memory reads/writes through the ring; it exposes no
+  device interface. Its security boundary is the section/event DACL
+  (hand-built, SYSTEM + Administrators, `GENERIC_ALL`) plus the ring state
+  machine. The first-kernel-opener `EPROCESS` binding and the old
+  device-object DACL are gone with the IOCTL path.
+- The wire format is postcard (LEB128 varints + little-endian fixed
+  fields) over the shared ring. Do not expose Rust struct layout, do not
+  reintroduce the removed `zerocopy` ABI, and bump `RING_VERSION` whenever
+  any layout or variant changes.
+- Validate lengths, counts, addresses, PIDs and sizes at every trust
+  boundary (`Request::validate` in ks-core, again in the driver operation
+  layer, again in ks-link).
+- Use `windows-sys` with narrow feature lists.
+- Every kernel object handle the driver creates (ring section, ring
+  events, worker thread) must be created with `OBJ_KERNEL_HANDLE`.
+  `DriverEntry` can run in an arbitrary process context — the KDU mapper
+  runs in-process inside `ks-test` (`kdu/ks_bridge.cpp`), and the manual
+  mapping path generally hands control to whatever process drove it — and
+  handles in that process's
+  table close when it exits, destroying the named ring objects while the
+  driver stays loaded (the failure mode: registry names that point at
+  objects that no longer exist). Registry-key and marker handles already
+  follow this rule; keep every new `Zw*` create/open site consistent.
+- Do not reintroduce removed synchronous Lua alternatives. GUI Lua memory
+  APIs must remain synchronous and run on the GUI Lua thread only.
+- Do not call blocking network operations, `block_on`, or driver round
+  trips from the GUI render thread. `OnUpdate` may use `sync_ipc` only
+  through Lua callbacks.
+- Lua VM objects must only be accessed by the GUI Lua thread. Never send
+  `Lua`, `Thread`, `Function`, or registry keys to worker threads.
 - Lua scripts have no filesystem access. All persistent script state goes
   through the `config` API (`ks-gui/src/config_store.rs`): typed scalar
   entries only, bounded sizes, debounced atomic writes to `config.json`.
-- Background workers may send only task IDs and owned plain data back to the GUI thread.
+- Background workers may send only task IDs and owned plain data back to
+  the GUI thread.
 
 ## GUI and Lua Lifecycle
 
@@ -67,17 +115,34 @@ The GUI frame lifecycle is:
 
 ```text
 check_hot_reload
-    -> OnUpdate (calculation, IPC, UI, drawing)
+    -> OnUpdate (calculation, memory ops, UI, drawing)
     -> Lua GC
 ```
 
 Rules:
 
-- `OnUpdate` is the only per-frame Lua callback and runs once per GUI frame. It performs calculations,
-  optional synchronous memory operations, UI calls, and drawing.
-- All memory API calls are synchronous and block the Lua thread for ~60-100μs.
+- `OnUpdate` is the only per-frame Lua callback and runs once per GUI
+  frame. It performs calculations, optional synchronous memory operations,
+  UI calls, and drawing.
+- All memory API calls are synchronous and block the Lua thread for one
+  ring round trip (~60-100 us).
 - Hot reload destroys the old Lua VM.
-- Multiple Lua scripts are loaded from `scripts/*.lua`; they run on the GUI Lua thread.
+- Multiple Lua scripts are loaded from `scripts/*.lua`; they run on the
+  GUI Lua thread.
+- Driver start/stop lives in `ks-gui/src/driver.rs` and is silent: the
+  startup probe spawns a background worker running `ks_sdk::start()` when
+  no live instance answers, and `driver::finish_on_exit` runs
+  `ks_sdk::stop()` after the render loop returns. The GUI shows the
+  current phase in its `KernelScript` window (`probing...` /
+  `starting...` / `running`, or the start error in red) above a
+  scrollable startup log — the lifecycle narrative plus the
+  `trying provider <id>` lines the ks_sdk log sink receives — and the
+  `Stop` button, which only closes the overlay. While such a job is in flight
+  every `sync_ipc` call fails immediately with "the driver is
+  starting". The gate is what makes `ks_link::close_session`
+  safe: the job may free the process-wide session on its way out, and the
+  single-threaded Lua rule plus the flag guarantees no round trip is in
+  flight when it does.
 
 Supported synchronous Luau operations include:
 
@@ -121,21 +186,183 @@ local value = memory.read_i32(pid, "0x1407FFF0")
 print(value)
 ```
 
-## IPC and Protocol
+## Ring and Protocol
 
-The GUI-to-service transport is the local Windows Named Pipe `\\.\pipe\KernelScript`.
+The transport is one named section plus two named events, all created by
+the driver and re-opened by clients:
 
-- `ks-service` uses Tokio Windows Named Pipes and `BytesMut` for asynchronous framed reads.
-- The pipe rejects remote clients and uses a bounded four-instance server. The
-  transport type alone is not authentication; keep its Windows security
-  descriptor restrictive if the service launch model changes.
-- Complete frames should be transferred with `BytesMut::split_to(...).freeze()` where ownership is needed.
-- Do not use `payload.to_vec()` merely to extend a frame lifetime.
-- The service uses a blocking boundary for synchronous `DeviceIoControl` calls. This is expected; the GUI must never observe that blocking operation.
-- Process enumeration uses Windows Toolhelp APIs in `ks-service/src/process.rs`.
-- The current process list wire response exposes `pid` and `name`. The service's internal Toolhelp record also collects `parent_pid` and `thread_count`; extend the wire format before exposing those fields to clients.
+- Section: `\BaseNamedObjects\KernelScriptSection` (client:
+  `Global\KernelScriptSection`).
+- Request event (client sets, auto-reset):
+  `\BaseNamedObjects\KernelScriptRequest`.
+- Response event (driver sets, client only waits):
+  `\BaseNamedObjects\KernelScriptResponse`.
+- Client mutex (clients only, created by the first client):
+  `Global\KernelScriptRingMutex`.
 
-The current driver ABI limits one memory read or write to `4096` bytes. Keep GUI and service validation aligned with the driver limit.
+Layout constants live in `ks-core/src/ring.rs` (`RING_MAGIC`, `RING_VERSION`,
+`HEADER_SPACE`, `REQUEST_OFFSET/SIZE`, `RESPONSE_OFFSET/META_SIZE/BULK_SIZE`,
+`RING_TOTAL_SIZE`, `STATE_IDLE/REQUEST/PROCESSING/RESPONSE`). All header
+fields are sequentially consistent atomics; the ring is a single request
+slot guarded by the four-state machine:
+
+```text
+IDLE --client--> REQUEST --driver--> PROCESSING --driver--> RESPONSE
+ ^                  |
+ +-- client cancel (5 s, only while still REQUEST)
+```
+
+Round-trip rules (implemented in `ks-link/src/lib.rs`):
+
+- Every round trip holds the client mutex, drains stale response signals,
+  publishes a postcard-encoded `Request`, sets `STATE_REQUEST`, signals the
+  request event, then waits for the response event.
+- The driver echoes the request `sequence` as `response_sequence`; a
+  response is only accepted when both the state and the sequence match.
+- A request the driver never picked up is cancelled back to `STATE_IDLE`
+  after 5 s; one it is already processing is waited out.
+- `RingHeader::status` is the single source of truth for transport-level
+  failure; `ResponseMeta` only describes a successful payload.
+- Object names are randomized per load, so a driver reload creates fresh
+  objects: a client session holds the previous load's handles, its round
+  trips time out, and the client must drop it (`ks_link::close_session`,
+  under ks-gui's lifecycle gate) or start a new process to open one
+  against the current load — a session never reconnects on its own.
+
+Payloads are postcard-encoded (`ks-core/src/protocol.rs`): `Ping`,
+`GetProcessBase`, `Read`/`Write` (with `rva` and `mdl` flags), `BatchRead`,
+`BatchWrite`, `TraverseChain`, `Shutdown`, `Lock`, `Unlock`, `UnlockAll`.
+The response is a fixed 64-byte
+`ResponseMeta` slot followed by a raw bulk region the driver fills in
+place.
+
+`Request::Shutdown` winds the worker down: the response header and the
+response event are published before the worker exits, so the call is an
+ordinary round trip (`ks_sdk::shutdown`, defined in ks-link). It also drops the whole lock
+table before the worker exits, so a shut-down driver performs no further
+target writes. Every later request times out
+until the driver is reloaded, and stopping the service afterwards runs the
+normal unload path against an already-exited thread. It is destructive:
+ks-test sends it after the correctness suite and benchmarks in both load
+modes. In the default KDU mode it is the *only* unload path — the worker
+runs a `self_teardown` that closes the ring handles, erases the registry
+publication (the three name values, the `Instance` claim and the key) and
+releases the marker last — because KDU never runs
+`DriverUnload`; `ks-test full` then verifies claim released, the
+published names removed, that a second `kdu -map` succeeds after
+shutdown, and that no live instance
+remains. The legacy `ks-test sc` path follows the shutdown with the `sc
+stop`/`sc query`/`sc delete` teardown that checks the service reports
+STOPPED and is removed.
+
+After the section, both events and the worker thread exist, the driver
+publishes the three randomized kernel object names as `REG_SZ` values
+under `HKLM\SOFTWARE\KernelScript` (`SectionName`, `RequestEventName`,
+`ResponseEventName`). ks-link resolves the names from there when it opens
+a session (kernel `\BaseNamedObjects\...` names are mapped to the client
+`Global\...` namespace) and falls back to the compiled-in defaults when
+the key is unreadable — a fallback that can never reach a randomized
+load, so an unreadable key just fails the session open. Because the
+registry is the only discovery path, publication failure fails driver
+start. ks-test is stricter: its readiness signal is polling the key
+(`ks_sdk::published_object_names_strict`, no fallback) until all three
+values exist, then pinging the ring. Teardown (`release_instance`, from
+the worker's `self_teardown` as well as from `comm::stop`) erases the
+whole record again — the three values, the `Instance` claim and the key
+itself — so a cleanly exited driver leaves the key absent; only a crash
+keeps stale values, and those are overwritten by the next load's publish.
+
+The names are randomized at every startup: `RingNames::generate`
+(`ks-driver/src/comm.rs`) draws a 64-bit token with `RtlRandomEx`, seeded
+from interrupt time and a stack address, and appends it as 16 lowercase
+hex chars to the fixed prefixes — the published values change per load,
+so nobody can predict the next load's names to squat them in advance.
+What makes randomization safe is the single-instance guard: `comm::start`
+claims a kernel-only marker event
+`\BaseNamedObjects\KernelScriptInstance` before any ring object exists
+(user-mode clients never open it), and a marker that is already openable
+— a second SCM service, or a manual mapper racing this load — makes the
+new instance fail with `STATUS_OBJECT_NAME_COLLISION`, which SCM reports
+as `ERROR_ALREADY_EXISTS`. Two driver images must never coexist: they
+would split the ring and the lock table between them. The claim also
+writes `Instance` as `REG_DWORD` 1 under `HKLM\SOFTWARE\KernelScript` for
+user-mode diagnostics; because registry values outlive a crash, the
+marker object — not the registry — decides liveness, and a stale value is
+deleted at the next start. Teardown releases the whole registry record
+first — the three name values, the `Instance` value and the key itself —
+and the marker object last, so a racing reload stays rejected until
+teardown completes. The marker name itself is fixed — it is the probe
+both loads must agree on; only the three ring object names randomize.
+
+The driver resolves each distinct PID once per batch
+(`memory::batch_write_process_memory`) instead of running
+`PsLookupProcessByProcessId` per entry. One driver read or write is capped
+at `4096` bytes; batch limits (`MAX_BATCH_ENTRIES = 256`,
+`MAX_BATCH_WRITE_ENTRIES = 64`) are enforced by ks-core validation and
+re-checked in the driver.
+
+Memory locks live entirely in `ks-driver` (`lock.rs`), and are replayed by
+the ring worker's own loop — there is no dedicated rewrite thread. The
+worker mutates a static driver-side table (one `Request::Lock`/`Unlock`/
+`UnlockAll` round trip per Lua call). Each loop pass:
+
+- with the table non-empty, *polls* the request event (`timeout = 0`) so a
+  pending request is always handled first, then rewrites exactly one lock
+  entry (`lock::sweep_step`), and loops again — continuous rewriting with
+  no inter-pass sleep while locks are held;
+- with the table empty, blocks on the request event, so an idle driver
+  burns no CPU. A `Lock` request is itself what wakes the worker; there is
+  no private wake event.
+
+The merged worker runs at kernel priority 6 (below the normal-class base,
+the mirror of `THREAD_PRIORITY_BELOW_NORMAL`) so the spinning loop can
+never starve the game or the GUI; requests still run at once whenever the
+CPU is free. Rules that keep this from repeating the bugchecks that killed
+the first kernel lock worker:
+
+- The table is guarded by a fast mutex whose critical sections only copy
+  bytes; target writes happen after the mutex is released, and nothing
+  that can wait runs inside a section.
+- Everything runs at `PASSIVE_LEVEL`, and no table operation can panic
+  (the workspace builds with `panic = "abort"`: any panic is a bugcheck).
+- Only the worker ever mutates or replays the table, so the sweep cursor
+  and scratch buffer are single-consumer by construction. `comm::stop`
+  flags the worker, signals the request event (the only wake source) and
+  joins it before releasing the ring objects and clearing the table;
+  `Request::Shutdown` clears the table before the worker exits.
+- Lock limits (64 entries, max 4096 bytes each, `id != 0`, `pid != 0`,
+  `address != 0` unless `rva`) are enforced by ks-core validation, by
+  ks-link before the round trip, and again in the driver's table insert.
+  A full table answers `STATUS_QUOTA_EXCEEDED`, which ks-link maps back to
+  `TooManyEntries`.
+- Do not replace the one-entry-per-pass rewrite with sleeps while locks
+  are held, do not move the polling wait to a blocking wait while the
+  table is non-empty (requests would stall behind a whole sweep), and do
+  not move the table back to user mode.
+
+## Driver Import Rules (ntdll.dll trap)
+
+windows-sys declares `Zw*`/`Rtl*` routines against `ntdll.dll` as
+`raw-dylib` imports. rustc packs the generated import objects into the
+*declaring crate's* rlib, and rlibs are searched before the WDK import
+libraries, so plain extern declarations in the driver resolve from a
+phantom `ntdll.dll` dependency and the kernel loader refuses the image
+(StartService fails; `dumpbin /imports` shows `ntdll.dll`).
+
+Therefore in `ks-driver/src/wdm.rs`:
+
+- Every `Zw*`/`Rtl*`/`Ps*`/`Ob*` extern used by Rust code must live in the
+  `#[link(name = "ntoskrnl.exe", kind = "raw-dylib", modifiers =
+  "+verbatim")]` block (x64 only: `import_name_type` is rejected off-x86).
+- The `ks_*` SEH-shim functions must stay in a separate plain
+  `extern "system"` block so they resolve against the bundled shim object.
+- Some WDK routines are header-only and are not exported by ntoskrnl at
+  all — `ExInitializeFastMutex` is one (importing it made StartService fail
+  with error 127 / `STATUS_ENTRYPOINT_NOT_FOUND`). Use `wdm::init_fast_mutex`
+  instead, and before adding any new kernel import check this machine's
+  export table (`dumpbin /exports C:\Windows\System32\ntoskrnl.exe`).
+- After every driver build, verify `dumpbin /imports ks-driver.sys` lists
+  `ntoskrnl.exe` only.
 
 ## Driver Build
 
@@ -147,18 +374,20 @@ cargo test --workspace
 cargo build --release --workspace
 ```
 
-Build the GUI with the unwind-enabled profile when runtime panic recovery is
-required:
+Build the GUI with the unwind-enabled profile when runtime panic recovery
+is required:
 
 ```powershell
 cargo build --profile gui-release -p ks-gui
 ```
 
-The normal release profile intentionally uses `panic = "abort"` for fail-fast
-components such as the driver and must not be used when GUI `catch_unwind`
-recovery is required.
+The normal release profile intentionally uses `panic = "abort"` for
+fail-fast components such as the driver and must not be used when GUI
+`catch_unwind` recovery is required.
 
-For a WDK driver build, use a Visual Studio Developer Command Prompt and set the WDK variables explicitly. The known working WDK configuration is `10.0.26100.0`:
+For a WDK driver build, use a Visual Studio Developer Command Prompt and
+set the WDK variables explicitly. The known working WDK configuration is
+`10.0.26100.0`:
 
 ```powershell
 $env:KS_DRIVER_WDK = '1'
@@ -167,48 +396,150 @@ $env:WDK_LIB = 'C:\Program Files (x86)\Windows Kits\10\Lib\10.0.26100.0\km\x64'
 $env:WDK_VERSION = '10.0.26100.0'
 
 $vs = 'C:\Program Files\Microsoft Visual Studio\18\Community\Common7\Tools\VsDevCmd.bat'
-cmd.exe /d /c "call `"$vs`" -arch=x64 -host_arch=x64 >nul && cargo build -p ks-driver --bin ks-driver --features wdk"
+cmd.exe /d /c "call `"$vs`" -arch=x64 -host_arch=x64 >nul && cargo build --release -p ks-driver --bin ks-driver --features wdk"
 ```
 
-The build script compiles `seh_shim.c` with MSVC and links the Native-subsystem driver image. The C shim contains the SEH boundary around `MmProbeAndLockPages` and the kernel-link compatibility symbols required by the Rust MSVC output:
+Always pass `--release`. A dev-profile (unoptimized) image overflows the
+worker system thread's kernel stack on the first request round trip —
+unoptimized postcard/heapless chains blow the ~16 KiB kernel stack — and
+bugchecks with `0x50` at a 32/64 KiB-aligned address. Verified: every dev
+build crashed at the first ping while the identical source in `--release`
+passed the full suite; do not test or ship a dev-profile driver image.
+
+The build script compiles `seh_shim.c` with MSVC and links the
+Native-subsystem driver image. The C shim contains the SEH boundary around
+`MmProbeAndLockPages`/`MmCopyVirtualMemory` and the kernel-link
+compatibility symbols required by the Rust MSVC output:
 
 - `_fltused`
 - `__CxxFrameHandler3`
 
-Do not link the user-mode CRT into the driver. Do not replace the handler with an incompatible zero-argument function.
+Do not link the user-mode CRT into the driver. Do not replace the handler
+with an incompatible zero-argument function. Route kernel calls that need
+an SEH boundary through `seh_shim.c` `ks_*` wrappers.
 
-The secure device wrapper uses `WdmlibIoCreateDeviceSecure` and links the WDK
-`wdmsec` and `BufferOverflowK` libraries. Keep this dependency in the WDK-only
-driver build path.
+The driver image is written to the workspace root as `ks-driver.sys`.
+Inspect it with platform linker tools before loading it. Driver signing
+and VM deployment are environment-specific and are outside the workspace
+source tree.
 
-All driver memory traffic uses the ordinary memory IOCTLs with plain,
-explicit little-endian fields. Sensitive integer fields, sizes, counts, and
-data are transmitted without obfuscation.
+## ks-test Load Modes
 
-Memory locks live entirely in `ks-service` (`driver_comm.rs`): a dedicated
-OS thread (`lock_rewrite_loop`, spawned by `run_lock_worker`) applies every
-entry with a single `IOCTL_WRITE_MEMORY_BATCH` per sweep in a continuous
-spin, with no inter-sweep sleep; it also runs at `THREAD_PRIORITY_BELOW_NORMAL`
-so the spinning thread can never starve the game or the service. Do not
-replace the batching with per-lock IOCTLs and do not use `yield_now`
-instead of pure spinning: full-speed sweeps with the batch write keep the
-per-lock rate at the IOCTL round-trip bound, and both per-sweep sleeps and
-yields were observed to either cap the rate or add cache-polluting context
-switches. The batch write (`IOCTL_WRITE_MEMORY_BATCH`, 0x0022_203C) carries up to
-`MAX_BATCH_WRITE_ENTRIES` (64) entries of
-`u64 pid, u64 address, u32 size, u32 pad, data` in one kernel transition
-and returns one NTSTATUS per entry; per-entry write failures are ignored by
-the sweep. Performance notes: the rewriter caches the encoded batch request
-keyed on a lock-table version counter (`LOCKS_VERSION`, bumped on every
-mutation), so sweeps between mutations submit the cached buffer with no
-table clone, no re-encode, and no table lock; the driver resolves each
-distinct PID once per batch (`memory::batch_write_process_memory`) instead
-of running `PsLookupProcessByProcessId` per entry. The driver keeps
-no lock state and exposes no lock IOCTLs. Lock limits (64 entries, max 4096
-bytes each) are enforced in the service.
-Inspect the native driver image with platform linker tools before loading it.
-Driver signing and VM deployment are environment-specific and are outside the
-workspace source tree.
+`ks-test` (full, minimal) defaults to KDU manual mapping; `ks-test sc
+[full]` is the legacy SCM path; `ks-test shutdown` is a standalone
+cleanup/verify subcommand.
+
+KDU is **compiled into ks-sdk** — there is no `kdu.exe` child process
+and nothing is staged for the mapper itself: the target image only ever
+reaches disk on the legacy `sc` path (SCM needs a `binPath`):
+
+- `ks-sdk/build.rs` compiles KDU 1.5.0's sources (`KDU-1.5.0/Source`,
+  the `KDU.vcxproj` file list minus `main.cpp` and `tests/*`, plus
+  `shellmasm.asm` via `ml64`) into a static library and adds
+  `ks-sdk/kdu/ks_bridge.cpp`, which exposes `ks_kdu_map`. Flags mirror
+  the vcxproj (`NDEBUG`, `UNICODE`, `/permissive-`, `/GS-`) plus `/MD` to
+  match Rust's dynamic CRT.
+- The packed provider database (`drv64.dll`, `ks-sdk/assets`,
+  `include_bytes`) is mapped into the process **in memory** (headers,
+  sections, base relocations; no imports/TLS — the same effect as KDU's
+  `LoadLibraryEx(..., DONT_RESOLVE_DLL_REFERENCES)`), so the DLL never
+  touches disk. Its exports (`gVersion`, `gProvTable`) are resolved by a
+  hand-rolled export walk: `GetProcAddress` rejects images that never
+  went through the loader (it fails with error 126).
+- The target image is mapped the same way and never touches disk either:
+  `ks_kdu_map` now takes raw bytes (`ks_sdk::DRIVER_IMAGE`, the embedded
+  `ks-sdk/assets/ks-driver.sys`) instead of a path, and
+  `KsMapImageFromMemory` builds the image layout itself — headers,
+  sections, base relocations, then `OptionalHeader.ImageBase` republished
+  at the mapped base. That last rewrite is mandatory: shellcode V3
+  relocates the payload copy a second time from
+  `delta = exbuffer - popth->ImageBase` (`shellcode.cpp`), so a header
+  still naming the preferred base while the pointers already sit at the
+  mapped base would relocate it by the wrong amount (LdrLoadDll did this
+  rewrite on the old path, which is why the old flow worked). Imports are
+  left unresolved; `KDUStorePayloadInSection` resolves the kernel imports
+  by name from the copy.
+- Only KDU's helper drivers are written to disk, and each is deleted
+  again: the provider's vulnerable driver (`NalDrv.sys`) is extracted
+  into the process working directory — a fresh temp root that becomes the
+  CWD for the duration of the `ks_kdu_map` call and is removed afterwards
+  (KDU resolves its extraction against the CWD) — and the victim
+  (`PROCEXP152.sys`) into `%SystemRoot%\system32\drivers`, where it is
+  removed once the payload has run. `ks_sdk::start` creates the root,
+  switches the CWD, runs the map, restores the CWD and deletes the root.
+- Every KDU translation unit gets `ks-sdk/kdu/ks_kdu_log.h` force-
+ included (`/FI`): `printf_s`/`vprintf_s` are macro-hooked to a Rust
+ callback in the bridge, but the C side's step-log output is discarded
+ (`kdu_log_quiet` in ks-sdk/src/kdu.rs): only the SDK's own lines —
+ the `trying provider <id>` attempts — reach the log sink (default:
+ stdout with the historic `kdu: ` prefix; ks-test installs a sink into
+ its step log). Swap `kdu_log_quiet` for a splitting function that
+ calls `emit` to bring the raw mapper log back for debugging.
+- Three small patches live in `KDU-1.5.0/Source/Hamakaze` and must be
+  re-applied if KDU is ever updated: `g_KduDbModule` is no longer
+  `static` (extern pair in `kduprov.h`); `KDUProviderSetPresetDb` (new,
+  `kduprov.cpp`) adopts the externally mapped database module after
+  `KDUProviderValidateDb`; `g_KduEntryStatus` (new, `drvmap.cpp` +
+  extern in `drvmap.h`) is recorded by `KDUShowPayloadResult` and is
+  what `ks_kdu_map` returns as the NTSTATUS of `DriverEntry`.
+- Building ks-sdk requires MSVC for every profile, `cargo test`
+  included: `cc` discovers Visual Studio through the registry and
+  `ml64.exe` through `VCToolsInstallDir` or the standard VS roots.
+  Because `ks-gui` and `ks-test` depend on ks-sdk, the requirement
+  applies to them as well.
+
+- Shellcode **V3 is mandatory**. V1 (KDU's default) starts `DriverEntry`
+  as a bare system-thread routine with a `NULL` driver object — this
+  driver rejects that — and the reported status then reflects thread
+  creation, not the entry's own result. V3 builds a real
+  `DRIVER_OBJECT`, calls `DriverEntry(driverObject, &regPath)`
+  synchronously; its NTSTATUS is `ks_kdu_map`'s return value, and
+  `0xC0000035` (returned directly) is how the dup-instance check
+  recognizes the single-instance guard rejecting a second load.
+- The driver object name (`ks_sdk::kdu`'s per-attempt `driver_name`) must
+  be unique per attempt:
+  V3's driver object is permanent
+  and KDU never deletes it, so a reused name would collide in
+  `ObCreateObject` with the same status code before the marker probe
+  ever runs.
+- Success is judged from the returned NTSTATUS (`0` = success); the old
+  child-process exit-code inversion and the `[~] Shellcode result`
+  text parsing are gone (KDU's own log output is discarded entirely —
+  the SDK only logs `trying provider <id>` per attempt).
+  Readiness is the registry publication (`ks_sdk::start` polls it via
+  `ks_sdk::published_object_names_strict`; ks-test additionally pings the
+  ring once names appear).
+- The provider chain starts at KDU's default (provider 0, Intel NAL);
+  override the first id with `KS_SDK_KDU_PRV=<id>` (the retired
+  `KS_TEST_KDU_PRV` is still honored). An attempt that dies before its
+  payload runs (the bridge's `STATUS_UNSUCCESSFUL` — the vulnerable
+  driver was rejected, blocklisted or unsupported) makes
+  `ks_sdk::start` retry with the next id of a curated fallback chain
+  (`FALLBACK_PROVIDERS` in ks-sdk/src/kdu.rs: cold vendor drivers that
+  survive blocklists; every id must support shellcode V3). A payload
+  that actually ran ends the chain at once: `DriverEntry`'s own
+  NTSTATUS — including the `0xC0000035` single-instance rejection —
+  cannot change with the provider. The last provider that succeeded in
+  the process is tried first on the next [`start`] (recorded in
+  `LAST_GOOD_PROVIDER`, ks-sdk/src/kdu.rs), so a repeated start —
+  ks-test full's duplicate-load and post-shutdown re-map checks — goes
+  straight to the working id. Every attempt gets a fresh V3
+  driver-object name, and an exhausted chain reports
+  `Error::NoProvider { tried }` with the ids attempted.
+- Teardown inverts (see `Request::Shutdown` above): `ks-test full`
+  verifies claim released, that a re-map after shutdown succeeds, and
+  that no live driver instance remains. `ks-test shutdown` exits 0 when
+  nothing live remains and is what leftover cleanup at start and `Drop`
+  spawn (a ks-link session never reconnects on its own; ks-test keeps one
+  session per process and uses a fresh `ks-test shutdown` process instead
+  of `ks_link::close_session`).
+- KDU never runs `DriverUnload`: every successful map leaks one
+  `THREAD_OBJECT` with its kernel stack and one permanent V3 driver
+  object until reboot — accepted for a test harness. The in-process
+  bridge additionally keeps the mapped `drv64.dll` image (VirtualAlloc)
+  alive for the life of the process.
+- Signing is not required in KDU mode; `ks-test sc` is the only remaining
+  path that loads a signed image through SCM.
 
 ## Verification Checklist
 
@@ -216,8 +547,16 @@ Before considering a change complete:
 
 1. Run `cargo fmt --all`.
 2. Run `cargo test --workspace`.
-3. Run `cargo check --workspace`.
-4. For driver changes, build `ks-driver --bin ks-driver --features wdk` using WDK 26100.
+3. Run `cargo check --workspace` (and `cargo clippy --workspace`, which
+   must stay warning-free apart from the build script's framework note).
+4. For driver changes, build `ks-driver --release --bin ks-driver
+   --features wdk` using WDK 26100, verify the import table lists
+   `ntoskrnl.exe` only, copy the image to `ks-sdk/assets/ks-driver.sys`
+   and rebuild `ks-test` (the image is embedded with `include_bytes`;
+   ks-sdk's build script recompiles the KDU static library, so MSVC is
+   required). For KDU/bridge changes, re-verify the three patches listed
+   under `ks-test Load Modes` are intact and run `kdu_smoke.ps1` plus
+   `drvtest7.ps1` elevated.
 5. Check `cargo tree -e features` when changing dependencies.
 6. Search for stale synchronous Lua calls after changing the Lua API.
 7. If artifacts are deployed to the VM, verify SHA256 hashes.
@@ -225,37 +564,50 @@ Before considering a change complete:
 
 ## Known Warnings and Limitations
 
-- An `IOCTL_ALLOC_MEM` (`0x80001040`) target-process allocation feature was
-  attempted twice and removed entirely. Both implementations produced a
-  driver that imported `ZwAllocateVirtualMemory`/`ZwClose` from
-  `ntdll.dll` (the WDK km `ntoskrnl.lib` has no `__imp_` stubs for them, so
-  dllimport references fall through to the SDK user-mode `ntdll.lib`), and
-  the kernel loader cannot resolve `ntdll.dll` as a driver dependency
-  (StartService failed while the pre-change build loaded fine). If target
-  process allocation is ever re-attempted, verify the built image with
-  `dumpbin /imports` contains no `ntdll.dll` before deploying, and route
-  kernel calls through `seh_shim.c` `ks_*` wrappers. All alloc wire
-  protocol, service, GUI, and Lua API code has been removed.
-- A kernel-side lock worker (system thread + kernel lock table +
-  `IOCTL_LOCK_MEMORY*`) was also removed after repeated bugchecks in the
-  field. A system thread performing periodic writes through
-  `MmCopyVirtualMemory` bugchecked on real game targets even though the
-  identical `IOCTL_WRITE_MEMORY` path from the service process was stable.
-  Locks must stay service-side (`run_lock_worker` in `driver_comm.rs`);
-  do not reintroduce kernel background writers.
-- The driver internally exposes normal memory I/O
-  (`IOCTL_READ_MEMORY`/`IOCTL_WRITE_MEMORY` and their RVA variants) alongside
-  separate MDL-remap I/O (`IOCTL_READ_MEMORY_MDL`/`IOCTL_WRITE_MEMORY_MDL`
-  and their RVA variants); callers must use the plain little-endian field
-  encoding because that encoding is now the normal IOCTL ABI.
+- The driver is a Native-subsystem kernel image and cannot be validated by
+  running it as a normal user-mode executable.
+- Process names and process metadata are collected in user mode by
+  Toolhelp in `ks-link`; a PID is not a permanent process identity because
+  Windows can reuse PIDs.
+- The GUI uses egui/eframe with the `glow` OpenGL backend. The native
+  eframe window is required as the OpenGL host and currently uses the
+  default opaque window configuration.
+- The GUI loads the first available `msyh.ttc`, `simsun.ttc`, or
+  `simhei.ttf` from `C:\Windows\Fonts` so Chinese Lua/UI text renders on
+  Windows. The GUI and release `ks-test` binaries embed a
+  `requireAdministrator` manifest (debug/test builds skip it so
+  `cargo test` can run unelevated).
+- The driver internally exposes normal memory I/O (`Read`/`Write` without
+  `mdl`) alongside separate MDL-remap I/O (`mdl = true`); the `rva` flag
+  is orthogonal and resolves the address against the target module base.
   MDL access attaches to the target, probes the MDL with read access only,
   locks pages, and maps them into kernel space so writes bypass user-mode
-  page protection (code sections, read-only data). MDL writes hit the shared
-  physical page: image-section edits are visible to every process mapping
-  that image. Keep both paths independent; do not silently fall back between
-  them.
-- `ks-driver` is a Native-subsystem kernel image and cannot be validated by running it as a normal user-mode executable.
-- Process names and process metadata are collected in user mode by Toolhelp; a PID is not a permanent process identity because Windows can reuse PIDs.
-- The GUI uses egui/eframe with the `glow` OpenGL backend. The native eframe window is required as the OpenGL host and currently uses the default opaque window configuration.
-- The GUI loads the first available `msyh.ttc`, `simsun.ttc`, or `simhei.ttf` from `C:\Windows\Fonts` so Chinese Lua/UI text renders on Windows.
-- Do not claim that an unsigned driver is VM-loadable merely because it compiled successfully.
+  page protection (code sections, read-only data). MDL writes hit the
+  shared physical page: image-section edits are visible to every process
+  mapping that image. Keep both paths independent; do not silently fall
+  back between them.
+- An `IOCTL_ALLOC_MEM` target-process allocation feature was attempted
+  twice and removed entirely; all alloc wire protocol, GUI, and Lua API
+  code is gone. If target-process allocation is ever re-attempted, verify
+  the built image with `dumpbin /imports` and route kernel calls through
+  `seh_shim.c` `ks_*` wrappers.
+- A first kernel-side lock worker was removed after repeated bugchecks in
+  the field; locks moved client side, then returned to the driver with the
+  invariants listed in the lock rules above (fast mutex around copies only,
+  single-consumer sweep on the joined worker, `PASSIVE_LEVEL`, panic-free
+  table code). Keep those invariants if the lock replay is ever reworked:
+  the failure mode is a bugcheck, not an error message.
+- Do not claim that an unsigned driver is VM-loadable merely because it
+  compiled successfully.
+- Windows Defender flags the KDU-mode test binaries (for example
+  `HackTool:Win64/KduDrv` and `HackTool:Win64/KernelDrUtil`) and may
+  quarantine `ks-test.exe` — which now contains the compiled-in KDU
+  mapper code — at launch; the
+  harness then exits silently with no output. Test machines need a
+  Defender exclusion for the workspace and the
+  `%LOCALAPPDATA%\Temp\kernel-script-*` staging directories (or
+  equivalent AV handling).
+- The KDU-mapped image registers no unwind information (`ntoskrnl`
+  exports no `RtlAddFunctionTable`), so an exception raised outside the
+  `seh_shim.c` probe guards bugchecks instead of being caught; the
+  harness only probes its own committed pages for that reason.

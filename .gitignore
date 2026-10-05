@@ -9,6 +9,10 @@ Cargo.lock.old
 *.dmp
 *.wer
 
+# Test artifacts
+gui_status.png
+dumps/
+
 # Local environment and tool state
 .env
 .env.*
@@ -44,7 +48,6 @@ driver-package/
 ks-core/.git
 ks-driver/.git
 ks-gui/.git
-ks-service/.git
 
 # OS
 Thumbs.db

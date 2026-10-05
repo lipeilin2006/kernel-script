@@ -1,976 +1,716 @@
-//! Wire protocol shared by the driver, service and clients.
-//! All integers are little-endian and no Rust layout is exposed on the wire.
+//! Request/response protocol carried by the shared-memory ring.
+//!
+//! Payloads are [`postcard`] encoded: a `no_std`, `no_alloc`, explicitly
+//! little-endian (LEB128 varints + little-endian fixed fields) format whose
+//! deserializer borrows directly out of the ring, so the driver never copies
+//! a request payload onto the stack. Variants are append-only; adding,
+//! removing or reordering fields requires bumping
+//! [`crate::ring::RING_VERSION`].
+//!
+//! The response side is a fixed [`RESPONSE_META_SIZE`]-byte postcard slot
+//! followed by a raw bulk region, so the driver never needs a staging
+//! buffer: read results are written straight into the bulk area.
 
-#[path = "message_type.rs"]
-mod message_type;
-pub use message_type::MessageType;
+use core::fmt;
 
-// Existing Windows driver ABI. These are intentionally kept separate from the
-// length-prefixed IPC messages below.
-// CTL_CODE(FILE_DEVICE_UNKNOWN, function, METHOD_BUFFERED, FILE_ANY_ACCESS).
-// The device type must match the type passed to IoCreateDevice.
-pub const IOCTL_READ_MEMORY: u32 = 0x0022_2004;
-pub const IOCTL_WRITE_MEMORY: u32 = 0x0022_2008;
-pub const IOCTL_PING: u32 = 0x0022_2010;
-pub const IOCTL_GET_PROCESS_BASE: u32 = 0x0022_2018;
-pub const IOCTL_READ_MEMORY_RVA: u32 = 0x0022_201C;
-pub const IOCTL_WRITE_MEMORY_RVA: u32 = 0x0022_2020;
-pub const IOCTL_READ_MEMORY_MDL: u32 = 0x0022_2024;
-pub const IOCTL_WRITE_MEMORY_MDL: u32 = 0x0022_2028;
-pub const IOCTL_READ_MEMORY_MDL_RVA: u32 = 0x0022_202C;
-pub const IOCTL_WRITE_MEMORY_MDL_RVA: u32 = 0x0022_2030;
-pub const IOCTL_BATCH_READ_MEMORY: u32 = 0x0022_2034;
-pub const IOCTL_TRAVERSE_POINTER_CHAIN: u32 = 0x0022_2038;
-pub const IOCTL_WRITE_MEMORY_BATCH: u32 = 0x0022_203C;
-pub const MAX_BATCH_WRITE_ENTRIES: usize = 64;
-pub const MAX_MEMORY_LOCK_SIZE: usize = 4096;
-pub const MAX_MEMORY_LOCKS: usize = 64;
+use heapless::Vec as SmallVec;
+use serde::{Deserialize, Serialize};
 
-/// `IOCTL_WRITE_MEMORY_BATCH` input wire layout (little-endian):
-/// `u32 count`, `u32 reserved`, then `count` entries of
-/// `u64 process_id, u64 address, u32 size, u32 _pad, size bytes of data`.
-/// Output layout: `u32 count`, then `count` little-endian `u32` NTSTATUS
-/// values, one per entry in input order. A malformed boundary aborts the
-/// walk; all unprocessed entries report `STATUS_INVALID_PARAMETER`.
+use crate::ring::RESPONSE_META_SIZE;
 
-/// Validates a pipe-level batch-write entries payload (`u64 address, u32
-/// size, u32 pad, data[size]` per entry) and returns the entry count. The
-/// leading `u64 pid` is not part of `entries`.
-#[cfg(feature = "alloc")]
-fn batch_write_entry_count(entries: &[u8]) -> Option<usize> {
-    if entries.len() < 16 {
-        return None;
-    }
-    let count = u32::from_le_bytes(entries[8..12].try_into().ok()?) as usize;
-    if count == 0 || count > MAX_BATCH_WRITE_ENTRIES {
-        return None;
-    }
-    let mut offset = 16usize;
-    for _ in 0..count {
-        if entries.len() - offset < 16 {
-            return None;
-        }
-        let size = u32::from_le_bytes(entries[offset + 8..offset + 12].try_into().ok()?) as usize;
-        if size == 0 || size > MAX_DRIVER_TRANSFER_SIZE {
-            return None;
-        }
-        offset = offset.checked_add(16)?.checked_add(size)?;
-    }
-    if offset != entries.len() {
-        return None;
-    }
-    Some(count)
-}
-
-#[repr(C)]
-pub struct MemoryReadRequest {
-    pub process_id: u64,
-    pub address: u64,
-    pub size: u64,
-}
-
-#[repr(C)]
-pub struct MemoryWriteRequest {
-    pub process_id: u64,
-    pub address: u64,
-    pub size: u64,
-    pub data: [u8; 4096],
-}
-
-#[repr(C)]
-pub struct ProcessBaseRequest {
-    pub process_id: u64,
-}
-
-#[repr(C)]
-pub struct MemoryRvaReadRequest {
-    pub process_id: u64,
-    pub relative_address: u64,
-    pub size: u64,
-}
-
-#[repr(C)]
-pub struct MemoryRvaWriteRequest {
-    pub process_id: u64,
-    pub relative_address: u64,
-    pub size: u64,
-    pub data: [u8; 4096],
-}
-
-#[repr(C)]
-pub struct MemoryResponse {
-    pub success: bool,
-    pub data: [u8; 4096],
-    pub error_code: u32,
-}
-
-pub const MAGIC: u32 = 0x4B53_4352; // "KSCR"
-pub const HEADER_SIZE: usize = 10;
-pub const MAX_FRAME_SIZE: usize = 1024 * 1024;
-// The Windows driver ABI uses a fixed 4096-byte data area.
+/// Largest single memory operation accepted by the driver.
 pub const MAX_DRIVER_TRANSFER_SIZE: usize = 4096;
-pub const READ_RESPONSE_HEADER_SIZE: usize = 8;
-pub const READ_RESPONSE_SIZE: usize = READ_RESPONSE_HEADER_SIZE + MAX_DRIVER_TRANSFER_SIZE + 4;
-pub const MAX_PROCESS_LIST_ENTRIES: usize = 4096;
-pub const MAX_PROCESS_NAME_BYTES: usize = 260;
-pub const PROCESS_RECORD_HEADER_SIZE: usize = 26;
-pub const MAX_PROCESS_LIST_SIZE: usize =
-    4 + MAX_PROCESS_LIST_ENTRIES * (PROCESS_RECORD_HEADER_SIZE + MAX_PROCESS_NAME_BYTES);
-pub const MAX_WRITE_SIZE: usize = MAX_FRAME_SIZE - HEADER_SIZE - 20;
+/// Entries in one batch read.
 pub const MAX_BATCH_ENTRIES: usize = 256;
-pub const BATCH_READ_ENTRY_WIRE_SIZE: usize = 12; // address:8 + size:4
+/// Entries in one batch write.
+pub const MAX_BATCH_WRITE_ENTRIES: usize = 64;
+/// Offsets in one pointer-chain walk.
+pub const MAX_CHAIN_OFFSETS: usize = 32;
+/// Slots in the service-side memory lock table.
+pub const MAX_MEMORY_LOCKS: usize = 64;
+/// Largest payload held by one memory lock.
+pub const MAX_MEMORY_LOCK_SIZE: usize = 4096;
+/// Convenience alias used by the Lua layer for write sizes.
+pub const MAX_WRITE_SIZE: usize = MAX_DRIVER_TRANSFER_SIZE;
+
+/// One entry of a batch write. `data` borrows straight out of the ring.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct BatchWriteItem<'a> {
+    pub pid: u64,
+    pub address: u64,
+    #[serde(borrow)]
+    pub data: &'a [u8],
+}
+
+/// Every request the driver services.
+///
+/// `rva` resolves `address` against the target module base and `mdl` routes
+/// the operation through the MDL-remap path; the two flags are orthogonal
+/// and replace the eight former `IOCTL_*` variants.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum Request<'a> {
+    Ping,
+    GetProcessBase {
+        pid: u64,
+    },
+    Read {
+        pid: u64,
+        address: u64,
+        size: u32,
+        rva: bool,
+        mdl: bool,
+    },
+    Write {
+        pid: u64,
+        address: u64,
+        #[serde(borrow)]
+        data: &'a [u8],
+        rva: bool,
+        mdl: bool,
+    },
+    BatchRead {
+        pid: u64,
+        size: u32,
+        addresses: SmallVec<u64, MAX_BATCH_ENTRIES>,
+    },
+    BatchWrite {
+        writes: SmallVec<BatchWriteItem<'a>, MAX_BATCH_WRITE_ENTRIES>,
+    },
+    TraverseChain {
+        pid: u64,
+        base: u64,
+        offsets: SmallVec<u64, MAX_CHAIN_OFFSETS>,
+    },
+    /// Wind down the driver's worker thread. The response is published
+    /// before the worker exits, so this is an ordinary round trip; every
+    /// later request times out until the driver is reloaded. It also stops
+    /// the driver-side lock rewrite thread and drops the whole lock table.
+    Shutdown,
+    /// Install or replace one entry in the driver's lock table. The
+    /// driver's dedicated rewrite thread replays the payload with plain
+    /// writes until the entry is removed by [`Request::Unlock`] or
+    /// [`Request::UnlockAll`]. `rva` resolves `address` against the target
+    /// module base once, at insert time.
+    Lock {
+        id: u64,
+        pid: u64,
+        address: u64,
+        #[serde(borrow)]
+        data: &'a [u8],
+        rva: bool,
+    },
+    /// Remove one lock entry. Removing an unknown id succeeds, so unlock
+    /// stays idempotent.
+    Unlock {
+        id: u64,
+    },
+    /// Remove every lock entry held against `pid`.
+    UnlockAll {
+        pid: u64,
+    },
+}
+
+/// Description of a successful response payload. Failures never reach this
+/// struct: they are reported through [`crate::ring::RingHeader::status`] with
+/// `bulk_len == 0`.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ResponseMeta {
+    /// Bytes of payload following the meta slot.
+    pub bulk_len: u32,
+    /// Element count for structured payloads (batch entries). Unused for
+    /// plain byte payloads, where it repeats `bulk_len`.
+    pub count: u32,
+    /// Scalar result: process base or pointer-chain address.
+    pub value: u64,
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ProtocolError {
     BufferTooSmall,
-    InvalidMagic,
-    InvalidLength,
-    UnknownMessageType,
+    EncodeFailed,
+    DecodeFailed,
+    /// The decoded message did not consume the whole input. A request slot
+    /// always holds exactly one message, so leftovers mean corruption or a
+    /// version mismatch.
+    TrailingBytes,
     InvalidPayload,
     TooLarge,
 }
 
-pub trait WireEncode {
-    fn message_type(&self) -> MessageType;
-    fn encoded_len(&self) -> Result<usize, ProtocolError>;
-    fn encode(&self, output: &mut [u8]) -> Result<usize, ProtocolError>;
-}
-
-pub trait WireDecode<'a>: Sized {
-    fn decode(message_type: MessageType, payload: &'a [u8]) -> Result<Self, ProtocolError>;
-}
-
-#[path = "frame.rs"]
-mod frame;
-pub use frame::Frame;
-#[cfg(feature = "alloc")]
-pub use frame::FrameDecoder;
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct ReadProcessMemory {
-    pub pid: u64,
-    pub target_address: u64,
-    pub size: u64,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct BatchReadEntry {
-    pub address: u64,
-    pub size: u32,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct ProcessRecord<'a> {
-    pub pid: u64,
-    pub parent_pid: u64,
-    pub thread_count: u32,
-    pub name: &'a [u8],
-}
-
-#[cfg(feature = "alloc")]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum Request<'a> {
-    FetchProcessList,
-    GetProcessId {
-        name: &'a [u8],
-    },
-    GetProcessBase {
-        pid: u64,
-    },
-    ReadMemoryRva {
-        pid: u64,
-        relative_address: u64,
-        size: u64,
-    },
-    WriteMemoryRva {
-        pid: u64,
-        relative_address: u64,
-        data: &'a [u8],
-    },
-    ReadMemoryMdl(ReadProcessMemory),
-    WriteMemoryMdl {
-        pid: u64,
-        target_address: u64,
-        data: &'a [u8],
-    },
-    ReadMemoryMdlRva {
-        pid: u64,
-        relative_address: u64,
-        size: u64,
-    },
-    WriteMemoryMdlRva {
-        pid: u64,
-        relative_address: u64,
-        data: &'a [u8],
-    },
-    ReadProcessMemory(ReadProcessMemory),
-    WriteProcessMemory {
-        pid: u64,
-        target_address: u64,
-        data: &'a [u8],
-    },
-    BatchReadMemory {
-        pid: u64,
-        size: u32,
-        addresses: &'a [u8],
-    },
-    /// Entries payload: per entry `u64 address, u32 size, u32 _pad,
-    /// data[size]`, all little-endian. All entries share `pid`.
-    BatchWrite {
-        pid: u64,
-        entries: &'a [u8],
-    },
-    TraversePointerChain {
-        pid: u64,
-        base: u64,
-        offsets: &'a [u8],
-    },
-    LockMemory {
-        pid: u64,
-        id: u64,
-        address: u64,
-        data: &'a [u8],
-    },
-    UnlockMemory {
-        id: u64,
-    },
-    ClearMemoryLocks {
-        pid: u64,
-    },
-    LockMemoryRva {
-        pid: u64,
-        id: u64,
-        relative_address: u64,
-        data: &'a [u8],
-    },
-    UnlockMemoryRva {
-        id: u64,
-    },
-}
-
-#[cfg(feature = "alloc")]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum Response<'a> {
-    ProcessList(ProcessList<'a>),
-    Memory(&'a [u8]),
-    WriteComplete,
-    Error(u32),
-    ErrorDetail(&'a [u8]),
-    ProcessId(u64),
-    ProcessBase(u64),
-    BatchReadMemory(&'a [u8]),
-    /// One little-endian NTSTATUS per entry, in input order.
-    BatchWriteStatuses(&'a [u8]),
-    PointerChainResult(u64),
-    LockComplete,
-}
-
-#[cfg(feature = "alloc")]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ProcessList<'a> {
-    payload: &'a [u8],
-}
-
-#[cfg(feature = "alloc")]
-impl<'a> ProcessList<'a> {
-    pub fn new(payload: &'a [u8]) -> Result<Self, ProtocolError> {
-        if payload.len() < 4 {
-            return Err(ProtocolError::BufferTooSmall);
-        }
-        let count = u32::from_le_bytes(payload[..4].try_into().unwrap()) as usize;
-        if count > MAX_PROCESS_LIST_ENTRIES {
-            return Err(ProtocolError::TooLarge);
-        }
-        let mut offset = 4usize;
-        for _ in 0..count {
-            if payload.len() - offset < PROCESS_RECORD_HEADER_SIZE {
-                return Err(ProtocolError::BufferTooSmall);
-            }
-            let name_len = u16::from_le_bytes(
-                payload[offset + 24..offset + PROCESS_RECORD_HEADER_SIZE]
-                    .try_into()
-                    .unwrap(),
-            ) as usize;
-            if name_len > MAX_PROCESS_NAME_BYTES {
-                return Err(ProtocolError::InvalidPayload);
-            }
-            offset = offset
-                .checked_add(PROCESS_RECORD_HEADER_SIZE)
-                .and_then(|value| value.checked_add(name_len))
-                .ok_or(ProtocolError::InvalidPayload)?;
-            if offset > payload.len() {
-                return Err(ProtocolError::BufferTooSmall);
-            }
-        }
-        if offset != payload.len() {
-            return Err(ProtocolError::InvalidPayload);
-        }
-        Ok(Self { payload })
-    }
-    pub fn count(&self) -> usize {
-        u32::from_le_bytes(self.payload[..4].try_into().unwrap()) as usize
-    }
-    pub fn iter(&self) -> ProcessIter<'a> {
-        ProcessIter {
-            bytes: &self.payload[4..],
-            remaining: self.count(),
-        }
-    }
-}
-
-#[cfg(feature = "alloc")]
-pub struct ProcessIter<'a> {
-    bytes: &'a [u8],
-    remaining: usize,
-}
-#[cfg(feature = "alloc")]
-impl<'a> Iterator for ProcessIter<'a> {
-    type Item = ProcessRecord<'a>;
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.remaining == 0 || self.bytes.len() < PROCESS_RECORD_HEADER_SIZE {
-            return None;
-        }
-        let pid = u64::from_le_bytes(self.bytes[..8].try_into().ok()?);
-        let parent_pid = u64::from_le_bytes(self.bytes[8..16].try_into().ok()?);
-        let thread_count = u32::from_le_bytes(self.bytes[16..20].try_into().ok()?);
-        let len = u16::from_le_bytes([self.bytes[24], self.bytes[25]]) as usize;
-        if len > MAX_PROCESS_NAME_BYTES || len > self.bytes.len() - PROCESS_RECORD_HEADER_SIZE {
-            self.remaining = 0;
-            return None;
-        }
-        let name = &self.bytes[PROCESS_RECORD_HEADER_SIZE..PROCESS_RECORD_HEADER_SIZE + len];
-        self.bytes = &self.bytes[PROCESS_RECORD_HEADER_SIZE + len..];
-        self.remaining -= 1;
-        Some(ProcessRecord {
-            pid,
-            parent_pid,
-            thread_count,
-            name,
-        })
-    }
-}
-
-#[cfg(feature = "alloc")]
-impl<'a> WireEncode for Request<'a> {
-    fn message_type(&self) -> MessageType {
-        match self {
-            Self::FetchProcessList => MessageType::FetchProcessList,
-            Self::GetProcessId { .. } => MessageType::GetProcessId,
-            Self::GetProcessBase { .. } => MessageType::GetProcessBase,
-            Self::ReadMemoryRva { .. } => MessageType::ReadMemoryRva,
-            Self::WriteMemoryRva { .. } => MessageType::WriteMemoryRva,
-            Self::ReadMemoryMdl(_) => MessageType::ReadMemoryMdl,
-            Self::WriteMemoryMdl { .. } => MessageType::WriteMemoryMdl,
-            Self::ReadMemoryMdlRva { .. } => MessageType::ReadMemoryMdlRva,
-            Self::WriteMemoryMdlRva { .. } => MessageType::WriteMemoryMdlRva,
-            Self::ReadProcessMemory(_) => MessageType::ReadProcessMemory,
-            Self::WriteProcessMemory { .. } => MessageType::WriteProcessMemory,
-            Self::BatchReadMemory { .. } => MessageType::BatchReadMemory,
-            Self::BatchWrite { .. } => MessageType::BatchWriteMemory,
-            Self::TraversePointerChain { .. } => MessageType::TraversePointerChain,
-            Self::LockMemory { .. } => MessageType::LockMemory,
-            Self::UnlockMemory { .. } => MessageType::UnlockMemory,
-            Self::ClearMemoryLocks { .. } => MessageType::ClearMemoryLocks,
-            Self::LockMemoryRva { .. } => MessageType::LockMemoryRva,
-            Self::UnlockMemoryRva { .. } => MessageType::UnlockMemoryRva,
-        }
-    }
-    fn encoded_len(&self) -> Result<usize, ProtocolError> {
-        let n = match self {
-            Self::FetchProcessList => 0,
-            Self::GetProcessId { name } => 4usize
-                .checked_add(name.len())
-                .ok_or(ProtocolError::TooLarge)?,
-            Self::GetProcessBase { .. } => 8,
-            Self::ReadMemoryRva { .. } => 24,
-            Self::WriteMemoryRva { data, .. } => 20usize
-                .checked_add(data.len())
-                .ok_or(ProtocolError::TooLarge)?,
-            Self::ReadMemoryMdl(_) => 24,
-            Self::WriteMemoryMdl { data, .. } => 20usize
-                .checked_add(data.len())
-                .ok_or(ProtocolError::TooLarge)?,
-            Self::ReadMemoryMdlRva { .. } => 24,
-            Self::WriteMemoryMdlRva { data, .. } => 20usize
-                .checked_add(data.len())
-                .ok_or(ProtocolError::TooLarge)?,
-            Self::ReadProcessMemory(_) => 24,
-            Self::WriteProcessMemory { data, .. } => 20usize
-                .checked_add(data.len())
-                .ok_or(ProtocolError::TooLarge)?,
-            Self::BatchReadMemory { addresses, .. } => {
-                if addresses.is_empty() || addresses.len() % 8 != 0 {
-                    return Err(ProtocolError::InvalidPayload);
-                }
-                16usize
-                    .checked_add(addresses.len())
-                    .ok_or(ProtocolError::TooLarge)?
-            }
-            Self::BatchWrite { entries, .. } => {
-                batch_write_entry_count(entries).ok_or(ProtocolError::InvalidPayload)?;
-                16usize
-                    .checked_add(entries.len())
-                    .ok_or(ProtocolError::TooLarge)?
-            }
-            Self::TraversePointerChain { offsets, .. } => {
-                if offsets.is_empty() || offsets.len() % 8 != 0 {
-                    return Err(ProtocolError::InvalidPayload);
-                }
-                20usize
-                    .checked_add(offsets.len())
-                    .ok_or(ProtocolError::TooLarge)?
-            }
-            Self::LockMemory { data, .. } => 28usize
-                .checked_add(data.len())
-                .ok_or(ProtocolError::TooLarge)?,
-            Self::UnlockMemory { .. } => 8,
-            Self::ClearMemoryLocks { .. } => 8,
-            Self::LockMemoryRva { data, .. } => 28usize
-                .checked_add(data.len())
-                .ok_or(ProtocolError::TooLarge)?,
-            Self::UnlockMemoryRva { .. } => 8,
+impl fmt::Display for ProtocolError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let text = match self {
+            Self::BufferTooSmall => "buffer too small",
+            Self::EncodeFailed => "encode failed",
+            Self::DecodeFailed => "decode failed",
+            Self::TrailingBytes => "trailing bytes after message",
+            Self::InvalidPayload => "invalid payload",
+            Self::TooLarge => "payload too large",
         };
-        if n > MAX_FRAME_SIZE - HEADER_SIZE {
-            Err(ProtocolError::TooLarge)
-        } else {
-            Ok(HEADER_SIZE + n)
-        }
+        f.write_str(text)
     }
-    fn encode(&self, out: &mut [u8]) -> Result<usize, ProtocolError> {
-        let total = self.encoded_len()?;
-        if out.len() < total {
-            return Err(ProtocolError::BufferTooSmall);
-        }
-        out[..4].copy_from_slice(&MAGIC.to_le_bytes());
-        out[4..6].copy_from_slice(&(self.message_type() as u16).to_le_bytes());
-        out[6..10].copy_from_slice(&((total - HEADER_SIZE) as u32).to_le_bytes());
+}
+
+fn check_len(len: usize) -> Result<(), ProtocolError> {
+    if len == 0 {
+        Err(ProtocolError::InvalidPayload)
+    } else if len > MAX_DRIVER_TRANSFER_SIZE {
+        Err(ProtocolError::TooLarge)
+    } else {
+        Ok(())
+    }
+}
+
+fn check_pid(pid: u64) -> Result<(), ProtocolError> {
+    if pid == 0 {
+        Err(ProtocolError::InvalidPayload)
+    } else {
+        Ok(())
+    }
+}
+
+impl<'a> Request<'a> {
+    /// Validate everything the driver is allowed to assume about a decoded
+    /// request. The driver re-checks the same rules at the memory layer, but
+    /// rejecting bad requests here keeps them out of the operation code.
+    pub fn validate(&self) -> Result<(), ProtocolError> {
         match self {
-            Self::FetchProcessList => {}
-            Self::GetProcessId { name } => {
-                out[10..14].copy_from_slice(&(name.len() as u32).to_le_bytes());
-                out[14..total].copy_from_slice(name);
-            }
-            Self::GetProcessBase { pid } => out[10..18].copy_from_slice(&pid.to_le_bytes()),
-            Self::ReadMemoryRva {
+            Self::Ping => Ok(()),
+            Self::GetProcessBase { pid } => check_pid(*pid),
+            Self::Read {
                 pid,
-                relative_address,
+                address,
                 size,
+                rva,
+                ..
             } => {
-                out[10..18].copy_from_slice(&pid.to_le_bytes());
-                out[18..26].copy_from_slice(&relative_address.to_le_bytes());
-                out[26..34].copy_from_slice(&size.to_le_bytes());
+                check_pid(*pid)?;
+                if *address == 0 && !*rva {
+                    return Err(ProtocolError::InvalidPayload);
+                }
+                check_len(*size as usize)
             }
-            Self::WriteMemoryRva {
+            Self::Write {
                 pid,
-                relative_address,
+                address,
                 data,
+                rva,
+                ..
             } => {
-                out[10..18].copy_from_slice(&pid.to_le_bytes());
-                out[18..26].copy_from_slice(&relative_address.to_le_bytes());
-                out[26..30].copy_from_slice(&(data.len() as u32).to_le_bytes());
-                out[30..total].copy_from_slice(data);
+                check_pid(*pid)?;
+                if *address == 0 && !*rva {
+                    return Err(ProtocolError::InvalidPayload);
+                }
+                check_len(data.len())
             }
-            Self::ReadMemoryMdl(v) => {
-                out[10..18].copy_from_slice(&v.pid.to_le_bytes());
-                out[18..26].copy_from_slice(&v.target_address.to_le_bytes());
-                out[26..34].copy_from_slice(&v.size.to_le_bytes());
-            }
-            Self::WriteMemoryMdl {
-                pid,
-                target_address,
-                data,
-            } => {
-                out[10..18].copy_from_slice(&pid.to_le_bytes());
-                out[18..26].copy_from_slice(&target_address.to_le_bytes());
-                out[26..30].copy_from_slice(&(data.len() as u32).to_le_bytes());
-                out[30..total].copy_from_slice(data);
-            }
-            Self::ReadMemoryMdlRva {
-                pid,
-                relative_address,
-                size,
-            } => {
-                out[10..18].copy_from_slice(&pid.to_le_bytes());
-                out[18..26].copy_from_slice(&relative_address.to_le_bytes());
-                out[26..34].copy_from_slice(&size.to_le_bytes());
-            }
-            Self::WriteMemoryMdlRva {
-                pid,
-                relative_address,
-                data,
-            } => {
-                out[10..18].copy_from_slice(&pid.to_le_bytes());
-                out[18..26].copy_from_slice(&relative_address.to_le_bytes());
-                out[26..30].copy_from_slice(&(data.len() as u32).to_le_bytes());
-                out[30..total].copy_from_slice(data);
-            }
-            Self::ReadProcessMemory(v) => {
-                out[10..18].copy_from_slice(&v.pid.to_le_bytes());
-                out[18..26].copy_from_slice(&v.target_address.to_le_bytes());
-                out[26..34].copy_from_slice(&v.size.to_le_bytes());
-            }
-            Self::WriteProcessMemory {
-                pid,
-                target_address,
-                data,
-            } => {
-                out[10..18].copy_from_slice(&pid.to_le_bytes());
-                out[18..26].copy_from_slice(&target_address.to_le_bytes());
-                out[26..30].copy_from_slice(&(data.len() as u32).to_le_bytes());
-                out[30..total].copy_from_slice(data);
-            }
-            Self::BatchReadMemory {
+            Self::BatchRead {
                 pid,
                 size,
                 addresses,
             } => {
-                out[10..18].copy_from_slice(&pid.to_le_bytes());
-                out[18..22].copy_from_slice(&size.to_le_bytes());
-                let count = (addresses.len() / 8) as u32;
-                out[22..26].copy_from_slice(&count.to_le_bytes());
-                out[26..total].copy_from_slice(addresses);
+                check_pid(*pid)?;
+                check_len(*size as usize)?;
+                if addresses.is_empty() {
+                    return Err(ProtocolError::InvalidPayload);
+                }
+                let total = (*size as usize)
+                    .checked_mul(addresses.len())
+                    .ok_or(ProtocolError::TooLarge)?;
+                if total > crate::ring::RESPONSE_BULK_SIZE {
+                    return Err(ProtocolError::TooLarge);
+                }
+                Ok(())
             }
-            Self::BatchWrite { pid, entries } => {
-                let count =
-                    batch_write_entry_count(entries).ok_or(ProtocolError::InvalidPayload)?;
-                out[10..18].copy_from_slice(&pid.to_le_bytes());
-                out[18..22].copy_from_slice(&(count as u32).to_le_bytes());
-                out[22..26].copy_from_slice(&0u32.to_le_bytes());
-                out[26..total].copy_from_slice(entries);
+            Self::BatchWrite { writes } => {
+                if writes.is_empty() {
+                    return Err(ProtocolError::InvalidPayload);
+                }
+                for item in writes {
+                    check_pid(item.pid)?;
+                    if item.address == 0 {
+                        return Err(ProtocolError::InvalidPayload);
+                    }
+                    check_len(item.data.len())?;
+                }
+                Ok(())
             }
-            Self::TraversePointerChain { pid, base, offsets } => {
-                out[10..18].copy_from_slice(&pid.to_le_bytes());
-                out[18..26].copy_from_slice(&base.to_le_bytes());
-                let count = (offsets.len() / 8) as u32;
-                out[26..30].copy_from_slice(&count.to_le_bytes());
-                out[30..total].copy_from_slice(offsets);
+            Self::TraverseChain { pid, base, offsets } => {
+                check_pid(*pid)?;
+                if *base == 0 {
+                    return Err(ProtocolError::InvalidPayload);
+                }
+                if offsets.len() > MAX_CHAIN_OFFSETS {
+                    return Err(ProtocolError::TooLarge);
+                }
+                Ok(())
             }
-            Self::LockMemory {
-                pid,
+            Self::Shutdown => Ok(()),
+            Self::Lock {
                 id,
+                pid,
                 address,
                 data,
+                rva,
             } => {
-                out[10..18].copy_from_slice(&pid.to_le_bytes());
-                out[18..26].copy_from_slice(&id.to_le_bytes());
-                out[26..34].copy_from_slice(&address.to_le_bytes());
-                out[34..38].copy_from_slice(&(data.len() as u32).to_le_bytes());
-                out[38..total].copy_from_slice(data);
-            }
-            Self::UnlockMemory { id } => {
-                out[10..18].copy_from_slice(&id.to_le_bytes());
-            }
-            Self::ClearMemoryLocks { pid } => {
-                out[10..18].copy_from_slice(&pid.to_le_bytes());
-            }
-            Self::LockMemoryRva {
-                pid,
-                id,
-                relative_address,
-                data,
-            } => {
-                out[10..18].copy_from_slice(&pid.to_le_bytes());
-                out[18..26].copy_from_slice(&id.to_le_bytes());
-                out[26..34].copy_from_slice(&relative_address.to_le_bytes());
-                out[34..38].copy_from_slice(&(data.len() as u32).to_le_bytes());
-                out[38..total].copy_from_slice(data);
-            }
-            Self::UnlockMemoryRva { id } => {
-                out[10..18].copy_from_slice(&id.to_le_bytes());
-            }
-        }
-        Ok(total)
-    }
-}
-
-#[cfg(feature = "alloc")]
-impl<'a> WireDecode<'a> for Request<'a> {
-    fn decode(ty: MessageType, p: &'a [u8]) -> Result<Self, ProtocolError> {
-        match ty {
-            MessageType::FetchProcessList if p.is_empty() => Ok(Self::FetchProcessList),
-            MessageType::GetProcessId if p.len() >= 4 => {
-                let len = u32::from_le_bytes(p[..4].try_into().unwrap()) as usize;
-                if len != p.len() - 4 || len == 0 || len > 255 {
+                if *id == 0 {
                     return Err(ProtocolError::InvalidPayload);
                 }
-                Ok(Self::GetProcessId { name: &p[4..] })
-            }
-            MessageType::GetProcessBase if p.len() == 8 => Ok(Self::GetProcessBase {
-                pid: u64::from_le_bytes(p.try_into().unwrap()),
-            }),
-            MessageType::ReadMemoryRva if p.len() == 24 => Ok(Self::ReadMemoryRva {
-                pid: u64::from_le_bytes(p[..8].try_into().unwrap()),
-                relative_address: u64::from_le_bytes(p[8..16].try_into().unwrap()),
-                size: u64::from_le_bytes(p[16..24].try_into().unwrap()),
-            }),
-            MessageType::WriteMemoryRva if p.len() >= 20 => {
-                let len = u32::from_le_bytes(p[16..20].try_into().unwrap()) as usize;
-                if len != p.len() - 20 || len > MAX_WRITE_SIZE {
+                check_pid(*pid)?;
+                if *address == 0 && !*rva {
                     return Err(ProtocolError::InvalidPayload);
                 }
-                Ok(Self::WriteMemoryRva {
-                    pid: u64::from_le_bytes(p[..8].try_into().unwrap()),
-                    relative_address: u64::from_le_bytes(p[8..16].try_into().unwrap()),
-                    data: &p[20..],
-                })
-            }
-            MessageType::ReadMemoryMdl if p.len() == 24 => {
-                Ok(Self::ReadMemoryMdl(ReadProcessMemory {
-                    pid: u64::from_le_bytes(p[..8].try_into().unwrap()),
-                    target_address: u64::from_le_bytes(p[8..16].try_into().unwrap()),
-                    size: u64::from_le_bytes(p[16..24].try_into().unwrap()),
-                }))
-            }
-            MessageType::WriteMemoryMdl if p.len() >= 20 => {
-                let len = u32::from_le_bytes(p[16..20].try_into().unwrap()) as usize;
-                if len != p.len() - 20 || len > MAX_WRITE_SIZE {
-                    return Err(ProtocolError::InvalidPayload);
+                check_len(data.len())?;
+                if data.len() > MAX_MEMORY_LOCK_SIZE {
+                    return Err(ProtocolError::TooLarge);
                 }
-                Ok(Self::WriteMemoryMdl {
-                    pid: u64::from_le_bytes(p[..8].try_into().unwrap()),
-                    target_address: u64::from_le_bytes(p[8..16].try_into().unwrap()),
-                    data: &p[20..],
-                })
+                Ok(())
             }
-            MessageType::ReadMemoryMdlRva if p.len() == 24 => Ok(Self::ReadMemoryMdlRva {
-                pid: u64::from_le_bytes(p[..8].try_into().unwrap()),
-                relative_address: u64::from_le_bytes(p[8..16].try_into().unwrap()),
-                size: u64::from_le_bytes(p[16..24].try_into().unwrap()),
-            }),
-            MessageType::WriteMemoryMdlRva if p.len() >= 20 => {
-                let len = u32::from_le_bytes(p[16..20].try_into().unwrap()) as usize;
-                if len != p.len() - 20 || len > MAX_WRITE_SIZE {
-                    return Err(ProtocolError::InvalidPayload);
+            Self::Unlock { id } => {
+                if *id == 0 {
+                    Err(ProtocolError::InvalidPayload)
+                } else {
+                    Ok(())
                 }
-                Ok(Self::WriteMemoryMdlRva {
-                    pid: u64::from_le_bytes(p[..8].try_into().unwrap()),
-                    relative_address: u64::from_le_bytes(p[8..16].try_into().unwrap()),
-                    data: &p[20..],
-                })
             }
-            MessageType::ReadProcessMemory if p.len() == 24 => {
-                Ok(Self::ReadProcessMemory(ReadProcessMemory {
-                    pid: u64::from_le_bytes(p[..8].try_into().unwrap()),
-                    target_address: u64::from_le_bytes(p[8..16].try_into().unwrap()),
-                    size: u64::from_le_bytes(p[16..24].try_into().unwrap()),
-                }))
-            }
-            MessageType::WriteProcessMemory if p.len() >= 20 => {
-                let len = u32::from_le_bytes(p[16..20].try_into().unwrap()) as usize;
-                if len != p.len() - 20 || len > MAX_WRITE_SIZE {
-                    return Err(ProtocolError::InvalidPayload);
-                }
-                Ok(Self::WriteProcessMemory {
-                    pid: u64::from_le_bytes(p[..8].try_into().unwrap()),
-                    target_address: u64::from_le_bytes(p[8..16].try_into().unwrap()),
-                    data: &p[20..],
-                })
-            }
-            MessageType::BatchReadMemory if p.len() >= 16 => {
-                let pid = u64::from_le_bytes(p[..8].try_into().unwrap());
-                let size = u32::from_le_bytes(p[8..12].try_into().unwrap());
-                let count = u32::from_le_bytes(p[12..16].try_into().unwrap()) as usize;
-                let expected = 16 + count * 8;
-                if p.len() != expected
-                    || count > MAX_BATCH_ENTRIES
-                    || size == 0
-                    || size > MAX_DRIVER_TRANSFER_SIZE as u32
-                {
-                    return Err(ProtocolError::InvalidPayload);
-                }
-                Ok(Self::BatchReadMemory {
-                    pid,
-                    size,
-                    addresses: &p[16..],
-                })
-            }
-            MessageType::BatchWriteMemory if p.len() >= 16 => {
-                batch_write_entry_count(p).ok_or(ProtocolError::InvalidPayload)?;
-                Ok(Self::BatchWrite {
-                    pid: u64::from_le_bytes(p[..8].try_into().unwrap()),
-                    entries: &p[16..],
-                })
-            }
-            MessageType::TraversePointerChain if p.len() >= 20 => {
-                let pid = u64::from_le_bytes(p[..8].try_into().unwrap());
-                let base = u64::from_le_bytes(p[8..16].try_into().unwrap());
-                let count = u32::from_le_bytes(p[16..20].try_into().unwrap()) as usize;
-                let expected = 20 + count * 8;
-                if p.len() != expected || count > 32 {
-                    return Err(ProtocolError::InvalidPayload);
-                }
-                Ok(Self::TraversePointerChain {
-                    pid,
-                    base,
-                    offsets: if count > 0 { &p[20..] } else { &[] },
-                })
-            }
-            MessageType::LockMemory if p.len() >= 28 => {
-                let size = u32::from_le_bytes(p[24..28].try_into().unwrap()) as usize;
-                if size == 0 || size > MAX_DRIVER_TRANSFER_SIZE || p.len() != 28 + size {
-                    return Err(ProtocolError::InvalidPayload);
-                }
-                Ok(Self::LockMemory {
-                    pid: u64::from_le_bytes(p[..8].try_into().unwrap()),
-                    id: u64::from_le_bytes(p[8..16].try_into().unwrap()),
-                    address: u64::from_le_bytes(p[16..24].try_into().unwrap()),
-                    data: &p[28..],
-                })
-            }
-            MessageType::UnlockMemory if p.len() == 8 => Ok(Self::UnlockMemory {
-                id: u64::from_le_bytes(p.try_into().unwrap()),
-            }),
-            MessageType::ClearMemoryLocks if p.len() == 8 => Ok(Self::ClearMemoryLocks {
-                pid: u64::from_le_bytes(p.try_into().unwrap()),
-            }),
-            MessageType::LockMemoryRva if p.len() >= 28 => {
-                let size = u32::from_le_bytes(p[24..28].try_into().unwrap()) as usize;
-                if size == 0 || size > MAX_DRIVER_TRANSFER_SIZE || p.len() != 28 + size {
-                    return Err(ProtocolError::InvalidPayload);
-                }
-                Ok(Self::LockMemoryRva {
-                    pid: u64::from_le_bytes(p[..8].try_into().unwrap()),
-                    id: u64::from_le_bytes(p[8..16].try_into().unwrap()),
-                    relative_address: u64::from_le_bytes(p[16..24].try_into().unwrap()),
-                    data: &p[28..],
-                })
-            }
-            MessageType::UnlockMemoryRva if p.len() == 8 => Ok(Self::UnlockMemoryRva {
-                id: u64::from_le_bytes(p.try_into().unwrap()),
-            }),
-            _ => Err(ProtocolError::InvalidPayload),
+            Self::UnlockAll { pid } => check_pid(*pid),
         }
     }
 }
 
-#[cfg(feature = "alloc")]
-impl<'a> WireEncode for Response<'a> {
-    fn message_type(&self) -> MessageType {
-        match self {
-            Self::ProcessList(_) => MessageType::ProcessList,
-            Self::Memory(_) => MessageType::ReadProcessMemoryResponse,
-            Self::WriteComplete => MessageType::WriteProcessMemoryResponse,
-            Self::Error(_) => MessageType::Error,
-            Self::ErrorDetail(_) => MessageType::ErrorDetail,
-            Self::ProcessId(_) => MessageType::GetProcessIdResponse,
-            Self::ProcessBase(_) => MessageType::GetProcessBaseResponse,
-            Self::BatchReadMemory(_) => MessageType::BatchReadMemoryResponse,
-            Self::BatchWriteStatuses(_) => MessageType::BatchWriteMemoryResponse,
-            Self::PointerChainResult(_) => MessageType::TraversePointerChainResponse,
-            Self::LockComplete => MessageType::LockMemoryResponse,
-        }
-    }
-    fn encoded_len(&self) -> Result<usize, ProtocolError> {
-        let payload_len = match self {
-            Self::ProcessList(v) => v.payload.len(),
-            Self::Memory(v) => v.len(),
-            Self::WriteComplete => 0,
-            Self::Error(_) => 4,
-            Self::ErrorDetail(v) => v.len(),
-            Self::ProcessId(_) => 8,
-            Self::ProcessBase(_) => 8,
-            Self::BatchReadMemory(v) => v.len(),
-            Self::BatchWriteStatuses(v) => v.len(),
-            Self::PointerChainResult(_) => 8,
-            Self::LockComplete => 0,
-        };
-        let total = HEADER_SIZE
-            .checked_add(payload_len)
-            .ok_or(ProtocolError::TooLarge)?;
-        if total > MAX_FRAME_SIZE {
-            Err(ProtocolError::TooLarge)
-        } else {
-            Ok(total)
-        }
-    }
-    fn encode(&self, out: &mut [u8]) -> Result<usize, ProtocolError> {
-        let total = self.encoded_len()?;
-        if out.len() < total {
-            return Err(ProtocolError::BufferTooSmall);
-        }
-        out[..4].copy_from_slice(&MAGIC.to_le_bytes());
-        out[4..6].copy_from_slice(&(self.message_type() as u16).to_le_bytes());
-        out[6..10].copy_from_slice(&((total - HEADER_SIZE) as u32).to_le_bytes());
-        match self {
-            Self::ProcessList(v) => out[10..total].copy_from_slice(v.payload),
-            Self::Memory(v) => out[10..total].copy_from_slice(v),
-            Self::WriteComplete => {}
-            Self::Error(code) => out[10..14].copy_from_slice(&code.to_le_bytes()),
-            Self::ErrorDetail(v) => out[10..total].copy_from_slice(v),
-            Self::ProcessId(pid) => out[10..18].copy_from_slice(&pid.to_le_bytes()),
-            Self::ProcessBase(base) => out[10..18].copy_from_slice(&base.to_le_bytes()),
-            Self::BatchReadMemory(v) => out[10..total].copy_from_slice(v),
-            Self::BatchWriteStatuses(v) => out[10..total].copy_from_slice(v),
-            Self::PointerChainResult(addr) => out[10..18].copy_from_slice(&addr.to_le_bytes()),
-            Self::LockComplete => {}
-        }
-        Ok(total)
-    }
+/// Serialize `request` into `out` and return the number of bytes used.
+///
+/// Encoding fails when validation fails or when the message does not fit,
+/// which also bounds every request by `out.len()` (the request region).
+pub fn encode_request(request: &Request<'_>, out: &mut [u8]) -> Result<usize, ProtocolError> {
+    request.validate()?;
+    postcard::to_slice(request, out)
+        .map(|used| used.len())
+        .map_err(|_| ProtocolError::EncodeFailed)
 }
 
-#[cfg(feature = "alloc")]
-impl<'a> WireDecode<'a> for Response<'a> {
-    fn decode(ty: MessageType, payload: &'a [u8]) -> Result<Self, ProtocolError> {
-        match ty {
-            MessageType::ProcessList => Ok(Self::ProcessList(ProcessList::new(payload)?)),
-            MessageType::ReadProcessMemoryResponse => Ok(Self::Memory(payload)),
-            MessageType::WriteProcessMemoryResponse if payload.is_empty() => {
-                Ok(Self::WriteComplete)
-            }
-            MessageType::Error if payload.len() == 4 => {
-                Ok(Self::Error(u32::from_le_bytes(payload.try_into().unwrap())))
-            }
-            MessageType::ErrorDetail => Ok(Self::ErrorDetail(payload)),
-            MessageType::GetProcessIdResponse if payload.len() == 8 => Ok(Self::ProcessId(
-                u64::from_le_bytes(payload.try_into().unwrap()),
-            )),
-            MessageType::GetProcessBaseResponse if payload.len() == 8 => Ok(Self::ProcessBase(
-                u64::from_le_bytes(payload.try_into().unwrap()),
-            )),
-            MessageType::BatchReadMemoryResponse => Ok(Self::BatchReadMemory(payload)),
-            MessageType::BatchWriteMemoryResponse
-                if !payload.is_empty() && payload.len() % 4 == 0 =>
-            {
-                Ok(Self::BatchWriteStatuses(payload))
-            }
-            MessageType::TraversePointerChainResponse if payload.len() == 8 => Ok(
-                Self::PointerChainResult(u64::from_le_bytes(payload.try_into().unwrap())),
-            ),
-            MessageType::LockMemoryResponse if payload.is_empty() => Ok(Self::LockComplete),
-            _ => Err(ProtocolError::InvalidPayload),
-        }
+/// Decode exactly one request from the request region.
+///
+/// `input` is the first `request_len` bytes of the region. Any trailing
+/// byte is rejected so a longer stale message can never be reinterpreted as
+/// a newer, shorter one.
+pub fn decode_request(input: &[u8]) -> Result<Request<'_>, ProtocolError> {
+    let (request, rest) =
+        postcard::take_from_bytes::<Request<'_>>(input).map_err(|_| ProtocolError::DecodeFailed)?;
+    if !rest.is_empty() {
+        return Err(ProtocolError::TrailingBytes);
     }
+    request.validate()?;
+    Ok(request)
 }
+
+/// Encode `meta` into the first [`RESPONSE_META_SIZE`] bytes of `out`,
+/// zero-filling the rest of the slot so the client always decodes a clean
+/// record.
+pub fn encode_response_meta(meta: ResponseMeta, out: &mut [u8]) -> Result<(), ProtocolError> {
+    if out.len() < RESPONSE_META_SIZE {
+        return Err(ProtocolError::BufferTooSmall);
+    }
+    let (slot, _) = out.split_at_mut(RESPONSE_META_SIZE);
+    let used = postcard::to_slice(&meta, slot)
+        .map(|used| used.len())
+        .map_err(|_| ProtocolError::EncodeFailed)?;
+    slot[used..].fill(0);
+    Ok(())
+}
+
+/// Decode the response meta from the first [`RESPONSE_META_SIZE`] bytes of
+/// the response region. Zero padding after the record is ignored.
+pub fn decode_response_meta(slot: &[u8]) -> Result<ResponseMeta, ProtocolError> {
+    if slot.len() < RESPONSE_META_SIZE {
+        return Err(ProtocolError::BufferTooSmall);
+    }
+    let (meta, _) = postcard::take_from_bytes::<ResponseMeta>(&slot[..RESPONSE_META_SIZE])
+        .map_err(|_| ProtocolError::DecodeFailed)?;
+    Ok(meta)
+}
+
+/// The largest legal batch read must fit the response bulk region exactly
+/// or below it, otherwise a valid request could not be answered.
+const _: () =
+    assert!(MAX_BATCH_ENTRIES * MAX_DRIVER_TRANSFER_SIZE <= crate::ring::RESPONSE_BULK_SIZE);
+
+/// A lock payload travels in one request and is re-checked with the same
+/// single-transfer rule in the driver, so the two limits must not drift.
+const _: () = assert!(MAX_MEMORY_LOCK_SIZE <= MAX_DRIVER_TRANSFER_SIZE);
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ring::RESPONSE_META_SIZE;
 
-    #[test]
-    fn request_round_trip() {
-        let request = Request::WriteProcessMemory {
-            pid: 42,
-            target_address: 0x1000,
-            data: b"abc",
-        };
-        let mut bytes = [0u8; 64];
-        let len = request.encode(&mut bytes).unwrap();
-        let frame = Frame::parse(&bytes[..len]).unwrap();
-        assert_eq!(
-            Request::decode(frame.message_type, frame.payload),
-            Ok(request)
-        );
+    fn round_trip(request: &Request<'_>) -> usize {
+        let mut buffer = [0u8; 8192];
+        let len = encode_request(request, &mut buffer).expect("encode");
+        let decoded = decode_request(&buffer[..len]).expect("decode");
+        assert_eq!(&decoded, request);
+        len
     }
 
     #[test]
-    fn process_lookup_request_round_trip() {
-        let request = Request::GetProcessId {
-            name: b"notepad.exe",
-        };
-        let mut bytes = [0u8; 64];
-        let len = request.encode(&mut bytes).unwrap();
-        let frame = Frame::parse(&bytes[..len]).unwrap();
-        assert_eq!(
-            Request::decode(frame.message_type, frame.payload),
-            Ok(request)
-        );
-    }
-
-    #[test]
-    fn rva_write_request_round_trip() {
-        let request = Request::WriteMemoryRva {
-            pid: 42,
-            relative_address: 0x1234,
-            data: b"abc",
-        };
-        let mut bytes = [0u8; 64];
-        let len = request.encode(&mut bytes).unwrap();
-        let frame = Frame::parse(&bytes[..len]).unwrap();
-        assert_eq!(
-            Request::decode(frame.message_type, frame.payload),
-            Ok(request)
-        );
-    }
-
-    #[test]
-    fn mdl_request_round_trip() {
-        let read = Request::ReadMemoryMdl(ReadProcessMemory {
+    fn every_variant_round_trips() {
+        round_trip(&Request::Ping);
+        round_trip(&Request::Shutdown);
+        round_trip(&Request::GetProcessBase { pid: 4242 });
+        round_trip(&Request::Lock {
+            id: 3,
             pid: 7,
-            target_address: 0x1000,
-            size: 4,
+            address: 0x7FF6_0000_1234,
+            data: b"locked",
+            rva: false,
         });
-        let write = Request::WriteMemoryMdl {
+        // The largest lock payload still fits the request region.
+        round_trip(&Request::Lock {
+            id: 4,
             pid: 7,
-            target_address: 0x1000,
-            data: b"xy",
+            address: 0x1234,
+            data: &[0xABu8; MAX_MEMORY_LOCK_SIZE],
+            rva: true,
+        });
+        round_trip(&Request::Unlock { id: 9 });
+        round_trip(&Request::UnlockAll { pid: 9 });
+        for mdl in [false, true] {
+            for rva in [false, true] {
+                round_trip(&Request::Read {
+                    pid: 7,
+                    address: 0x7FF6_0000_1234,
+                    size: 4096,
+                    rva,
+                    mdl,
+                });
+                round_trip(&Request::Write {
+                    pid: 7,
+                    address: 0x7FF6_0000_1234,
+                    data: b"payload",
+                    rva,
+                    mdl,
+                });
+            }
+        }
+        let mut chain = SmallVec::<u64, MAX_CHAIN_OFFSETS>::new();
+        for offset in [0x10u64, 0x20, 0x30] {
+            chain.push(offset).unwrap();
+        }
+        round_trip(&Request::TraverseChain {
+            pid: 9,
+            base: 0x1A2B_0000,
+            offsets: chain,
+        });
+    }
+
+    #[test]
+    fn batch_write_round_trips_at_every_supported_count() {
+        for count in [1usize, 2, 7, MAX_BATCH_WRITE_ENTRIES] {
+            let mut writes = SmallVec::<BatchWriteItem<'_>, MAX_BATCH_WRITE_ENTRIES>::new();
+            for index in 0..count {
+                writes
+                    .push(BatchWriteItem {
+                        pid: (index as u64 % 3) + 1,
+                        address: 0x1000 + index as u64 * 4,
+                        data: &[0xABu8; 4],
+                    })
+                    .unwrap();
+            }
+            let request = Request::BatchWrite { writes };
+            let len = round_trip(&request);
+            assert!(len < crate::ring::REQUEST_SIZE);
+        }
+    }
+
+    #[test]
+    fn batch_read_round_trips_at_max_entry_count() {
+        let mut addresses = SmallVec::<u64, MAX_BATCH_ENTRIES>::new();
+        for index in 0..MAX_BATCH_ENTRIES {
+            addresses
+                .push(0x7FFF_0000_0000 + index as u64 * 4096)
+                .unwrap();
+        }
+        let request = Request::BatchRead {
+            pid: 31,
+            size: 4096,
+            addresses,
         };
-        let read_rva = Request::ReadMemoryMdlRva {
-            pid: 7,
-            relative_address: 0x2000,
-            size: 8,
+        let len = round_trip(&request);
+        assert!(len < crate::ring::REQUEST_SIZE);
+    }
+
+    #[test]
+    fn truncated_request_is_rejected() {
+        let request = Request::Write {
+            pid: 5,
+            address: 0x1000,
+            data: &[1, 2, 3, 4],
+            rva: false,
+            mdl: false,
         };
-        let write_rva = Request::WriteMemoryMdlRva {
-            pid: 7,
-            relative_address: 0x2000,
-            data: b"xyz",
-        };
-        for request in [read, write, read_rva, write_rva] {
-            let mut bytes = [0u8; 64];
-            let len = request.encode(&mut bytes).unwrap();
-            let frame = Frame::parse(&bytes[..len]).unwrap();
-            assert_eq!(
-                Request::decode(frame.message_type, frame.payload),
-                Ok(request)
+        let mut buffer = [0u8; 256];
+        let len = encode_request(&request, &mut buffer).unwrap();
+        for cut in 0..len {
+            assert!(
+                decode_request(&buffer[..cut]).is_err(),
+                "truncation at {cut} of {len} must fail"
             );
         }
     }
 
     #[test]
-    fn decoder_handles_half_and_sticky_frames() {
-        let request = Request::FetchProcessList;
-        let mut first = [0u8; HEADER_SIZE];
-        let first_len = request.encode(&mut first).unwrap();
-        let mut decoder = FrameDecoder::new();
-        decoder.push(&first[..3]).unwrap();
-        assert!(decoder.next().unwrap().is_none());
-        decoder.push(&first[3..]).unwrap();
+    fn trailing_bytes_are_rejected() {
+        let mut buffer = [0u8; 64];
+        let len = encode_request(&Request::Ping, &mut buffer).unwrap();
+        let mut extended = [0u8; 65];
+        extended[..len].copy_from_slice(&buffer[..len]);
         assert_eq!(
-            decoder.next().unwrap().unwrap().message_type,
-            MessageType::FetchProcessList
+            decode_request(&extended[..len + 1]),
+            Err(ProtocolError::TrailingBytes)
         );
-        decoder.consume().unwrap();
-        assert_eq!(decoder.buffered_len(), 0);
-        assert_eq!(first_len, HEADER_SIZE);
     }
 
     #[test]
-    fn malformed_lengths_never_panic() {
-        assert_eq!(Frame::parse(&[]), Err(ProtocolError::BufferTooSmall));
-        let mut bytes = [0u8; HEADER_SIZE];
-        bytes[..4].copy_from_slice(&MAGIC.to_le_bytes());
-        bytes[4..6].copy_from_slice(&(MessageType::FetchProcessList as u16).to_le_bytes());
-        bytes[6..10].copy_from_slice(&1u32.to_le_bytes());
-        assert_eq!(Frame::parse(&bytes), Err(ProtocolError::BufferTooSmall));
-        let mut decoder = FrameDecoder::with_capacity(1);
-        decoder.push(&bytes).unwrap();
-        assert_eq!(decoder.next(), Err(ProtocolError::TooLarge));
-    }
+    fn validation_rejects_out_of_range_requests() {
+        let mut buffer = [0u8; 8192];
 
-    #[test]
-    fn write_length_and_output_are_checked() {
-        let too_large = Request::WriteProcessMemory {
+        let read = Request::Read {
             pid: 1,
-            target_address: 2,
-            data: &[0u8; MAX_WRITE_SIZE + 1],
+            address: 0x1000,
+            size: (MAX_DRIVER_TRANSFER_SIZE + 1) as u32,
+            rva: false,
+            mdl: false,
         };
-        assert_eq!(too_large.encoded_len(), Err(ProtocolError::TooLarge));
-        let read = Request::ReadProcessMemory(ReadProcessMemory {
-            pid: 1,
-            target_address: 2,
-            size: 3,
-        });
         assert_eq!(
-            read.encode(&mut [0u8; 10]),
+            encode_request(&read, &mut buffer),
+            Err(ProtocolError::TooLarge)
+        );
+
+        let zero_pid = Request::GetProcessBase { pid: 0 };
+        assert_eq!(
+            encode_request(&zero_pid, &mut buffer),
+            Err(ProtocolError::InvalidPayload)
+        );
+
+        let empty_batch = Request::BatchRead {
+            pid: 1,
+            size: 4,
+            addresses: SmallVec::new(),
+        };
+        assert_eq!(
+            encode_request(&empty_batch, &mut buffer),
+            Err(ProtocolError::InvalidPayload)
+        );
+
+        let empty_writes = Request::BatchWrite {
+            writes: SmallVec::new(),
+        };
+        assert_eq!(
+            encode_request(&empty_writes, &mut buffer),
+            Err(ProtocolError::InvalidPayload)
+        );
+
+        let mut writes = SmallVec::<BatchWriteItem<'_>, MAX_BATCH_WRITE_ENTRIES>::new();
+        writes
+            .push(BatchWriteItem {
+                pid: 1,
+                address: 0,
+                data: b"x",
+            })
+            .unwrap();
+        let bad_address = Request::BatchWrite { writes };
+        assert_eq!(
+            encode_request(&bad_address, &mut buffer),
+            Err(ProtocolError::InvalidPayload)
+        );
+
+        let base_zero = Request::TraverseChain {
+            pid: 1,
+            base: 0,
+            offsets: SmallVec::new(),
+        };
+        assert_eq!(
+            encode_request(&base_zero, &mut buffer),
+            Err(ProtocolError::InvalidPayload)
+        );
+
+        let zero_size = Request::Read {
+            pid: 1,
+            address: 0x1000,
+            size: 0,
+            rva: false,
+            mdl: false,
+        };
+        assert_eq!(
+            encode_request(&zero_size, &mut buffer),
+            Err(ProtocolError::InvalidPayload)
+        );
+
+        let lock_zero_id = Request::Lock {
+            id: 0,
+            pid: 1,
+            address: 0x1000,
+            data: b"x",
+            rva: false,
+        };
+        assert_eq!(
+            encode_request(&lock_zero_id, &mut buffer),
+            Err(ProtocolError::InvalidPayload)
+        );
+
+        let lock_zero_pid = Request::Lock {
+            id: 1,
+            pid: 0,
+            address: 0x1000,
+            data: b"x",
+            rva: false,
+        };
+        assert_eq!(
+            encode_request(&lock_zero_pid, &mut buffer),
+            Err(ProtocolError::InvalidPayload)
+        );
+
+        let lock_zero_address = Request::Lock {
+            id: 1,
+            pid: 1,
+            address: 0,
+            data: b"x",
+            rva: false,
+        };
+        assert_eq!(
+            encode_request(&lock_zero_address, &mut buffer),
+            Err(ProtocolError::InvalidPayload)
+        );
+
+        let lock_empty = Request::Lock {
+            id: 1,
+            pid: 1,
+            address: 0x1000,
+            data: b"",
+            rva: false,
+        };
+        assert_eq!(
+            encode_request(&lock_empty, &mut buffer),
+            Err(ProtocolError::InvalidPayload)
+        );
+
+        let lock_oversized = Request::Lock {
+            id: 1,
+            pid: 1,
+            address: 0x1000,
+            data: &[0u8; MAX_MEMORY_LOCK_SIZE + 1],
+            rva: false,
+        };
+        assert_eq!(
+            encode_request(&lock_oversized, &mut buffer),
+            Err(ProtocolError::TooLarge)
+        );
+
+        // An RVA lock may address offset zero: it resolves against the
+        // module base before it ever reaches the table.
+        let lock_rva_zero = Request::Lock {
+            id: 1,
+            pid: 1,
+            address: 0,
+            data: b"MZ",
+            rva: true,
+        };
+        let len = encode_request(&lock_rva_zero, &mut buffer).expect("rva lock encodes");
+        assert_eq!(
+            decode_request(&buffer[..len]).expect("decode"),
+            lock_rva_zero
+        );
+
+        let unlock_zero = Request::Unlock { id: 0 };
+        assert_eq!(
+            encode_request(&unlock_zero, &mut buffer),
+            Err(ProtocolError::InvalidPayload)
+        );
+
+        let unlock_all_zero = Request::UnlockAll { pid: 0 };
+        assert_eq!(
+            encode_request(&unlock_all_zero, &mut buffer),
+            Err(ProtocolError::InvalidPayload)
+        );
+    }
+
+    #[test]
+    fn zero_address_is_rejected_unless_rva() {
+        let mut buffer = [0u8; 256];
+
+        let read_rva = Request::Read {
+            pid: 1,
+            address: 0,
+            size: 2,
+            rva: true,
+            mdl: false,
+        };
+        let len = encode_request(&read_rva, &mut buffer).expect("rva zero address encodes");
+        assert_eq!(decode_request(&buffer[..len]).expect("decode"), read_rva);
+
+        let read_abs = Request::Read {
+            pid: 1,
+            address: 0,
+            size: 2,
+            rva: false,
+            mdl: false,
+        };
+        assert_eq!(
+            encode_request(&read_abs, &mut buffer),
+            Err(ProtocolError::InvalidPayload)
+        );
+
+        let write_rva = Request::Write {
+            pid: 1,
+            address: 0,
+            data: b"MZ",
+            rva: true,
+            mdl: false,
+        };
+        encode_request(&write_rva, &mut buffer).expect("rva zero-address write encodes");
+
+        let write_abs = Request::Write {
+            pid: 1,
+            address: 0,
+            data: b"MZ",
+            rva: false,
+            mdl: false,
+        };
+        assert_eq!(
+            encode_request(&write_abs, &mut buffer),
+            Err(ProtocolError::InvalidPayload)
+        );
+    }
+
+    #[test]
+    fn response_meta_round_trips_through_zero_padding() {
+        let meta = ResponseMeta {
+            bulk_len: 4096,
+            count: 1,
+            value: 0x1234_5678_9ABC_DEF0,
+        };
+        let mut slot = [0u8; RESPONSE_META_SIZE];
+        slot.fill(0xFF);
+        encode_response_meta(meta, &mut slot).unwrap();
+        assert_eq!(decode_response_meta(&slot), Ok(meta));
+
+        // A meta encoded into a larger buffer still decodes from its slot.
+        let mut region = [0u8; RESPONSE_META_SIZE + 16];
+        encode_response_meta(ResponseMeta::default(), &mut region).unwrap();
+        assert_eq!(
+            decode_response_meta(&region[..RESPONSE_META_SIZE]),
+            Ok(ResponseMeta::default())
+        );
+    }
+
+    #[test]
+    fn response_meta_rejects_short_slots() {
+        let mut short = [0u8; RESPONSE_META_SIZE - 1];
+        assert_eq!(
+            encode_response_meta(ResponseMeta::default(), &mut short),
+            Err(ProtocolError::BufferTooSmall)
+        );
+        assert_eq!(
+            decode_response_meta(&short),
             Err(ProtocolError::BufferTooSmall)
         );
     }

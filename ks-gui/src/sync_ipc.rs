@@ -1,423 +1,134 @@
-use std::cell::RefCell;
-use std::ffi::OsStr;
-use std::os::windows::ffi::OsStrExt;
+//! Synchronous memory operations for the GUI Lua thread, backed by the
+//! shared-memory link re-exported from [`ks_sdk`].
+//!
+//! Every call performs exactly one ring round trip and blocks the calling
+//! thread for its duration (~60-100 us); the public signatures are the Lua
+//! API contract and must not grow blocking alternatives.
+//!
+//! [`gate`] additionally refuses every call while a driver lifecycle job
+//! (probe/start) is in flight: that job may close and replace the
+//! process-wide session, and the check runs on the same GUI Lua thread
+//! that issues the round trips — so no round trip can be in flight when
+//! the session goes away (see `ks-gui/src/driver.rs`).
 
-use ks_core::protocol::{
-    Frame, ReadProcessMemory, Request, Response, WireDecode, WireEncode, HEADER_SIZE,
-    MAX_FRAME_SIZE,
-};
-
-struct SyncPipe {
-    handle: windows_sys::Win32::Foundation::HANDLE,
-    request_buffer: Vec<u8>,
+fn reason<E: std::fmt::Display>(error: E) -> String {
+    error.to_string()
 }
 
-unsafe impl Send for SyncPipe {}
-
-impl SyncPipe {
-    fn connect() -> Result<Self, String> {
-        let path: Vec<u16> = OsStr::new(r"\\.\pipe\KernelScript")
-            .encode_wide()
-            .chain(Some(0))
-            .collect();
-
-        let handle = unsafe {
-            windows_sys::Win32::Storage::FileSystem::CreateFileW(
-                path.as_ptr(),
-                windows_sys::Win32::Storage::FileSystem::FILE_GENERIC_READ
-                    | windows_sys::Win32::Storage::FileSystem::FILE_GENERIC_WRITE,
-                0,
-                core::ptr::null_mut(),
-                windows_sys::Win32::Storage::FileSystem::OPEN_EXISTING,
-                0,
-                core::ptr::null_mut(),
-            )
-        };
-
-        if handle.is_null() || handle == windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE {
-            return Err("failed to open pipe".into());
-        }
-
-        Ok(Self {
-            handle,
-            request_buffer: Vec::with_capacity(MAX_FRAME_SIZE.min(4096)),
-        })
-    }
-
-    fn write_all(&self, data: &[u8]) -> Result<(), String> {
-        let mut total = 0usize;
-        while total < data.len() {
-            let mut written = 0u32;
-            let ok = unsafe {
-                windows_sys::Win32::Storage::FileSystem::WriteFile(
-                    self.handle,
-                    data[total..].as_ptr(),
-                    (data.len() - total) as u32,
-                    &mut written,
-                    core::ptr::null_mut(),
-                )
-            };
-            if ok == 0 || written == 0 {
-                return Err("write failed".into());
-            }
-            total += written as usize;
-        }
+/// Refuses the call while a driver lifecycle job owns the session.
+fn gate() -> Result<(), String> {
+    if crate::driver::lifecycle_busy() {
+        Err("the driver is starting".to_string())
+    } else {
         Ok(())
     }
-
-    fn read_exact(&self, buf: &mut [u8]) -> Result<(), String> {
-        let mut total = 0;
-        while total < buf.len() {
-            let mut read = 0u32;
-            let ok = unsafe {
-                windows_sys::Win32::Storage::FileSystem::ReadFile(
-                    self.handle,
-                    buf[total..].as_mut_ptr(),
-                    (buf.len() - total) as u32,
-                    &mut read,
-                    core::ptr::null_mut(),
-                )
-            };
-            if ok == 0 || read == 0 {
-                return Err("read failed".into());
-            }
-            total += read as usize;
-        }
-        Ok(())
-    }
-
-    fn send_request(&mut self, request: &Request) -> Result<Vec<u8>, String> {
-        let total = request.encoded_len().map_err(|e| format!("{e:?}"))?;
-        self.request_buffer.resize(total, 0);
-        request
-            .encode(&mut self.request_buffer)
-            .map_err(|e| format!("{e:?}"))?;
-        self.write_all(&self.request_buffer)?;
-
-        let mut header = [0u8; HEADER_SIZE];
-        self.read_exact(&mut header)?;
-        let payload_len = u32::from_le_bytes(header[6..10].try_into().unwrap()) as usize;
-        if payload_len > MAX_FRAME_SIZE - HEADER_SIZE {
-            return Err("response too large".into());
-        }
-        let mut response = vec![0u8; HEADER_SIZE + payload_len];
-        response[..HEADER_SIZE].copy_from_slice(&header);
-        self.read_exact(&mut response[HEADER_SIZE..])?;
-        Ok(response)
-    }
-}
-
-impl Drop for SyncPipe {
-    fn drop(&mut self) {
-        unsafe {
-            windows_sys::Win32::Foundation::CloseHandle(self.handle);
-        }
-    }
-}
-
-thread_local! {
-    static SYNC_PIPE: RefCell<Option<SyncPipe>> = const { RefCell::new(None) };
-}
-
-fn ipc_send(request: &Request) -> Result<Vec<u8>, String> {
-    SYNC_PIPE.with(|cell| {
-        let mut borrow = cell.borrow_mut();
-
-        if borrow.is_none() {
-            *borrow = Some(SyncPipe::connect()?);
-        }
-
-        let result = borrow.as_mut().unwrap().send_request(request);
-
-        match result {
-            Ok(resp) => Ok(resp),
-            Err(_) => {
-                *borrow = Some(SyncPipe::connect()?);
-                borrow.as_mut().unwrap().send_request(request)
-            }
-        }
-    })
-}
-
-fn decode_ok(resp_bytes: &[u8]) -> Result<Response<'_>, String> {
-    let frame = Frame::parse(resp_bytes).map_err(|e| format!("{e:?}"))?;
-    Response::decode(frame.message_type, frame.payload).map_err(|e| format!("{e:?}"))
 }
 
 pub fn get_pid(name: &str) -> Result<u64, String> {
-    let resp = ipc_send(&Request::GetProcessId {
-        name: name.as_bytes(),
-    })?;
-    match decode_ok(&resp)? {
-        Response::ProcessId(pid) => Ok(pid),
-        Response::Error(code) => Err(format!("service error: {code}")),
-        _ => Err("unexpected response".into()),
-    }
+    gate()?;
+    ks_sdk::find_pid(name).map_err(reason)
 }
 
 pub fn get_process_base(pid: u64) -> Result<u64, String> {
-    let resp = ipc_send(&Request::GetProcessBase { pid })?;
-    match decode_ok(&resp)? {
-        Response::ProcessBase(base) => Ok(base),
-        Response::Error(code) => Err(format!("service error: {code}")),
-        _ => Err("unexpected response".into()),
-    }
+    gate()?;
+    ks_sdk::get_process_base(pid).map_err(reason)
 }
 
 pub fn read_i32(pid: u64, address: u64) -> Result<i32, String> {
-    let resp = ipc_send(&Request::ReadProcessMemory(ReadProcessMemory {
-        pid,
-        target_address: address,
-        size: 4,
-    }))?;
-    match decode_ok(&resp)? {
-        Response::Memory(data) => {
-            if data.len() >= 4 {
-                Ok(i32::from_le_bytes(data[..4].try_into().unwrap()))
-            } else {
-                Err("short read".into())
-            }
-        }
-        Response::Error(code) => Err(format!("service error: {code}")),
-        _ => Err("unexpected response".into()),
+    gate()?;
+    let data = ks_sdk::read_bytes(pid, address, 4, false, false).map_err(reason)?;
+    if data.len() >= 4 {
+        Ok(i32::from_le_bytes(data[..4].try_into().unwrap()))
+    } else {
+        Err("short read".into())
     }
 }
 
 pub fn read_bytes(pid: u64, address: u64, size: u64) -> Result<Vec<u8>, String> {
-    let resp = ipc_send(&Request::ReadProcessMemory(ReadProcessMemory {
-        pid,
-        target_address: address,
-        size,
-    }))?;
-    match decode_ok(&resp)? {
-        Response::Memory(data) => Ok(data.to_vec()),
-        Response::Error(code) => Err(format!("service error: {code}")),
-        _ => Err("unexpected response".into()),
-    }
+    gate()?;
+    ks_sdk::read_bytes(pid, address, size as usize, false, false).map_err(reason)
 }
 
 pub fn write_i32(pid: u64, address: u64, value: i32) -> Result<(), String> {
-    let data = value.to_le_bytes();
-    let resp = ipc_send(&Request::WriteProcessMemory {
-        pid,
-        target_address: address,
-        data: &data,
-    })?;
-    match decode_ok(&resp)? {
-        Response::WriteComplete => Ok(()),
-        Response::Error(code) => Err(format!("service error: {code}")),
-        _ => Err("unexpected response".into()),
-    }
+    gate()?;
+    ks_sdk::write_bytes(pid, address, &value.to_le_bytes(), false, false).map_err(reason)
 }
 
 pub fn write_bytes(pid: u64, address: u64, data: &[u8]) -> Result<(), String> {
-    let resp = ipc_send(&Request::WriteProcessMemory {
-        pid,
-        target_address: address,
-        data,
-    })?;
-    match decode_ok(&resp)? {
-        Response::WriteComplete => Ok(()),
-        Response::Error(code) => Err(format!("service error: {code}")),
-        _ => Err("unexpected response".into()),
-    }
+    gate()?;
+    ks_sdk::write_bytes(pid, address, data, false, false).map_err(reason)
 }
 
 pub fn read_rva(pid: u64, relative_address: u64, size: u64) -> Result<Vec<u8>, String> {
-    let resp = ipc_send(&Request::ReadMemoryRva {
-        pid,
-        relative_address,
-        size,
-    })?;
-    match decode_ok(&resp)? {
-        Response::Memory(data) => Ok(data.to_vec()),
-        Response::Error(code) => Err(format!("service error: {code}")),
-        _ => Err("unexpected response".into()),
-    }
+    gate()?;
+    ks_sdk::read_bytes(pid, relative_address, size as usize, true, false).map_err(reason)
 }
 
 pub fn write_rva(pid: u64, relative_address: u64, data: &[u8]) -> Result<(), String> {
-    let resp = ipc_send(&Request::WriteMemoryRva {
-        pid,
-        relative_address,
-        data,
-    })?;
-    match decode_ok(&resp)? {
-        Response::WriteComplete => Ok(()),
-        Response::Error(code) => Err(format!("service error: {code}")),
-        _ => Err("unexpected response".into()),
-    }
+    gate()?;
+    ks_sdk::write_bytes(pid, relative_address, data, true, false).map_err(reason)
 }
 
 pub fn read_mdl(pid: u64, address: u64, size: u64) -> Result<Vec<u8>, String> {
-    let resp = ipc_send(&Request::ReadMemoryMdl(ReadProcessMemory {
-        pid,
-        target_address: address,
-        size,
-    }))?;
-    match decode_ok(&resp)? {
-        Response::Memory(data) => Ok(data.to_vec()),
-        Response::Error(code) => Err(format!("service error: {code}")),
-        _ => Err("unexpected response".into()),
-    }
+    gate()?;
+    ks_sdk::read_bytes(pid, address, size as usize, false, true).map_err(reason)
 }
 
 pub fn write_mdl(pid: u64, address: u64, data: &[u8]) -> Result<(), String> {
-    let resp = ipc_send(&Request::WriteMemoryMdl {
-        pid,
-        target_address: address,
-        data,
-    })?;
-    match decode_ok(&resp)? {
-        Response::WriteComplete => Ok(()),
-        Response::Error(code) => Err(format!("service error: {code}")),
-        _ => Err("unexpected response".into()),
-    }
+    gate()?;
+    ks_sdk::write_bytes(pid, address, data, false, true).map_err(reason)
 }
 
 pub fn read_mdl_rva(pid: u64, relative_address: u64, size: u64) -> Result<Vec<u8>, String> {
-    let resp = ipc_send(&Request::ReadMemoryMdlRva {
-        pid,
-        relative_address,
-        size,
-    })?;
-    match decode_ok(&resp)? {
-        Response::Memory(data) => Ok(data.to_vec()),
-        Response::Error(code) => Err(format!("service error: {code}")),
-        _ => Err("unexpected response".into()),
-    }
+    gate()?;
+    ks_sdk::read_bytes(pid, relative_address, size as usize, true, true).map_err(reason)
 }
 
 pub fn write_mdl_rva(pid: u64, relative_address: u64, data: &[u8]) -> Result<(), String> {
-    let resp = ipc_send(&Request::WriteMemoryMdlRva {
-        pid,
-        relative_address,
-        data,
-    })?;
-    match decode_ok(&resp)? {
-        Response::WriteComplete => Ok(()),
-        Response::Error(code) => Err(format!("service error: {code}")),
-        _ => Err("unexpected response".into()),
-    }
+    gate()?;
+    ks_sdk::write_bytes(pid, relative_address, data, true, true).map_err(reason)
 }
 
 pub fn batch_read(pid: u64, size: u32, addresses: &[u64]) -> Result<Vec<u8>, String> {
-    let mut addrs_raw = Vec::with_capacity(addresses.len() * 8);
-    for &addr in addresses {
-        addrs_raw.extend_from_slice(&addr.to_le_bytes());
-    }
-    let resp = ipc_send(&Request::BatchReadMemory {
-        pid,
-        size,
-        addresses: &addrs_raw,
-    })?;
-    match decode_ok(&resp)? {
-        Response::BatchReadMemory(data) => Ok(data.to_vec()),
-        Response::Error(code) => Err(format!("service error: {code}")),
-        _ => Err("unexpected response".into()),
-    }
+    gate()?;
+    ks_sdk::batch_read(pid, size, addresses).map_err(reason)
 }
 
-/// Writes every (address, data) entry for `pid` in one service round trip.
+/// Writes every (address, data) entry for `pid` in one ring round trip.
 /// Returns one flag per entry: true when the driver reported success.
 pub fn batch_write(pid: u64, entries: &[(u64, Vec<u8>)]) -> Result<Vec<bool>, String> {
-    let mut entries_raw = Vec::new();
-    for (address, data) in entries {
-        entries_raw.extend_from_slice(&address.to_le_bytes());
-        entries_raw.extend_from_slice(&(data.len() as u32).to_le_bytes());
-        entries_raw.extend_from_slice(&0u32.to_le_bytes());
-        entries_raw.extend_from_slice(data);
-    }
-    let resp = ipc_send(&Request::BatchWrite {
-        pid,
-        entries: &entries_raw,
-    })?;
-    match decode_ok(&resp)? {
-        Response::BatchWriteStatuses(bytes) => {
-            let mut flags = Vec::with_capacity(bytes.len() / 4);
-            for chunk in bytes.chunks_exact(4) {
-                flags.push(u32::from_le_bytes(chunk.try_into().unwrap()) == 0);
-            }
-            Ok(flags)
-        }
-        Response::Error(code) => Err(format!("service error: {code}")),
-        _ => Err("unexpected response".into()),
-    }
+    gate()?;
+    ks_sdk::batch_write(pid, entries)
+        .map(|statuses| statuses.iter().map(|&status| status == 0).collect())
+        .map_err(reason)
 }
 
 pub fn traverse_pointer_chain(pid: u64, base: u64, offsets: &[u64]) -> Result<u64, String> {
-    let mut offsets_raw = Vec::with_capacity(offsets.len() * 8);
-    for &off in offsets {
-        offsets_raw.extend_from_slice(&off.to_le_bytes());
-    }
-    let resp = ipc_send(&Request::TraversePointerChain {
-        pid,
-        base,
-        offsets: &offsets_raw,
-    })?;
-    match decode_ok(&resp)? {
-        Response::PointerChainResult(addr) => Ok(addr),
-        Response::Error(code) => Err(format!("service error: {code}")),
-        _ => Err("unexpected response".into()),
-    }
+    gate()?;
+    ks_sdk::traverse_pointer_chain(pid, base, offsets).map_err(reason)
 }
 
 pub fn lock(id: u64, pid: u64, address: u64, data: &[u8]) -> Result<(), String> {
-    let resp = ipc_send(&Request::LockMemory {
-        pid,
-        id,
-        address,
-        data,
-    })?;
-    match decode_ok(&resp)? {
-        Response::LockComplete => Ok(()),
-        Response::Error(code) => Err(format!("service error: {code}")),
-        Response::ErrorDetail(detail) => Err(String::from_utf8_lossy(detail).into_owned()),
-        _ => Err("unexpected response".into()),
-    }
+    gate()?;
+    ks_sdk::lock(id, pid, address, data).map_err(reason)
 }
 
 pub fn unlock(id: u64) -> Result<(), String> {
-    let resp = ipc_send(&Request::UnlockMemory { id })?;
-    match decode_ok(&resp)? {
-        Response::LockComplete => Ok(()),
-        Response::Error(code) => Err(format!("service error: {code}")),
-        Response::ErrorDetail(detail) => Err(String::from_utf8_lossy(detail).into_owned()),
-        _ => Err("unexpected response".into()),
-    }
+    gate()?;
+    ks_sdk::unlock(id).map_err(reason)
 }
 
 pub fn unlock_all(pid: u64) -> Result<(), String> {
-    let resp = ipc_send(&Request::ClearMemoryLocks { pid })?;
-    match decode_ok(&resp)? {
-        Response::LockComplete => Ok(()),
-        Response::Error(code) => Err(format!("service error: {code}")),
-        Response::ErrorDetail(detail) => Err(String::from_utf8_lossy(detail).into_owned()),
-        _ => Err("unexpected response".into()),
-    }
+    gate()?;
+    ks_sdk::unlock_all(pid).map_err(reason)
 }
 
 pub fn lock_rva(id: u64, pid: u64, relative_address: u64, data: &[u8]) -> Result<(), String> {
-    let resp = ipc_send(&Request::LockMemoryRva {
-        pid,
-        id,
-        relative_address,
-        data,
-    })?;
-    match decode_ok(&resp)? {
-        Response::LockComplete => Ok(()),
-        Response::Error(code) => Err(format!("service error: {code}")),
-        Response::ErrorDetail(detail) => Err(String::from_utf8_lossy(detail).into_owned()),
-        _ => Err("unexpected response".into()),
-    }
+    gate()?;
+    ks_sdk::lock_rva(id, pid, relative_address, data).map_err(reason)
 }
 
 pub fn unlock_rva(id: u64) -> Result<(), String> {
-    let resp = ipc_send(&Request::UnlockMemoryRva { id })?;
-    match decode_ok(&resp)? {
-        Response::LockComplete => Ok(()),
-        Response::Error(code) => Err(format!("service error: {code}")),
-        Response::ErrorDetail(detail) => Err(String::from_utf8_lossy(detail).into_owned()),
-        _ => Err("unexpected response".into()),
-    }
+    gate()?;
+    ks_sdk::unlock_rva(id).map_err(reason)
 }

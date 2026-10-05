@@ -23,11 +23,12 @@ end
 说明：
 
 - `OnStart` 在脚本加载后调用一次。
-- `OnUpdate` 是唯一的每帧回调。覆盖层帧率封顶 60Hz。
+- `OnUpdate(delta_time)` 是唯一的每帧回调。`delta_time` 是距离上一帧的秒数；
+  engine 暂停时为 `0`。覆盖层帧率封顶 60Hz。
 - UI 和 draw API 都在 `OnUpdate` 中使用。
 - 键盘状态在每帧 `OnUpdate` 之前快照一次；同帧内查询与按下沿锁存保持一致。
 - `OnDestroy` 在热重载或 GUI 退出时调用。
-- 所有内存 API 调用都是同步的，阻塞 Lua 线程约 60-100μs。
+- 所有内存 API 调用都是同步的，阻塞 Lua 线程约 10-15μs。
 - 如果延迟敏感，不要在 `ui.window` 回调中调用内存 API。
 
 ## Process API
@@ -68,7 +69,7 @@ local a = "140702365450240"
 local b = "0x7FF812345000"
 ```
 
-地址 `0` 会提交给后台请求，最终由 service/driver 返回错误；它不会在 GUI
+地址 `0` 会提交给驱动，由其返回错误；它不会在 GUI
 渲染回调入口同步抛错。负数地址和不支持的 Lua 类型会在参数转换阶段拒绝。
 
 ### memory.read_i32
@@ -239,18 +240,19 @@ end
 
 ## Memory Lock API（内存锁定）
 
-Memory lock 以批量写往返允许的速度持续向目标地址重写指定字节模式。锁由显式
-`id` 唯一标识；使用相同 id 再次 lock 会更新 PID、地址和数据。
+Memory lock 以内核速度持续向目标地址重写指定字节模式：每次 lock 调用以一次
+往返修改 driver 内部的锁表，由 driver 的 worker 线程在请求间隙逐条重放。锁由
+显式 `id` 唯一标识；使用相同 id 再次 lock 会更新 PID、地址和数据。
 
-锁表位于 `ks-service`：专用重写线程以连续自旋将每条锁通过一次批量写
-（`IOCTL_WRITE_MEMORY_BATCH`）重放。Driver 不
-保存任何锁状态。锁表最多 64 条，每条 1–4096 字节。
-所有写入与普通 `memory.write_*` 使用完全相同的内核原语。
+锁表位于 driver（`ks-driver/src/lock.rs`）：表非空时 worker 只轮询请求事件
+（请求始终优先处理），每轮循环重写一条锁；表为空时阻塞在请求事件上，空闲
+driver 不消耗 CPU。锁表最多 64 条，每条 1–4096 字节。所有写入与普通
+`memory.write_*` 使用完全相同的内核原语。
 
 ### memory.lock
 
-将字节模式锁定到绝对地址。Service 持续将 `data` 写入目标进程的 `address`，
-直到 unlock。
+将字节模式锁定到绝对地址。driver 持续将 `data` 写入目标进程的
+`address`，直到 unlock。
 
 ```lua
 memory.lock(1, pid, address, {0x90, 0x90, 0x90, 0xC3})
@@ -275,7 +277,7 @@ memory.unlock_all(pid)
 
 ### memory.lock_rva
 
-将字节模式锁定到 `base + relative_address`。Service 在创建锁时解析 image
+将字节模式锁定到 `base + relative_address`。`ks-link` 在创建锁时解析 image
 base（与 `get_process_base` 相同）。
 
 ```lua
@@ -292,11 +294,13 @@ memory.unlock_rva(2)
 
 约束：
 
-- 所有 lock API 均为同步调用，仅更新 service 锁表。
-- 周期性写入在 `ks-service` 中执行，不在 driver 中。
+- 所有 lock API 均为同步调用，每次调用以一次往返修改 driver 侧锁表。
+- 周期性写入在 driver 中执行，不在 `ks-link` 中。
 - 每条锁数据大小：1–4096 字节。
-- 最大锁数量：64 条（service 全局）。
-- Service 停止时所有锁自动清除。
+- 最大锁数量：64 条（driver 全局）。锁表满后新的锁 id 会返回“条目过多”错误。
+- 锁由 `unlock`/`unlock_all`、停止 driver 以及 driver shutdown 清除。
+  **客户端进程退出时锁不会自动清除**：脚本宿主崩溃后其锁会继续重写，
+  直到停止 driver。
 
 ## MDL Memory API
 
@@ -397,7 +401,7 @@ print(addr)
 
 ### memory.batch_write
 
-在单次 service 往返和单次内核转换（`IOCTL_WRITE_MEMORY_BATCH`）内应用多条
+在单次 ring 往返和单次内核转换内应用多条
 写入：整批只做一次进程查找，每条写入返回一个 NTSTATUS。
 
 ```lua
@@ -715,7 +719,7 @@ local state = {
 }
 
 function OnUpdate(dt)
-    -- 所有内存调用都是同步的（每次约 60-100μs）
+    -- 所有内存调用都是同步的（每次约 10-15μs）
     ui.window("Kernel Script", function()
         if ui.button("附加") then
             state.pid = memory.get_pid(state.process_name)
@@ -744,33 +748,35 @@ end
 
 ## IPC 架构
 
-GUI 到 service 的 IPC 使用同步阻塞 Named Pipe 调用：
+GUI 到驱动的传输是同步共享内存 ring：
 
-1. **GUI 侧**：每次内存 API 调用打开一个阻塞管道连接（或复用线程本地连接），
-   写入帧请求，同步读取响应。
-2. **Service 侧**：`handle_client` 从管道 decoder 读取帧，
-   每帧 `spawn_blocking` 在 Tokio blocking pool 上并发执行。
-3. **零锁 IOCTL**：驱动 handle 以 `Arc<DriverHandle>` 共享。每个 blocking task
-   直接调用 `DeviceIoControl`，无需获取 mutex。Windows I/O manager 内部序列化 IRP。
+1. **Lua 侧**：每次内存 API 调用阻塞 GUI Lua 线程直到往返完成
+   （`sync_ipc` 基于 `ks-link`）。
+2. **客户端侧**：`ks-link` 在持有命名互斥体的前提下将 postcard 编码的请求
+   写入唯一请求槽，置位请求事件发布，然后等待响应事件（驱动 5 秒内未取走
+   的请求会被取消）。
+3. **驱动侧**：一个 worker 系统线程服务该槽：解码并校验请求，执行内存
+   操作，再以匹配的序列号发布响应。
 
-往返延迟：每次调用约 60-100μs。在 60fps（16.6ms 帧预算）下，每帧可以轻松
-执行 100+ 次同步内存读取。
+往返延迟：每次调用约 10-15μs。在 60fps（16.6ms 帧预算）下，每帧可以轻松
+执行 500+ 次同步内存读取。
 
 ## Runtime Constraints
 
 - Lua VM 只在 GUI Lua 线程访问。
-- 所有内存 API 调用都是同步的，阻塞 Lua 线程约 60-100μs。
+- 所有内存 API 调用都是同步的，阻塞 Lua 线程约 10-15μs。
 - 单次内存读写最多 4096 字节。
 - 批量读取限制：最多 256 个条目，总计 4096 字节。
-- 内存锁限制：64 条，每条最多 4096 字节；连续自旋重放，每轮 sweep 一次
-  批量写 IOCTL。
-- 进程列表由 service 在用户态枚举。
+- 内存锁限制：64 条，每条最多 4096 字节；由 driver worker 在请求间隙重放
+  （持锁期间轮询，锁表为空时阻塞等待）。
+- 进程列表由 `ks-link` 在用户态枚举（Toolhelp）。
 - 内存读写和 RVA 计算由 driver 执行。
 - 窗口枚举在 GUI 进程（用户会话）中执行。
 - Draw 命令必须在 `OnUpdate` 中调用。
 - 坐标单位为 egui 逻辑点；物理像素需除以 `content_scale` 才能正确对齐。
-- 服务传输使用 `\\.\pipe\KernelScript` Named Pipe。
-- Named Pipe 和 driver device 的权限由 Windows 安全描述符控制。
-- Driver 使用普通内存 IOCTL 常量；PID、绝对地址、RVA/基址/指针偏移以及批量和
-  指针链条目中的敏感整数均按显式小端序明文传输。大小、数量和数据继续保持明文，
-  并使用相同的显式线格式。
+- 传输使用一个命名 section 加两个命名事件（外加客户端互斥体），全部由
+  driver 创建。
+- 内核对象由手工构建的 DACL 保护，仅授予 SYSTEM 和 Administrators；
+  driver 不暴露设备对象。
+- 线格式为 postcard（LEB128 变长整数 + 小端定长字段）；`RING_VERSION`
+  为每次布局变更兜底。

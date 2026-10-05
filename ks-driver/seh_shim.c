@@ -8,92 +8,6 @@
  */
 #include <ntifs.h>
 
-int ks_load_ioctl_key(PUNICODE_STRING registry_path, UCHAR *key)
-{
-    UNICODE_STRING path;
-    UNICODE_STRING value_name;
-    OBJECT_ATTRIBUTES attributes;
-    HANDLE handle = NULL;
-    UCHAR storage[sizeof(KEY_VALUE_PARTIAL_INFORMATION) + 32] = {0};
-    PKEY_VALUE_PARTIAL_INFORMATION value =
-        (PKEY_VALUE_PARTIAL_INFORMATION)storage;
-    NTSTATUS status;
-
-    UNREFERENCED_PARAMETER(registry_path);
-    RtlInitUnicodeString(
-        &path,
-        L"\\Registry\\Machine\\SYSTEM\\CurrentControlSet\\Control\\KernelScript");
-    RtlInitUnicodeString(&value_name, L"IoctlKey");
-    InitializeObjectAttributes(
-        &attributes, &path, OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE,
-        NULL, NULL);
-
-    status = ZwOpenKey(&handle, KEY_QUERY_VALUE, &attributes);
-    if (!NT_SUCCESS(status)) {
-        return 0;
-    }
-    ULONG returned = 0;
-    status = ZwQueryValueKey(
-        handle, &value_name, KeyValuePartialInformation,
-        value, sizeof(storage), &returned);
-    ObCloseHandle(handle, KernelMode);
-    if (!NT_SUCCESS(status) || value->Type != REG_BINARY ||
-        value->DataLength != 32) {
-        return 0;
-    }
-    RtlCopyMemory(key, value->Data, 32);
-    return 1;
-}
-
-static const GUID KS_DEVICE_CLASS_GUID = {
-    0x7d7f1e42, 0x3c5f, 0x4c3d,
-    { 0x9a, 0x81, 0x4d, 0x6e, 0x3b, 0x5f, 0x19, 0x72 }
-};
-
-static PEPROCESS g_trusted_process = NULL;
-
-NTSTATUS ks_authorize_device_request(PIRP irp)
-{
-    PIO_STACK_LOCATION stack = IoGetCurrentIrpStackLocation(irp);
-    PEPROCESS current = PsGetCurrentProcess();
-
-    if (stack->MajorFunction == IRP_MJ_CREATE) {
-        if (InterlockedCompareExchangePointer(
-                (PVOID volatile *)&g_trusted_process, current, NULL) == NULL) {
-            ObReferenceObject(current);
-            return STATUS_SUCCESS;
-        }
-        return g_trusted_process == current ? STATUS_SUCCESS : STATUS_ACCESS_DENIED;
-    }
-
-    if (stack->MajorFunction == IRP_MJ_CLOSE) {
-        if (g_trusted_process == current &&
-            InterlockedCompareExchangePointer(
-                (PVOID volatile *)&g_trusted_process, NULL, current) == current) {
-            ObDereferenceObject(current);
-        }
-        return STATUS_SUCCESS;
-    }
-
-    return g_trusted_process == current ? STATUS_SUCCESS : STATUS_ACCESS_DENIED;
-}
-
-NTSTATUS ks_create_secure_device(
-    PDRIVER_OBJECT driver,
-    PUNICODE_STRING device_name,
-    PDEVICE_OBJECT *device
-)
-{
-    // Only LocalSystem may open the device. The service runs as SYSTEM; an
-    // administrator token is intentionally not granted direct device access.
-    UNICODE_STRING sddl = RTL_CONSTANT_STRING(L"D:P(A;;GA;;;SY)");
-    return WdmlibIoCreateDeviceSecure(
-        driver, 0, device_name, FILE_DEVICE_UNKNOWN,
-        FILE_DEVICE_SECURE_OPEN, TRUE, &sddl,
-        (LPGUID)&KS_DEVICE_CLASS_GUID, device
-    );
-}
-
 NTSTATUS ks_probe_and_lock_pages(
     PMDL mdl,
     KPROCESSOR_MODE mode,
@@ -107,32 +21,6 @@ NTSTATUS ks_probe_and_lock_pages(
     __except (EXCEPTION_EXECUTE_HANDLER) {
         return (NTSTATUS)GetExceptionCode();
     }
-}
-
-/* These WDK helpers are macros/inline definitions, not linkable exports. */
-PIO_STACK_LOCATION ks_get_current_irp_stack_location(PIRP irp)
-{
-    return IoGetCurrentIrpStackLocation(irp);
-}
-
-ULONG ks_get_ioctl_code(PIRP irp)
-{
-    return IoGetCurrentIrpStackLocation(irp)->Parameters.DeviceIoControl.IoControlCode;
-}
-
-ULONG ks_get_input_buffer_length(PIRP irp)
-{
-    return IoGetCurrentIrpStackLocation(irp)->Parameters.DeviceIoControl.InputBufferLength;
-}
-
-ULONG ks_get_output_buffer_length(PIRP irp)
-{
-    return IoGetCurrentIrpStackLocation(irp)->Parameters.DeviceIoControl.OutputBufferLength;
-}
-
-PVOID ks_get_system_buffer(PIRP irp)
-{
-    return irp->AssociatedIrp.SystemBuffer;
 }
 
 NTSTATUS ks_copy_process_memory(
@@ -171,18 +59,6 @@ NTSTATUS ks_write_process_memory(
         KernelMode,
         copied
     );
-}
-
-PVOID ks_get_system_address_for_mdl_safe(PMDL mdl, ULONG priority)
-{
-    return MmGetSystemAddressForMdlSafe(mdl, priority);
-}
-
-void ks_complete_irp(PIRP irp, NTSTATUS status, ULONG_PTR information, CCHAR priority)
-{
-    irp->IoStatus.Status = status;
-    irp->IoStatus.Information = information;
-    IofCompleteRequest(irp, priority);
 }
 
 /*

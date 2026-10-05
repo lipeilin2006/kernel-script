@@ -23,12 +23,14 @@ end
 Notes:
 
 - `OnStart` is called once after the script is loaded.
-- `OnUpdate` is the only per-frame callback. The overlay frame rate is capped at 60 Hz.
+- `OnUpdate(delta_time)` is the only per-frame callback. `delta_time` is the
+  elapsed time since the previous frame in seconds; it is `0` while the engine
+  is paused. The overlay frame rate is capped at 60 Hz.
 - UI and draw APIs are available during `OnUpdate`.
 - Keyboard state is snapshotted once per frame before `OnUpdate`; queries and
   press latches are consistent within a frame.
 - `OnDestroy` is called on hot-reload or GUI exit.
-- All memory API calls are synchronous and block the Lua thread for ~60-100μs.
+- All memory API calls are synchronous and block the Lua thread for ~10-15μs.
 - Do not call memory APIs inside `ui.window` callbacks if latency is critical.
 
 ## Process API
@@ -69,7 +71,7 @@ local a = "140702365450240"
 local b = "0x7FF812345000"
 ```
 
-Address `0` is forwarded to the service/driver which returns an error; it does
+Address `0` is forwarded to the driver which returns an error; it does
 not throw synchronously in the GUI render callback. Negative addresses and
 unsupported Lua types are rejected at parameter conversion time.
 
@@ -248,20 +250,23 @@ end
 
 ## Memory Lock API
 
-Memory lock continuously rewrites a byte pattern to a target address as fast
-as the batch driver round trip allows. Each lock has an explicit stable `id`;
-locking the same id again updates its PID, address, and data.
+Memory lock continuously rewrites a byte pattern to a target address at
+kernel speed: the call mutates a driver-side lock table in a single round
+trip, and the driver's worker thread replays entries between requests.
+Each lock has an explicit stable `id`; locking the same id again updates
+its PID, address, and data.
 
-The lock table lives in `ks-service`: a dedicated rewrite thread replays
-every entry through one batch write (`IOCTL_WRITE_MEMORY_BATCH`) in a
-continuous spin. The driver keeps no
-lock state. The table supports up to 64 entries, each 1–4096 bytes. All
-writes use the same kernel primitive as ordinary `memory.write_*` calls.
+The lock table lives in the driver (`ks-driver/src/lock.rs`): while any
+lock is held the worker only polls the request event (so pending requests
+are always handled first) and rewrites one entry per loop pass; when the
+table is empty it blocks on the request event, so an idle driver burns no
+CPU. The table supports up to 64 entries, each 1–4096 bytes. All writes
+use the same kernel primitive as ordinary `memory.write_*` calls.
 
 ### memory.lock
 
-Locks a byte pattern to an absolute address. The service rewrites `data` to
-`address` in the target process continuously until unlocked.
+Locks a byte pattern to an absolute address. The driver keeps rewriting
+`data` to `address` in the target process until unlocked.
 
 ```lua
 memory.lock(1, pid, address, {0x90, 0x90, 0x90, 0xC3})
@@ -287,7 +292,7 @@ memory.unlock_all(pid)
 
 ### memory.lock_rva
 
-Locks a byte pattern at `base + relative_address`. The service resolves the
+Locks a byte pattern at `base + relative_address`. `ks-link` resolves the
 image base when the lock is created (same base as `get_process_base`).
 
 ```lua
@@ -304,11 +309,16 @@ memory.unlock_rva(2)
 
 Constraints:
 
-- All lock APIs are synchronous; they only update the service lock table.
-- The periodic write runs in `ks-service`, not in the driver.
+- All lock APIs are synchronous; each one is a single round trip that
+  mutates the driver-side lock table.
+- The periodic write runs in the driver, not in `ks-link`.
 - Data size per lock: 1–4096 bytes.
-- Maximum locks: 64 (service-wide).
-- Locks are cleared when the service stops.
+- Maximum locks: 64 (driver-wide). When the table is full, a further
+  distinct lock id fails with a "too many entries" error.
+- Locks are cleared by `unlock`/`unlock_all`, by stopping the driver, and
+  by driver shutdown. They are NOT cleared when the client process exits:
+  a crashed script host leaves its locks rewriting until the driver is
+  stopped.
 
 ## MDL Memory API
 
@@ -415,9 +425,8 @@ null or unreadable.
 
 ### memory.batch_write
 
-Applies multiple writes in one service round trip and one kernel transition
-(`IOCTL_WRITE_MEMORY_BATCH`): one process lookup for the whole batch, one
-NTSTATUS per entry.
+Applies multiple writes in one ring round trip and one kernel transition:
+one process lookup for the whole batch, one NTSTATUS per entry.
 
 ```lua
 local results = memory.batch_write(pid, {
@@ -734,7 +743,7 @@ local state = {
 }
 
 function OnUpdate(dt)
-    -- All memory calls are synchronous (~60-100μs each)
+    -- All memory calls are synchronous (~10-15μs each)
     ui.window("Kernel Script", function()
         if ui.button("Attach") then
             state.pid = memory.get_pid(state.process_name)
@@ -763,38 +772,39 @@ end
 
 ## IPC Architecture
 
-The GUI-to-service IPC uses synchronous blocking named pipe calls:
+The GUI-to-driver transport is a synchronous shared-memory ring:
 
-1. **GUI side**: Each memory API call opens a blocking pipe connection (or
-   reuses a thread-local connection), writes the framed request, and reads
-   the response synchronously.
-2. **Service side**: `handle_client` reads frames from the pipe decoder,
-   spawns each as a `spawn_blocking` task on Tokio's blocking pool.
-3. **Zero-mutex IOCTL**: The driver handle is shared as `Arc<DriverHandle>`.
-   Each blocking task calls `DeviceIoControl` directly without acquiring a
-   mutex. Windows I/O manager serializes IRPs internally.
+1. **Lua side**: each memory API call blocks the GUI Lua thread until the
+   round trip completes (`sync_ipc` over `ks-link`).
+2. **Client side**: `ks-link` serializes a postcard-encoded request into
+   the single request slot while holding a named mutex, publishes it by
+   setting the request event, and waits for the response event (a request
+   the driver never picks up is cancelled after 5 seconds).
+3. **Driver side**: one worker system thread services the slot: it decodes
+   and validates the request, performs the memory operation, and publishes
+   the response with a matching sequence number.
 
-Round-trip latency: ~60-100μs per call. At 60fps (16.6ms frame budget), you
-can comfortably fit 100+ synchronous memory reads per frame.
+Round-trip latency: ~10-15μs per call. At 60fps (16.6ms frame budget), you
+can comfortably fit 500+ synchronous memory reads per frame.
 
 ## Runtime Constraints
 
 - Lua VM is only accessed by the GUI Lua thread.
-- All memory API calls are synchronous and block the Lua thread for ~60-100μs.
+- All memory API calls are synchronous and block the Lua thread for ~10-15μs.
 - Single memory read/write limit: 4096 bytes.
 - Batch read limit: 256 entries, 4096 bytes total.
-- Memory lock limit: 64 entries, 4096 bytes per entry; rewritten continuously
-  through one batch write IOCTL per sweep.
-- Process list is enumerated in user mode by the service.
+- Memory lock limit: 64 entries, 4096 bytes per entry; replayed by the
+  driver worker between requests (poll while locks are held, blocking
+  wait when the table is empty).
+- Process list is enumerated in user mode by `ks-link` (Toolhelp).
 - Memory read/write and RVA computation are performed by the driver.
 - Window rect enumeration runs in the GUI process (user session).
 - Draw commands must be called inside `OnUpdate`.
 - Coordinates are in egui logical points; divide physical pixels by
   `content_scale` for correct overlay alignment.
-- Transport uses the `\\.\pipe\KernelScript` Named Pipe.
-- Named Pipe and driver device access are controlled by Windows security
-  descriptors.
-- Driver requests use the ordinary memory IOCTL constants. Sensitive integer
-  fields (PID, absolute address, RVA/base/pointer offsets, including batch and
-  pointer-chain entries) are plain little-endian values. Sizes, counts, and
-  memory data remain plaintext in the same explicitly encoded layouts.
+- Transport is one named section plus two named events (plus a
+  client-side mutex), all created by the driver.
+- Kernel objects are protected by a hand-built DACL granting SYSTEM and
+  Administrators; the driver exposes no device object.
+- The wire format is postcard (LEB128 varints + little-endian fixed
+  fields); `RING_VERSION` guards every layout change.

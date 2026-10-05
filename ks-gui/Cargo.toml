@@ -5,7 +5,8 @@ edition.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-ks-core = { workspace = true, features = ["alloc"] }
+ks-core.workspace = true
+ks-sdk.workspace = true
 egui_overlay.workspace = true
 egui.workspace = true
 glow = "0.13"

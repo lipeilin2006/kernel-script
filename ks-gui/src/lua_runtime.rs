@@ -1,10 +1,9 @@
-use std::fs;
+﻿use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
-use egui;
 use mlua::{Function, Lua, Table, Value};
 
 mod engine_api;
@@ -24,7 +23,7 @@ pub fn set_content_scale(scale: f32) {
 
 use types::Address;
 
-// The whole overlay (render + OnUpdate) is capped at 100 frames per second by
+// The whole overlay (render + OnUpdate) is capped at 60 frames per second by
 // the repaint interval in app.rs. OnUpdate runs once per rendered frame, which
 // keeps immediate-mode egui windows stable; a slow callback simply lowers the
 // achieved frequency.
@@ -1051,7 +1050,7 @@ fn register_memory_api(lua: &Lua) -> mlua::Result<()> {
 
     // memory.batch_write(pid, writes) -> {bool, ...}
     // `writes` is an array of {address, data} tables; `data` is a byte
-    // table. All entries are applied in a single service round trip and a
+    // table. All entries are applied in a single ring round trip and a
     // single kernel transition; the returned table holds one success flag
     // per entry, in input order.
     module.set(

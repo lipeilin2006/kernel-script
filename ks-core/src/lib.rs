@@ -1,49 +1,18 @@
-#![no_std]
+#![cfg_attr(not(test), no_std)]
 
-#[cfg(feature = "alloc")]
-extern crate alloc;
-
-pub mod memory;
 pub mod protocol;
+pub mod ring;
 
-pub mod crypto {
-    pub const KEY_LEN: usize = 32;
-    pub const FALLBACK_KEY: [u8; KEY_LEN] = *b"KS-XOR-obfuscation-key-2026!!!!!";
-
-    pub const PID: usize = 0;
-    pub const ADDRESS: usize = 1;
-    pub const RVA: usize = 2;
-    pub const BASE: usize = 3;
-    pub const OFFSET: usize = 4;
-    pub const RESULT: usize = 5;
-
-    #[inline]
-    pub fn xor_u64(value: u64, key: &[u8; KEY_LEN], field: usize) -> u64 {
-        let mut bytes = value.to_le_bytes();
-        let start = (field * 8) % KEY_LEN;
-        let mut index = 0;
-        while index < bytes.len() {
-            bytes[index] ^= key[(start + index) % KEY_LEN];
-            index += 1;
-        }
-        u64::from_le_bytes(bytes)
-    }
-
-    #[cfg(test)]
-    mod tests {
-        use super::*;
-
-        #[test]
-        fn xor_is_reversible() {
-            let value = 0x1234_5678_9abc_def0;
-            assert_eq!(
-                xor_u64(xor_u64(value, &FALLBACK_KEY, 7), &FALLBACK_KEY, 7),
-                value
-            );
-        }
-    }
-}
-
-#[cfg(feature = "alloc")]
-pub use protocol::FrameDecoder;
-pub use protocol::{Frame, MessageType, ProtocolError, WireDecode, WireEncode};
+pub use protocol::{
+    decode_request, decode_response_meta, encode_request, encode_response_meta, BatchWriteItem,
+    ProtocolError, Request, ResponseMeta, MAX_BATCH_ENTRIES, MAX_BATCH_WRITE_ENTRIES,
+    MAX_CHAIN_OFFSETS, MAX_DRIVER_TRANSFER_SIZE, MAX_MEMORY_LOCKS, MAX_MEMORY_LOCK_SIZE,
+    MAX_WRITE_SIZE,
+};
+pub use ring::{
+    header, request_bytes, response_bytes, RingHeader, REQUEST_EVENT_CLIENT_NAME,
+    REQUEST_EVENT_KERNEL_NAME, REQUEST_SIZE, RESPONSE_BULK_SIZE, RESPONSE_EVENT_CLIENT_NAME,
+    RESPONSE_EVENT_KERNEL_NAME, RESPONSE_META_SIZE, RESPONSE_SIZE, RING_MAGIC,
+    RING_MUTEX_CLIENT_NAME, RING_TOTAL_SIZE, RING_VERSION, SECTION_CLIENT_NAME,
+    SECTION_KERNEL_NAME, STATE_IDLE, STATE_PROCESSING, STATE_REQUEST, STATE_RESPONSE,
+};

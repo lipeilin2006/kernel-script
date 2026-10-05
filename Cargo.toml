@@ -2,9 +2,9 @@
 members = [
     "ks-core",
     "ks-driver",
-    "ks-service",
+    "ks-link",
+    "ks-sdk",
     "ks-gui",
-    "ks-launcher",
     "ks-test",
 ]
 resolver = "2"
@@ -16,15 +16,14 @@ rust-version = "1.85"
 
 [workspace.dependencies]
 ks-core = { path = "ks-core", default-features = false }
+ks-link = { path = "ks-link" }
+ks-sdk = { path = "ks-sdk" }
 
 egui_overlay = { version = "0.9.0", default-features = false, features = ["egui_default", "glfw_default", "three_d"] }
 egui = { version = "0.29", default-features = false }
 eframe = { version = "0.27.2", default-features = false, features = ["default_fonts", "glow"] }
 windows-sys = "0.61.2"
-windows-service = "0.8.1"
 mlua = { version = "0.12.0", features = ["luau-jit", "vendored", "send"] }
-tokio = "1.53.1"
-bytes = "1.10.1"
 encoding_rs = "0.8"
 tracing = "0.1.44"
 tracing-subscriber = "0.3.20"

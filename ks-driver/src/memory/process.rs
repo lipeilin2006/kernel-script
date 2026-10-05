@@ -1,7 +1,7 @@
 use core::{ffi::c_void, ptr};
 
 use crate::wdm::*;
-use ks_core::protocol::MAX_DRIVER_TRANSFER_SIZE;
+use ks_core::protocol::{BatchWriteItem, MAX_DRIVER_TRANSFER_SIZE};
 
 /// RAII owner for the reference returned by PsLookupProcessByProcessId.
 struct ProcessRef(isize);
@@ -50,14 +50,18 @@ fn mdl_access(
         )
     };
     if mdl.is_null() {
-        unsafe { KeUnstackDetachProcess(&mut apc_state) };
+        unsafe { KeUnstackDetachProcess(&apc_state) };
         return Err(STATUS_INSUFFICIENT_RESOURCES);
     }
     // This function is implemented in a tiny WDK/MSVC shim using
     // __try/__except around MmProbeAndLockPages. Rust cannot catch SEH with
     // catch_unwind, and allowing an exception across Rust frames is invalid.
-    let status = unsafe { ks_probe_and_lock_pages(mdl, KernelMode as i8, IoReadAccess) };
-    unsafe { KeUnstackDetachProcess(&mut apc_state) };
+    // The probe mode MUST be UserMode: for a user VA, UserMode probing
+    // raises STATUS_ACCESS_VIOLATION on failure, which the shim catches;
+    // KernelMode probing asserts the caller already validated the pages and
+    // bugchecks (PAGE_FAULT_IN_NONPAGED_AREA) instead of raising.
+    let status = unsafe { ks_probe_and_lock_pages(mdl, UserMode as i8, IoReadAccess) };
+    unsafe { KeUnstackDetachProcess(&apc_state) };
     if !nt_success(status) {
         unsafe {
             IoFreeMdl(mdl);
@@ -112,41 +116,31 @@ pub fn write_process_memory_mdl(
     })
 }
 
-/// One prepared batch-write entry. `data` must point into memory that stays
-/// valid for the duration of the call (the METHOD_BUFFERED system buffer).
-#[derive(Clone, Copy)]
-pub struct BatchWriteEntry {
-    pub process_id: u64,
-    pub address: u64,
-    pub data: *const u8,
-    pub len: usize,
-}
-
+/// One prepared batch-write entry. `data` borrows straight out of the ring,
+/// which stays mapped for the whole request.
+///
 /// Writes every entry in one pass, resolving each distinct process only
 /// once: `PsLookupProcessByProcessId` per entry dominated the batch cost
 /// when all locks target the same game. Entries with invalid parameters or
 /// a failed lookup are skipped and their status slot reports why.
-///
-/// Safety: every `data` pointer must be valid for `len` bytes, and each
-/// address must be a user-mode address in the entry's target process.
-pub unsafe fn batch_write_process_memory(entries: &[BatchWriteEntry], statuses: &mut [NTSTATUS]) {
+pub fn batch_write_process_memory(writes: &[BatchWriteItem<'_>], statuses: &mut [NTSTATUS]) {
     let mut cached: Option<(u64, ProcessRef)> = None;
-    for (entry, slot) in entries.iter().zip(statuses.iter_mut()) {
-        if entry.process_id == 0
-            || entry.address == 0
-            || entry.len == 0
-            || entry.len > MAX_DRIVER_TRANSFER_SIZE
+    for (item, slot) in writes.iter().zip(statuses.iter_mut()) {
+        if item.pid == 0
+            || item.address == 0
+            || item.data.is_empty()
+            || item.data.len() > MAX_DRIVER_TRANSFER_SIZE
         {
             *slot = STATUS_INVALID_PARAMETER;
             continue;
         }
         let cached_same = matches!(
             cached.as_ref(),
-            Some((pid, _)) if *pid == entry.process_id
+            Some((pid, _)) if *pid == item.pid
         );
         if !cached_same {
-            match lookup(entry.process_id) {
-                Ok(process) => cached = Some((entry.process_id, process)),
+            match lookup(item.pid) {
+                Ok(process) => cached = Some((item.pid, process)),
                 Err(status) => {
                     cached = None;
                     *slot = status;
@@ -154,22 +148,24 @@ pub unsafe fn batch_write_process_memory(entries: &[BatchWriteEntry], statuses: 
                 }
             }
         }
-        let process = match cached.as_ref() {
-            Some((_, process)) => process.0,
-            None => unreachable!("process cached above"),
+        let Some((_, process)) = cached.as_ref() else {
+            *slot = STATUS_INVALID_PARAMETER;
+            continue;
         };
-        let data = core::slice::from_raw_parts(entry.data, entry.len);
+        let process = process.0;
         let mut copied = 0usize;
-        let status = ks_write_process_memory(
-            process,
-            data.as_ptr() as Pvoid,
-            entry.address as Pvoid,
-            entry.len,
-            &mut copied,
-        );
+        let status = unsafe {
+            ks_write_process_memory(
+                process,
+                item.data.as_ptr() as Pvoid,
+                item.address as Pvoid,
+                item.data.len(),
+                &mut copied,
+            )
+        };
         *slot = if !nt_success(status) {
             status
-        } else if copied == entry.len {
+        } else if copied == item.data.len() {
             STATUS_SUCCESS
         } else {
             STATUS_ACCESS_VIOLATION
@@ -239,8 +235,8 @@ pub fn write_process_memory(process_id: u64, address: u64, data: &[u8]) -> Resul
 }
 
 /// Batch-read multiple memory regions from a target process with a single
-/// process lookup. Each entry reads `size` bytes from `address` into the
-/// output buffer contiguously (no size prefix, no padding).
+/// process lookup. Each address reads `size` bytes into the output buffer
+/// contiguously (no size prefix, no padding).
 ///
 /// Invalid addresses (null or unreadable) are skipped and zero-filled in the
 /// output buffer so that valid entries are still returned.
@@ -248,26 +244,28 @@ pub fn write_process_memory(process_id: u64, address: u64, data: &[u8]) -> Resul
 /// Returns the total number of bytes written to `output`.
 pub fn batch_read_process_memory(
     process_id: u64,
-    entries: &[(u64, u32)],
+    addresses: &[u64],
+    size: usize,
     output: &mut [u8],
 ) -> Result<usize, NTSTATUS> {
-    if entries.is_empty() || process_id == 0 {
+    if addresses.is_empty() || process_id == 0 {
         return Err(STATUS_INVALID_PARAMETER);
     }
+    if size == 0 || size > MAX_DRIVER_TRANSFER_SIZE {
+        return Err(STATUS_INVALID_PARAMETER);
+    }
+    let total = addresses
+        .len()
+        .checked_mul(size)
+        .ok_or(STATUS_INTEGER_OVERFLOW)?;
+    if output.len() < total {
+        return Err(STATUS_BUFFER_TOO_SMALL);
+    }
     let process = lookup(process_id)?;
-    let mut out_off = 0usize;
-    for &(address, size) in entries {
-        if size == 0 || size > MAX_DRIVER_TRANSFER_SIZE as u32 {
-            return Err(STATUS_INVALID_PARAMETER);
-        }
-        let size = size as usize;
-        if out_off + size > output.len() {
-            return Err(STATUS_BUFFER_TOO_SMALL);
-        }
-        let data_slice = &mut output[out_off..out_off + size];
+    for (index, &address) in addresses.iter().enumerate() {
+        let data_slice = &mut output[index * size..(index + 1) * size];
         if address == 0 {
             data_slice.fill(0);
-            out_off += size;
             continue;
         }
         let mut copied = 0usize;
@@ -280,14 +278,11 @@ pub fn batch_read_process_memory(
                 &mut copied,
             )
         };
-        if nt_success(status) && copied == size {
-            out_off += size;
-        } else {
+        if !nt_success(status) || copied != size {
             data_slice.fill(0);
-            out_off += size;
         }
     }
-    Ok(out_off)
+    Ok(total)
 }
 
 /// Walk a pointer chain in a target process. Starting from `base`, read a u64

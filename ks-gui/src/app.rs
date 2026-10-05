@@ -19,6 +19,8 @@ mod win32 {
     use std::ffi::c_void;
 
     #[repr(C)]
+    #[allow(non_camel_case_types)]
+    #[allow(clippy::upper_case_acronyms)]
     pub struct MARGINS {
         pub cx_left_width: i32,
         pub cx_right_width: i32,
@@ -44,6 +46,7 @@ mod win32 {
 
 struct KernelScriptApp {
     runtime: LuaRuntimeManager,
+    driver: crate::driver::DriverControl,
     fonts_installed: bool,
     ui_visible: bool,
     insert_was_down: bool,
@@ -56,8 +59,12 @@ impl KernelScriptApp {
             .map(|p| p.to_path_buf())
             .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
         let script_dir = exe_dir.join("scripts");
+        // The manager runs every script's OnStart before this, so no Lua
+        // round trip can overlap the probe the control spawns in `new`.
+        let runtime = LuaRuntimeManager::new(script_dir)?;
         Ok(Self {
-            runtime: LuaRuntimeManager::new(script_dir)?,
+            driver: crate::driver::DriverControl::new(),
+            runtime,
             fonts_installed: false,
             ui_visible: true,
             insert_was_down: false,
@@ -76,8 +83,10 @@ impl EguiOverlay for KernelScriptApp {
         // Cap the whole overlay (render + OnUpdate) at 60 FPS so egui windows
         // stay stable and slow Lua callbacks simply lower the frame rate.
         ctx.request_repaint_after(crate::lua_runtime::FRAME_INTERVAL);
-        // Insert toggles the egui script windows only; Lua keeps running and
-        // the draw.* overlay layer stays visible while the UI is hidden.
+        // Insert toggles the egui script windows only (the KernelScript
+        // window stays so the driver state remains visible and the GUI
+        // closable); Lua keeps running and the draw.* overlay layer stays
+        // visible while the UI is hidden.
         // GetAsyncKeyState reads the physical key state of the whole desktop,
         // so the toggle works while another window (the game) owns input
         // focus and the unfocused overlay never receives key events.
@@ -108,6 +117,15 @@ impl EguiOverlay for KernelScriptApp {
                     .glow_context
                     .clear_color(0.0, 0.0, 0.0, 0.0);
             }
+        }
+        // Driver lifecycle first: apply finished worker jobs (this flips
+        // the sync_ipc gate) before this frame's Lua runs, then draw the
+        // KernelScript window (driver phase + Stop). `Stop` just closes
+        // the overlay window — the driver shutdown runs after the render
+        // loop returns, in `driver::finish_on_exit`.
+        self.driver.poll();
+        if self.driver.ui(ctx) {
+            glfw_backend.window.set_should_close(true);
         }
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             self.runtime.frame(ctx, Instant::now(), self.ui_visible);
@@ -195,6 +213,10 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         glfw_backend,
     };
     overlap_app.enter_event_loop();
+    // The loop only returns once the window is closed (the Stop button or
+    // a WM_CLOSE): Lua and rendering are gone, so the driver can be shut
+    // down synchronously here.
+    crate::driver::finish_on_exit();
     Ok(())
 }
 

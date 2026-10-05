@@ -1,3 +1,8 @@
+//! Process enumeration through the Toolhelp API.
+//!
+//! Process metadata comes from user mode; a PID is not a permanent process
+//! identity because Windows can reuse PIDs.
+
 use std::fmt;
 
 use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
@@ -8,12 +13,10 @@ use windows_sys::Win32::System::Diagnostics::ToolHelp::{
 #[derive(Clone, Debug)]
 pub struct ProcessInfo {
     pub pid: u32,
-    pub parent_pid: u32,
-    pub thread_count: u32,
     pub name: String,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum ProcessError {
     Snapshot(u32),
     Enumeration(u32),
@@ -35,6 +38,8 @@ impl fmt::Display for ProcessError {
 impl std::error::Error for ProcessError {}
 
 pub fn list() -> Result<Vec<ProcessInfo>, ProcessError> {
+    // SAFETY: snapshot enumeration with the documented PROCESSENTRY32W
+    // protocol; the handle is closed on every path.
     let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
     if snapshot == INVALID_HANDLE_VALUE {
         return Err(ProcessError::Snapshot(last_error()));
@@ -45,6 +50,7 @@ pub fn list() -> Result<Vec<ProcessInfo>, ProcessError> {
         ..Default::default()
     };
     let mut processes = Vec::new();
+    // SAFETY: `entry` is initialized with dwSize as Toolhelp requires.
     let first = unsafe { Process32FirstW(snapshot, &mut entry) } != 0;
     if !first {
         let error = last_error();
@@ -55,10 +61,9 @@ pub fn list() -> Result<Vec<ProcessInfo>, ProcessError> {
     loop {
         processes.push(ProcessInfo {
             pid: entry.th32ProcessID,
-            parent_pid: entry.th32ParentProcessID,
-            thread_count: entry.cntThreads,
             name: utf16_name(&entry.szExeFile),
         });
+        // SAFETY: same initialized entry.
         if unsafe { Process32NextW(snapshot, &mut entry) } == 0 {
             break;
         }
@@ -89,4 +94,37 @@ fn utf16_name(value: &[u16]) -> String {
 
 fn last_error() -> u32 {
     unsafe { windows_sys::Win32::Foundation::GetLastError() }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn invalid_names_are_rejected() {
+        assert_eq!(find_pid(""), Err(ProcessError::InvalidName));
+        assert_eq!(find_pid("   "), Err(ProcessError::InvalidName));
+        assert_eq!(find_pid("a\0b"), Err(ProcessError::InvalidName));
+        assert_eq!(find_pid(&"x".repeat(256)), Err(ProcessError::InvalidName));
+    }
+
+    #[test]
+    fn this_process_is_enumerable() {
+        let pid = std::process::id() as u64;
+        let own_exe = std::env::current_exe()
+            .expect("current exe")
+            .file_name()
+            .expect("file name")
+            .to_string_lossy()
+            .to_string();
+        assert_eq!(find_pid(&own_exe), Ok(pid));
+    }
+
+    #[test]
+    fn missing_process_is_not_found() {
+        assert_eq!(
+            find_pid("definitely-not-a-real-process.exe"),
+            Err(ProcessError::NotFound)
+        );
+    }
 }
