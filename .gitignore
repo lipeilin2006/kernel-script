@@ -73,3 +73,5 @@ Desktop.ini
 syms/
 dump_*.log
 dump_hex.txt
+# KDU porting reference — local only, not part of the repository
+KDU-1.5.0/
