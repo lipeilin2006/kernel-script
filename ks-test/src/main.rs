@@ -3,7 +3,7 @@
 //! Default lifecycle (KDU mode): the KDU mapper core — compiled into
 //! `ks-sdk` from `KDU-1.5.0/Source` (see `ks-sdk/kdu/ks_bridge.cpp`) —
 //! maps the embedded driver in-process with shellcode V3 through
-//! `ks_sdk::start(None)`: KDU loads the vulnerable helper drivers, maps
+//! `ks_sdk::start()`: KDU loads the vulnerable helper drivers, maps
 //! `ks-driver.sys` into the kernel, creates
 //! a real `DRIVER_OBJECT` and executes `DriverEntry` in place, so
 //! no service is created, no signature is required and nothing registers
@@ -141,7 +141,7 @@ struct EmbeddedDriver {
 
 impl EmbeddedDriver {
     /// Loads the embedded driver: the legacy SCM service when
-    /// `legacy_sc` is set, otherwise `ks_sdk::start(None)` (the in-process
+    /// `legacy_sc` is set, otherwise `ks_sdk::start()` (the in-process
     /// KDU mapper). Both paths first clear a leftover live instance
     /// (see [`cleanup_leftover`]). Only the SCM path puts the image on
     /// disk — `sc create` needs a `binPath` — and it writes it into the
@@ -199,7 +199,7 @@ impl EmbeddedDriver {
             // The mapper runs in-process against the SDK's embedded image
             // bytes; only KDU's extracted helper drivers need files (in
             // their own temporary root, created and removed by `start`).
-            if let Err(error) = ks_sdk::start(None) {
+            if let Err(error) = ks_sdk::start() {
                 let _ = fs::remove_dir_all(&root);
                 return Err(format!("ks_sdk::start: {error}"));
             }
@@ -1486,13 +1486,125 @@ fn run_benchmarks(t: &Target, iters: usize) {
     .report();
 }
 
+/// `ks-test loadone <provider> <victim>`: one pinned provider × victim
+/// attempt in a FRESH process. The matrix parent spawns this per
+/// combination because a ks-link session binds to one driver
+/// generation and never reconnects — a second combo in the same
+/// process would talk to a dead ring.
+fn load_one_standalone(provider: u32, victim: u32) -> i32 {
+    std::env::set_var("KS_SDK_MAP", "1");
+    std::env::remove_var("KS_SDK_KDU_PRV");
+    std::env::remove_var("KS_TEST_KDU_PRV");
+    std::env::remove_var("KS_SDK_VICTIM");
+    if let Err(error) = ks_sdk::start_with(Some(provider), Some(victim)) {
+        eprintln!("loadone: start failed: {error}");
+        return 1;
+    }
+    if let Err(error) = ks_sdk::ping() {
+        eprintln!("loadone: loaded but ping failed: {error}");
+        let _ = ks_sdk::stop();
+        return 1;
+    }
+    println!("loadone: provider {provider} × victim {victim}: loaded, ring answers");
+    let _ = ks_sdk::stop();
+    0
+}
+
+/// `ks-test load`: sweep every retained provider × victim build through
+/// `ks_sdk::start_with` on the manual-map path and report the matrix.
+///
+/// Each combination runs in a fresh `loadone` child process (one
+/// ks-link session per driver generation) and gets a full [`ks_sdk::stop`].
+/// Exit 0 only when every combination passed.
+fn run_load_matrix() -> i32 {
+    std::env::set_var("KS_SDK_MAP", "1");
+    std::env::remove_var("KS_SDK_KDU_PRV");
+    std::env::remove_var("KS_TEST_KDU_PRV");
+    std::env::remove_var("KS_SDK_VICTIM");
+
+    let exe = match std::env::current_exe() {
+        Ok(exe) => exe,
+        Err(error) => {
+            eprintln!("load matrix: current exe: {error}");
+            return 2;
+        }
+    };
+    let providers = ks_sdk::provider_ids();
+    let victims = ks_sdk::victim_builds();
+    say(&format!(
+        "load matrix: {} providers × {} victims, manual mapping only",
+        providers.len(),
+        victims.len()
+    ));
+
+    let mut pass = 0usize;
+    let mut fail = 0usize;
+    let mut results: Vec<String> = Vec::new();
+
+    for provider in &providers {
+        for victim in &victims {
+            say(&format!("=== provider {provider} × victim {victim} ==="));
+            let output = Command::new(&exe)
+                .args(["loadone", &provider.to_string(), &victim.to_string()])
+                .creation_flags(CREATE_NO_WINDOW)
+                .output();
+            let outcome = match output {
+                Ok(output) if output.status.success() => {
+                    pass += 1;
+                    "PASS".to_string()
+                }
+                Ok(output) => {
+                    fail += 1;
+                    let text = format!(
+                        "{}{}",
+                        String::from_utf8_lossy(&output.stdout),
+                        String::from_utf8_lossy(&output.stderr)
+                    );
+                    let last = text.lines().last().unwrap_or("no output").to_string();
+                    format!("FAIL ({last})")
+                }
+                Err(error) => {
+                    fail += 1;
+                    format!("FAIL (spawn: {error})")
+                }
+            };
+            say(&format!("    {outcome}"));
+            results.push(format!(
+                "  provider {provider} × victim {victim}: {outcome}"
+            ));
+            std::thread::sleep(std::time::Duration::from_millis(300));
+        }
+    }
+
+    say("");
+    say("--- load matrix results ---");
+    for line in &results {
+        say(line);
+    }
+    say(&format!(
+        "load matrix: {pass} pass, {fail} fail (of {})",
+        pass + fail
+    ));
+    if fail == 0 {
+        0
+    } else {
+        1
+    }
+}
+
 fn run() -> i32 {
     let args: Vec<String> = std::env::args().collect();
     let full = args.iter().any(|a| a == "full");
     let iters: usize = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(200);
-    // Default load path is KDU manual mapping; `ks-test sc ...` selects the
-    // legacy SCM lifecycle for regression runs.
+    // Default load path is the service load with manual-map fallback;
+    // `ks-test sc ...` selects the legacy SCM lifecycle for regression
+    // runs, `benchmark` runs the performance suite only, and `load`
+    // sweeps every provider × victim combination through start_with.
     let legacy_sc = args.iter().any(|a| a == "sc");
+
+    if args.iter().any(|a| a == "load") {
+        return run_load_matrix();
+    }
 
     // Held (not dropped) until the end of `run`, so the driver stays loaded
     // while the harness executes. Full mode ends with the checked teardown
@@ -1506,7 +1618,7 @@ fn run() -> i32 {
         }
     };
     match &embedded.mode {
-        LoadMode::Kdu => say("driver load mode: kdu (manual map, no service)"),
+        LoadMode::Kdu => say("driver load mode: sdk (service load first, manual-map fallback)"),
         LoadMode::Sc { service } => {
             say(&format!("driver load mode: sc (legacy service {service})"));
         }
@@ -1532,6 +1644,13 @@ fn run() -> i32 {
     say("");
 
     let mut failures = Vec::new();
+
+    if args.iter().any(|a| a == "benchmark") {
+        say("mode: benchmark (performance suite only; `ks-test full` adds correctness)");
+        say("");
+        run_benchmarks(&target, iters);
+        return 0;
+    }
 
     if !full {
         // Minimal mode: transport (ping/getbase) plus normal non-MDL reads
@@ -1581,7 +1700,7 @@ fn run() -> i32 {
     check(&mut failures, "second driver instance rejected", || {
         match &embedded.mode {
             LoadMode::Kdu => {
-                match ks_sdk::start(None) {
+                match ks_sdk::start() {
                     Ok(()) => return Err("second instance mapped (guard missing)".into()),
                     // STATUS_OBJECT_NAME_COLLISION, exactly what the
                     // marker probe returns.
@@ -1723,7 +1842,7 @@ fn run() -> i32 {
             }
             if failures.is_empty() {
                 check(&mut failures, "driver re-maps after shutdown", || {
-                    ks_sdk::start(None).map_err(|e| format!("ks_sdk::start: {e}"))?;
+                    ks_sdk::start().map_err(|e| format!("ks_sdk::start: {e}"))?;
                     // This process's session still points at the dead ring,
                     // so the fresh instance is stopped through a child.
                     run_shutdown_child()
@@ -1765,6 +1884,22 @@ fn main() {
     // before run()'s interactive paths.
     if std::env::args().nth(1).as_deref() == Some("shutdown") {
         std::process::exit(shutdown_standalone());
+    }
+    // `ks-test loadone <provider> <victim>`: one pinned matrix cell,
+    // driven by `run_load_matrix` (fresh process per driver generation).
+    if std::env::args().nth(1).as_deref() == Some("loadone") {
+        let parsed = (|| {
+            let provider: u32 = std::env::args().nth(2)?.parse().ok()?;
+            let victim: u32 = std::env::args().nth(3)?.parse().ok()?;
+            Some((provider, victim))
+        })();
+        match parsed {
+            Some((provider, victim)) => std::process::exit(load_one_standalone(provider, victim)),
+            None => {
+                eprintln!("usage: ks-test loadone <provider-id> <victim-build>");
+                std::process::exit(2);
+            }
+        }
     }
     let failures = run();
     if failures != 0 {

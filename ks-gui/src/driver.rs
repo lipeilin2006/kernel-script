@@ -290,7 +290,7 @@ fn start() -> Result<(), String> {
     // probe that timed out); drop it so the first Lua round trip after
     // this opens against the new load's randomized names.
     ks_sdk::close_session();
-    ks_sdk::start(None).map_err(|error| error.to_string())
+    ks_sdk::start().map_err(|error| error.to_string())
 }
 
 fn stop() -> Result<(), String> {

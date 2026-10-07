@@ -26,4 +26,7 @@ pub use ks_link::*;
 /// [`DRIVER_IMAGE`] bytes and the [`Error`] type).
 pub mod kdu;
 
-pub use kdu::{cleanup_service_load, set_log_sink, start, stop, Error, DRIVER_IMAGE};
+pub use kdu::{
+    cleanup_service_load, provider_ids, set_log_sink, start, start_with, stop, victim_builds,
+    Error, DRIVER_IMAGE,
+};
