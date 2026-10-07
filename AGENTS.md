@@ -23,13 +23,18 @@
   crate root and owns the driver lifecycle: `ks_sdk::start()` maps the
   embedded target image (`ks-sdk/assets/ks-driver.sys`, `DRIVER_IMAGE`)
   in-process and `ks_sdk::stop()` shuts the driver down again — the
-  in-process KDU mapper
-  (`ks-sdk/build.rs` compiles the KDU 1.5.0 map core plus
-  `ks-sdk/kdu/ks_bridge.cpp`; the packed provider database lives in
-  `ks-sdk/assets/drv64.dll`). Neither image is ever written to disk by
-  the SDK; `ks-gui` and `ks-test` depend on `ks-sdk`
-  (not `ks-link` directly), so everything downstream of `ks-sdk` shares
-  its MSVC/C++ build requirement.
+  pure-Rust mapper in `ks-sdk/src/kdu/` (a port of the KDU 1.5.0 map
+  core; the one C++-derived artifact is the extracted shellcode V3
+  machine code `ks-sdk/assets/shellcode_v3.bin`, produced once by
+  `ks-sdk/tools/shellcode_dump.cpp`). The loader-driver images live in
+  `ks-sdk/assets/loader_drivers/` (5 verified provider blobs + 1
+  PROCEXP152 victim). `ks_sdk::start(provider)` takes an optional
+  provider id: `Some(id)` runs exactly that provider, `None` walks the
+  whole table in order until one maps the driver. Neither the target
+  image nor anything else mapper-related
+  is ever compiled: no `build.rs`, no `cc`, no MSVC requirement for the
+  workspace build. `ks-gui` and `ks-test` depend on `ks-sdk`
+  (not `ks-link` directly).
 - `ks-gui`: user-mode egui/eframe OpenGL GUI and Lua runtime. It owns the
    Lua VM, the synchronous `sync_ipc` facade over `ks-sdk` (the re-exported
    link API), the draw command
@@ -88,8 +93,8 @@ one.
 - Use `windows-sys` with narrow feature lists.
 - Every kernel object handle the driver creates (ring section, ring
   events, worker thread) must be created with `OBJ_KERNEL_HANDLE`.
-  `DriverEntry` can run in an arbitrary process context — the KDU mapper
-  runs in-process inside `ks-test` (`kdu/ks_bridge.cpp`), and the manual
+  `DriverEntry` can run in an arbitrary process context — the mapper
+  runs in-process inside `ks-test` (`ks_sdk::start`), and the manual
   mapping path generally hands control to whatever process drove it — and
   handles in that process's
   table close when it exits, destroying the named ring objects while the
@@ -423,109 +428,138 @@ Inspect it with platform linker tools before loading it. Driver signing
 and VM deployment are environment-specific and are outside the workspace
 source tree.
 
-## ks-test Load Modes
+## Mapper (ks-sdk Rust port)
 
-`ks-test` (full, minimal) defaults to KDU manual mapping; `ks-test sc
+`ks-test` (full, minimal) defaults to manual mapping; `ks-test sc
 [full]` is the legacy SCM path; `ks-test shutdown` is a standalone
 cleanup/verify subcommand.
 
-KDU is **compiled into ks-sdk** — there is no `kdu.exe` child process
-and nothing is staged for the mapper itself: the target image only ever
-reaches disk on the legacy `sc` path (SCM needs a `binPath`):
+The mapper is a **pure-Rust port of the KDU 1.5.0 map core** in
+`ks-sdk/src/kdu/` — there is no C++ in the build and no `kdu.exe`
+child process: the target image only ever reaches disk on the legacy
+`sc` path (SCM needs a `binPath`):
 
-- `ks-sdk/build.rs` compiles KDU 1.5.0's sources (`KDU-1.5.0/Source`,
-  the `KDU.vcxproj` file list minus `main.cpp` and `tests/*`, plus
-  `shellmasm.asm` via `ml64`) into a static library and adds
-  `ks-sdk/kdu/ks_bridge.cpp`, which exposes `ks_kdu_map`. Flags mirror
-  the vcxproj (`NDEBUG`, `UNICODE`, `/permissive-`, `/GS-`) plus `/MD` to
-  match Rust's dynamic CRT.
-- The packed provider database (`drv64.dll`, `ks-sdk/assets`,
-  `include_bytes`) is mapped into the process **in memory** (headers,
-  sections, base relocations; no imports/TLS — the same effect as KDU's
-  `LoadLibraryEx(..., DONT_RESOLVE_DLL_REFERENCES)`), so the DLL never
-  touches disk. Its exports (`gVersion`, `gProvTable`) are resolved by a
-  hand-rolled export walk: `GetProcAddress` rejects images that never
-  went through the loader (it fails with error 126).
-- The target image is mapped the same way and never touches disk either:
-  `ks_kdu_map` now takes raw bytes (`ks_sdk::DRIVER_IMAGE`, the embedded
-  `ks-sdk/assets/ks-driver.sys`) instead of a path, and
-  `KsMapImageFromMemory` builds the image layout itself — headers,
-  sections, base relocations, then `OptionalHeader.ImageBase` republished
-  at the mapped base. That last rewrite is mandatory: shellcode V3
-  relocates the payload copy a second time from
-  `delta = exbuffer - popth->ImageBase` (`shellcode.cpp`), so a header
-  still naming the preferred base while the pointers already sit at the
-  mapped base would relocate it by the wrong amount (LdrLoadDll did this
-  rewrite on the old path, which is why the old flow worked). Imports are
-  left unresolved; `KDUStorePayloadInSection` resolves the kernel imports
-  by name from the copy.
-- Only KDU's helper drivers are written to disk, and each is deleted
-  again: the provider's vulnerable driver (`NalDrv.sys`) is extracted
-  into the process working directory — a fresh temp root that becomes the
-  CWD for the duration of the `ks_kdu_map` call and is removed afterwards
-  (KDU resolves its extraction against the CWD) — and the victim
+- Module map: `nt.rs` (raw FFI against ntdll/kernel32/advapi32/rpcrt4,
+  each with an explicit `#[link]`), `pe.rs` (image layout + kernel
+  import resolution + ntoskrnl loading via `LoadLibraryExW(...,
+  DONT_RESOLVE_DLL_REFERENCES)` + `GetProcAddress`), `env.rs` (build
+  number, elevation, HVCI, pool-tag selection), `loader.rs` (service
+  registry entries + `NtLoadDriver`/`NtUnloadDriver` + device open),
+  `victim.rs` (PROCEXP152 drop/load/open, dispatch-signature query,
+  `IRP_MJ_CREATE` execution), `shellcode.rs` (the 2048-byte `SHELLCODE`
+  blob: init stub + embedded V3 machine code + resolved import table),
+  `payload.rs` (UUID-named shared section holding the V3 payload
+  header + import-resolved image copy), `superfetch.rs` (V2P
+  translation via the Superfetch PFN query — the retained providers
+  all translate through it, built lazily at first use and dropped
+  after every attempt), `primitives.rs` (5 provider IOCTL primitive
+  sets), `provider.rs` (the static provider table) and `dispatch.rs`
+  (route selection + map orchestration).
+- The provider database is gone: the 5 retained provider driver blobs
+  plus 1 PROCEXP152 victim live as individual `.sys` files under
+  `ks-sdk/assets/loader_drivers/` (`include_bytes!` in `drivers.rs`),
+  extracted from KDU's packed database by `build_loader_drivers.ps1`.
+  The rest of KDU's providers were removed after field verification on
+  the development machine: Intel NAL / EneIo64 / DirectIo64 /
+  EtdSupport / AsrDrv107 are signed with certificates Microsoft has
+  revoked (kernel loads fail with `0xC0000603` on current builds),
+  EleetX1's brute-force physical scan bugchecked the machine, CORMEM
+  and PGRHostControl failed their kernel-write primitives, and Lenovo
+  Diagnostics needs dbghelp symbol resolution (never ported). Re-add a
+  provider by restoring its blob, a `ProviderDef` in `provider.rs` and
+  its primitives in `primitives.rs`; `start(Some(id))` runs it alone,
+  `start(None)` walks the table in order.
+- The target image never touches disk. `pe::MappedImage::load` lays
+  headers and sections out at their virtual addresses **without**
+  applying relocations and **without** rewriting `ImageBase`: the
+  kernel shellcode relocates the payload copy from
+  `delta = exbuffer - popth->ImageBase`, so the only invariant is that
+  the field names the base the absolute pointers currently sit at —
+  keeping the preferred base in both places satisfies it. Kernel
+  imports are resolved by name from the copy
+  (`pe::resolve_kernel_import`, ntoskrnl-only single-descriptor walk).
+- Only the helper drivers are written to disk, and each is deleted
+  again: the provider's vulnerable driver is extracted into the process
+  working directory — a fresh temp root that is the CWD for the
+  duration of the map call and is removed afterwards — and the victim
   (`PROCEXP152.sys`) into `%SystemRoot%\system32\drivers`, where it is
   removed once the payload has run. `ks_sdk::start` creates the root,
-  switches the CWD, runs the map, restores the CWD and deletes the root.
-- Every KDU translation unit gets `ks-sdk/kdu/ks_kdu_log.h` force-
- included (`/FI`): `printf_s`/`vprintf_s` are macro-hooked to a Rust
- callback in the bridge, but the C side's step-log output is discarded
- (`kdu_log_quiet` in ks-sdk/src/kdu.rs): only the SDK's own lines —
- the `trying provider <id>` attempts — reach the log sink (default:
- stdout with the historic `kdu: ` prefix; ks-test installs a sink into
- its step log). Swap `kdu_log_quiet` for a splitting function that
- calls `emit` to bring the raw mapper log back for debugging.
-- Three small patches live in `KDU-1.5.0/Source/Hamakaze` and must be
-  re-applied if KDU is ever updated: `g_KduDbModule` is no longer
-  `static` (extern pair in `kduprov.h`); `KDUProviderSetPresetDb` (new,
-  `kduprov.cpp`) adopts the externally mapped database module after
-  `KDUProviderValidateDb`; `g_KduEntryStatus` (new, `drvmap.cpp` +
-  extern in `drvmap.h`) is recorded by `KDUShowPayloadResult` and is
-  what `ks_kdu_map` returns as the NTSTATUS of `DriverEntry`.
-- Building ks-sdk requires MSVC for every profile, `cargo test`
-  included: `cc` discovers Visual Studio through the registry and
-  `ml64.exe` through `VCToolsInstallDir` or the standard VS roots.
-  Because `ks-gui` and `ks-test` depend on ks-sdk, the requirement
-  applies to them as well.
+  switches the CWD, runs the chain, restores the CWD and deletes the
+  root.
+- Progress/log lines go through the internal `emit` (default: stdout
+  with the historic `kdu: ` prefix; ks-test installs a sink into its
+  step log). The line format `trying provider <id>` is load-bearing —
+  ks-gui's startup log and the tests grep it.
+- The shellcode V3 machine code (`shellcode.rs`, `SHELLCODE_V3`) is
+  position-independent machine code extracted once from the verified
+  MSVC build of KDU's `shellcode.cpp` by
+  `ks-sdk/tools/shellcode_dump.cpp` and committed as
+  `ks-sdk/assets/shellcode_v3.bin` (1581 bytes, sha256 2ACB3BE4…).
+  Never "re-implement" it in Rust or change the extraction procedure —
+  the blob is copied byte-for-byte into the kernel shellcode structure
+  and any byte difference is a kernel bugcheck. Regeneration requires
+  the pre-port C++ build (see the tool's header comment).
 
 - Shellcode **V3 is mandatory**. V1 (KDU's default) starts `DriverEntry`
   as a bare system-thread routine with a `NULL` driver object — this
   driver rejects that — and the reported status then reflects thread
   creation, not the entry's own result. V3 builds a real
   `DRIVER_OBJECT`, calls `DriverEntry(driverObject, &regPath)`
-  synchronously; its NTSTATUS is `ks_kdu_map`'s return value, and
+  synchronously; its NTSTATUS is `dispatch::map_driver`'s `Ok` value, and
   `0xC0000035` (returned directly) is how the dup-instance check
   recognizes the single-instance guard rejecting a second load.
 - The driver object name (`ks_sdk::kdu`'s per-attempt `driver_name`) must
   be unique per attempt:
   V3's driver object is permanent
-  and KDU never deletes it, so a reused name would collide in
+  and nothing deletes it, so a reused name would collide in
   `ObCreateObject` with the same status code before the marker probe
   ever runs.
-- Success is judged from the returned NTSTATUS (`0` = success); the old
-  child-process exit-code inversion and the `[~] Shellcode result`
-  text parsing are gone (KDU's own log output is discarded entirely —
-  the SDK only logs `trying provider <id>` per attempt).
+- Success is judged from the returned NTSTATUS (`0` = success).
   Readiness is the registry publication (`ks_sdk::start` polls it via
   `ks_sdk::published_object_names_strict`; ks-test additionally pings the
   ring once names appear).
-- The provider chain starts at KDU's default (provider 0, Intel NAL);
-  override the first id with `KS_SDK_KDU_PRV=<id>` (the retired
-  `KS_TEST_KDU_PRV` is still honored). An attempt that dies before its
-  payload runs (the bridge's `STATUS_UNSUCCESSFUL` — the vulnerable
-  driver was rejected, blocklisted or unsupported) makes
-  `ks_sdk::start` retry with the next id of a curated fallback chain
-  (`FALLBACK_PROVIDERS` in ks-sdk/src/kdu.rs: cold vendor drivers that
-  survive blocklists; every id must support shellcode V3). A payload
-  that actually ran ends the chain at once: `DriverEntry`'s own
-  NTSTATUS — including the `0xC0000035` single-instance rejection —
-  cannot change with the provider. The last provider that succeeded in
-  the process is tried first on the next [`start`] (recorded in
-  `LAST_GOOD_PROVIDER`, ks-sdk/src/kdu.rs), so a repeated start —
-  ks-test full's duplicate-load and post-shutdown re-map checks — goes
-  straight to the working id. Every attempt gets a fresh V3
-  driver-object name, and an exhausted chain reports
+- Loading order: the **normal service load first** (`kdu/sc.rs`): the
+  signed image goes through a service registry entry plus
+  `NtLoadDriver` — deterministic, no live kernel code is overwritten.
+  Only a rejected service load (signature, policy) falls back to the
+  manual-map provider chain: `ks_sdk::start(provider)` — `Some(id)`
+  runs that provider alone; `None` (what ks-gui and ks-test use) walks
+  the whole `PROVIDERS` table in order, one attempt per id, until a
+  payload reports a status. `KS_SDK_KDU_PRV=<id>` (the retired
+  `KS_TEST_KDU_PRV` is still honored) is tried first in the `None`
+  mode; `KS_SDK_MAP=1` skips the service attempt entirely (manual
+  mapping only, for testing the exploit path). `ks_sdk::stop` also
+  unloads a service-loaded instance (`NtUnloadDriver` + service key +
+  image file), and `ks_sdk::cleanup_service_load` recovers a leftover
+  service load from a killed run (the image file stays locked until
+  then). `KS_SDK_VICTIM=<build>` pins the victim build (1627/1702/1712).
+- The payload encryption key is the pool tag: `KDU_CONTEXT` stores
+  `EncryptKey` and `MemoryTag` in one `union`, so the shellcode's
+  `Tag` decode always matches the encode. The Rust port keeps that
+  identity — `dispatch::run_map` encodes with the same `memory_tag`
+  that `shellcode::build` writes into the blob. Never split them: a
+  mismatch decodes the payload to garbage and the victim executes it
+  (two field bugchecks came from exactly this class of divergence,
+  before the union identity was restored — they also briefly blamed
+  the PROCEXP152 16.27 victim, which was exonerated once the key
+  identity was fixed and now serves as the primary victim again). An attempt that dies before its payload runs moves the chain to
+  the next id; a payload that actually ran ends the chain at once:
+  `DriverEntry`'s own NTSTATUS — including the `0xC0000035`
+  single-instance rejection — cannot change with the provider. The last
+  provider that succeeded in the process is tried first on the next
+  `start` (recorded in `LAST_GOOD_PROVIDER`, ks-sdk/src/kdu/mod.rs), so
+  a repeated start — ks-test full's duplicate-load and post-shutdown
+  re-map checks — goes straight to the working id. Every attempt gets a
+  fresh V3 driver-object name, and an exhausted chain reports
   `Error::NoProvider { tried }` with the ids attempted.
+- Route selection mirrors KDU exactly: `FLAG_PHYSICAL_BRUTE_FORCE` →
+  page-by-page physical scan patching the victim dispatch
+  (registry `HARDWARE\RESOURCEMAP\System Resources\Physical Memory`
+  `.Translated` list); `FLAG_ROOT_FROM_LOWSTUB | FLAG_PREFER_PHYSICAL`
+  → physical-translate through the provider's kernel-VM write; else →
+  direct kernel-VM write. The shellcode blob is page-locked
+  (`shellcode::LockedMemory`) before the scan, like KDU's
+  `supAllocateLockedMemory`.
 - Teardown inverts (see `Request::Shutdown` above): `ks-test full`
   verifies claim released, that a re-map after shutdown succeeds, and
   that no live driver instance remains. `ks-test shutdown` exits 0 when
@@ -535,11 +569,11 @@ reaches disk on the legacy `sc` path (SCM needs a `binPath`):
   of `ks_link::close_session`).
 - KDU never runs `DriverUnload`: every successful map leaks one
   `THREAD_OBJECT` with its kernel stack and one permanent V3 driver
-  object until reboot — accepted for a test harness. The in-process
-  bridge additionally keeps the mapped `drv64.dll` image (VirtualAlloc)
-  alive for the life of the process.
-- Signing is not required in KDU mode; `ks-test sc` is the only remaining
+  object until reboot — accepted for a test harness.
+- Signing is not required in the default mode; `ks-test sc` is the only
   path that loads a signed image through SCM.
+- The `KDU-1.5.0/` source tree stays in the repository as the porting
+  reference (and for shellcode regeneration); nothing builds it.
 
 ## Verification Checklist
 
@@ -552,11 +586,9 @@ Before considering a change complete:
 4. For driver changes, build `ks-driver --release --bin ks-driver
    --features wdk` using WDK 26100, verify the import table lists
    `ntoskrnl.exe` only, copy the image to `ks-sdk/assets/ks-driver.sys`
-   and rebuild `ks-test` (the image is embedded with `include_bytes`;
-   ks-sdk's build script recompiles the KDU static library, so MSVC is
-   required). For KDU/bridge changes, re-verify the three patches listed
-   under `ks-test Load Modes` are intact and run `kdu_smoke.ps1` plus
-   `drvtest7.ps1` elevated.
+   and rebuild `ks-test` (the image is embedded with `include_bytes`).
+   For mapper changes, run `drvtest7.ps1` elevated (the default KDU
+   mode exercises the Rust mapper end to end).
 5. Check `cargo tree -e features` when changing dependencies.
 6. Search for stale synchronous Lua calls after changing the Lua API.
 7. If artifacts are deployed to the VM, verify SHA256 hashes.
@@ -601,8 +633,8 @@ Before considering a change complete:
   compiled successfully.
 - Windows Defender flags the KDU-mode test binaries (for example
   `HackTool:Win64/KduDrv` and `HackTool:Win64/KernelDrUtil`) and may
-  quarantine `ks-test.exe` — which now contains the compiled-in KDU
-  mapper code — at launch; the
+  quarantine `ks-test.exe` — which contains the Rust mapper and the
+  embedded loader-driver blobs — at launch; the
   harness then exits silently with no output. Test machines need a
   Defender exclusion for the workspace and the
   `%LOCALAPPDATA%\Temp\kernel-script-*` staging directories (or

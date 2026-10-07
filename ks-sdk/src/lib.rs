@@ -3,11 +3,11 @@
 //! Two halves in one crate:
 //!
 //! * [`start`] / [`stop`] — the driver lifecycle: `start` maps the
-//!   embedded image ([`DRIVER_IMAGE`]) into the kernel in-process through
-//!   KDU's map core (compiled from `KDU-1.5.0/Source` by this crate's
-//!   `build.rs`, entry `kdu/ks_bridge.cpp`) without writing the target
-//!   image to disk; `stop` shuts the driver down again. Both live in
-//!   [`kdu`].
+//!   embedded image ([`DRIVER_IMAGE`]) into the kernel in-process
+//!   through the pure-Rust mapper in [`kdu`] (shellcode V3; the only
+//!   C++-derived artifact is the extracted machine code in
+//!   `assets/shellcode_v3.bin`) without writing the target image to
+//!   disk; `stop` shuts the driver down again.
 //! * The whole [`ks_link`] API re-exported at the crate root — session,
 //!   ring round trips, process enumeration, memory reads/writes, batch
 //!   operations, pointer walks and memory locks:
@@ -19,9 +19,6 @@
 //! let value = ks_sdk::read_bytes(pid, addr, 4, false, false)?;
 //! ks_sdk::stop()?;                           // shut the driver down
 //! ```
-//!
-//! The C++/MSVC toolchain requirement introduced by the KDU build applies
-//! to every crate that depends on ks-sdk (see AGENTS.md).
 
 pub use ks_link::*;
 
@@ -29,4 +26,4 @@ pub use ks_link::*;
 /// [`DRIVER_IMAGE`] bytes and the [`Error`] type).
 pub mod kdu;
 
-pub use kdu::{set_log_sink, start, stop, Error, DRIVER_IMAGE};
+pub use kdu::{cleanup_service_load, set_log_sink, start, stop, Error, DRIVER_IMAGE};

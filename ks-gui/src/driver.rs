@@ -1,5 +1,5 @@
 //! Silent driver lifecycle: the startup probe reuses a live driver or
-//! starts the embedded one through `ks_sdk::start()` (in-process KDU map)
+//! starts the embedded one through `ks_sdk::start(None)` (in-process KDU map)
 //! on a background worker, [`DriverControl::poll`] chains that start once
 //! the probe reports a stopped driver, and [`finish_on_exit`] shuts a live
 //! driver down again after the render loop has returned. The module also
@@ -290,7 +290,7 @@ fn start() -> Result<(), String> {
     // probe that timed out); drop it so the first Lua round trip after
     // this opens against the new load's randomized names.
     ks_sdk::close_session();
-    ks_sdk::start().map_err(|error| error.to_string())
+    ks_sdk::start(None).map_err(|error| error.to_string())
 }
 
 fn stop() -> Result<(), String> {

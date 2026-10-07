@@ -3,7 +3,7 @@
 //! Default lifecycle (KDU mode): the KDU mapper core — compiled into
 //! `ks-sdk` from `KDU-1.5.0/Source` (see `ks-sdk/kdu/ks_bridge.cpp`) —
 //! maps the embedded driver in-process with shellcode V3 through
-//! `ks_sdk::start()`: KDU loads the vulnerable helper drivers, maps
+//! `ks_sdk::start(None)`: KDU loads the vulnerable helper drivers, maps
 //! `ks-driver.sys` into the kernel, creates
 //! a real `DRIVER_OBJECT` and executes `DriverEntry` in place, so
 //! no service is created, no signature is required and nothing registers
@@ -141,7 +141,7 @@ struct EmbeddedDriver {
 
 impl EmbeddedDriver {
     /// Loads the embedded driver: the legacy SCM service when
-    /// `legacy_sc` is set, otherwise `ks_sdk::start()` (the in-process
+    /// `legacy_sc` is set, otherwise `ks_sdk::start(None)` (the in-process
     /// KDU mapper). Both paths first clear a leftover live instance
     /// (see [`cleanup_leftover`]). Only the SCM path puts the image on
     /// disk — `sc create` needs a `binPath` — and it writes it into the
@@ -199,7 +199,7 @@ impl EmbeddedDriver {
             // The mapper runs in-process against the SDK's embedded image
             // bytes; only KDU's extracted helper drivers need files (in
             // their own temporary root, created and removed by `start`).
-            if let Err(error) = ks_sdk::start() {
+            if let Err(error) = ks_sdk::start(None) {
                 let _ = fs::remove_dir_all(&root);
                 return Err(format!("ks_sdk::start: {error}"));
             }
@@ -535,7 +535,8 @@ fn cleanup_leftover() -> Result<(), String> {
 /// process.
 fn shutdown_standalone() -> i32 {
     let Some(names) = ks_sdk::published_object_names_strict() else {
-        say("shutdown: no published object names; nothing to do");
+        say("shutdown: no published object names; cleaning any leftover service load");
+        ks_sdk::cleanup_service_load();
         return 0;
     };
     say(&format!(
@@ -549,7 +550,7 @@ fn shutdown_standalone() -> i32 {
             ));
             0
         }
-        Ok(()) => match ks_sdk::shutdown() {
+        Ok(()) => match ks_sdk::stop() {
             Err(error) => {
                 eprintln!("shutdown: shutdown request failed: {error}");
                 1
@@ -1580,7 +1581,7 @@ fn run() -> i32 {
     check(&mut failures, "second driver instance rejected", || {
         match &embedded.mode {
             LoadMode::Kdu => {
-                match ks_sdk::start() {
+                match ks_sdk::start(None) {
                     Ok(()) => return Err("second instance mapped (guard missing)".into()),
                     // STATUS_OBJECT_NAME_COLLISION, exactly what the
                     // marker probe returns.
@@ -1722,7 +1723,7 @@ fn run() -> i32 {
             }
             if failures.is_empty() {
                 check(&mut failures, "driver re-maps after shutdown", || {
-                    ks_sdk::start().map_err(|e| format!("ks_sdk::start: {e}"))?;
+                    ks_sdk::start(None).map_err(|e| format!("ks_sdk::start: {e}"))?;
                     // This process's session still points at the dead ring,
                     // so the fresh instance is stopped through a child.
                     run_shutdown_child()
