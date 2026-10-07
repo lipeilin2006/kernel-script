@@ -62,3 +62,14 @@ Desktop.ini
 *.swp
 *.swo
 *~
+# IDA databases and debugger artifacts
+*.i64
+*.id0
+*.id1
+*.id2
+*.nam
+*.til
+*.idb
+syms/
+dump_*.log
+dump_hex.txt
