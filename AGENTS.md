@@ -572,8 +572,14 @@ child process: the target image only ever reaches disk on the legacy
   object until reboot — accepted for a test harness.
 - Signing is not required in the default mode; `ks-test sc` is the only
   path that loads a signed image through SCM.
-- The `KDU-1.5.0/` source tree stays in the repository as the porting
-  reference (and for shellcode regeneration); nothing builds it.
+- The `KDU-1.5.0/` C++ tree has been deleted from the workspace
+  (untracked from git first, then removed): nothing builds it, the
+  loader-driver blobs and `shellcode_v3.bin` are committed assets, and
+  the mapper is fully self-contained. The extraction scripts
+  (`extract_kdu_drivers.ps1`/`build_loader_drivers.ps1`) and
+  `ks-sdk/tools/shellcode_dump.cpp` document how to regenerate those
+  artifacts if the KDU package is ever re-obtained, but are dormant
+  without it.
 
 ## Verification Checklist
 

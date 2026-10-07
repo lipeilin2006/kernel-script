@@ -1,18 +1,13 @@
 //! ks-test: correctness harness and benchmark for the KernelScript ring.
 //!
-//! Default lifecycle (KDU mode): the KDU mapper core — compiled into
-//! `ks-sdk` from `KDU-1.5.0/Source` (see `ks-sdk/kdu/ks_bridge.cpp`) —
-//! maps the embedded driver in-process with shellcode V3 through
-//! `ks_sdk::start()`: KDU loads the vulnerable helper drivers, maps
-//! `ks-driver.sys` into the kernel, creates
-//! a real `DRIVER_OBJECT` and executes `DriverEntry` in place, so
-//! no service is created, no signature is required and nothing registers
-//! with the SCM. Neither the driver image nor the packed provider
-//! database (`drv64.dll` bytes) is ever written to disk — both live in
-//! the `ks-sdk` binary as bytes; only KDU's extracted helper drivers
-//! are files, in a fresh temp root that is the process working directory
-//! for the map call. Readiness is again the registry publication: poll
-//! `HKLM\SOFTWARE\KernelScript` until the driver publishes its object
+//! Default lifecycle: the pure-Rust mapper in `ks-sdk/src/kdu/` loads
+//! the driver through `ks_sdk::start()` — the signed image goes through
+//! a normal service load first, and only a rejected service load falls
+//! back to manual mapping (shellcode V3, `DriverEntry` runs in place,
+//! nothing registers with the SCM). Modes: `full`/`minimal` correctness
+//! suites, `benchmark` performance only, `load` the provider × victim
+//! matrix, `shutdown` recovery. Readiness is the registry publication:
+//! poll `HKLM\SOFTWARE\KernelScript` until the driver publishes its object
 //! names, connect through `ks-sdk` (the `ks-link` re-export) and exercise
 //! every operation against
 //! this process's own memory: plain, RVA-resolved and MDL-remap
