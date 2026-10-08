@@ -27,7 +27,7 @@
   core; the one C++-derived artifact is the extracted shellcode V3
   machine code `ks-sdk/assets/shellcode_v3.bin`, produced once by
   `ks-sdk/tools/shellcode_dump.cpp`). The loader-driver images live in
-  `ks-sdk/assets/loader_drivers/` (5 verified provider blobs + 1
+  `ks-sdk/assets/loader_drivers/` (6 verified provider blobs + 1
   PROCEXP152 victim). `ks_sdk::start(provider)` takes an optional
   provider id: `Some(id)` runs exactly that provider, `None` walks the
   whole table in order until one maps the driver. Neither the target
@@ -452,13 +452,18 @@ child process: the target image only ever reaches disk on the legacy
   header + import-resolved image copy), `superfetch.rs` (V2P
   translation via the Superfetch PFN query — the retained providers
   all translate through it, built lazily at first use and dropped
-  after every attempt), `primitives.rs` (5 provider IOCTL primitive
+  after every attempt), `primitives.rs` (6 provider IOCTL primitive
   sets), `provider.rs` (the static provider table) and `dispatch.rs`
   (route selection + map orchestration).
-- The provider database is gone: the 5 retained provider driver blobs
+- The provider database is gone: the 6 retained provider driver blobs
   plus 1 PROCEXP152 victim live as individual `.sys` files under
   `ks-sdk/assets/loader_drivers/` (`include_bytes!` in `drivers.rs`),
   extracted from KDU's packed database by `build_loader_drivers.ps1`.
+  The retained ids are 44 / 56 / 57 / 60 / 67 plus 34 (WinIo64.sys,
+  "MSI Foundation Service": map/unmap protocol, device `\Device\WinIo`,
+  the 40-byte `WINIO_PHYSICAL_MEMORY_INFO`, page-aligned `SectionOffset`
+  with the page offset walked in user mode — probe-verified map/IOCTL
+  round trip, staged separately by `winio_probe.ps1`).
   The rest of KDU's providers were removed after field verification on
   the development machine: Intel NAL / EneIo64 / DirectIo64 /
   EtdSupport / AsrDrv107 are signed with certificates Microsoft has
