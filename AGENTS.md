@@ -226,7 +226,7 @@ IDLE --client--> REQUEST --driver--> PROCESSING --driver--> RESPONSE
  +-- client cancel (5 s, only while still REQUEST)
 ```
 
-Round-trip rules (implemented in `ks-link/src/lib.rs`):
+Round-trip rules (implemented in `ks-link/src/session.rs`):
 
 - Every round trip holds the client mutex, drains stale response signals,
   publishes a postcard-encoded `Request`, sets `STATE_REQUEST`, signals the
@@ -243,7 +243,7 @@ Round-trip rules (implemented in `ks-link/src/lib.rs`):
   under ks-gui's lifecycle gate) or start a new process to open one
   against the current load — a session never reconnects on its own.
 
-Payloads are postcard-encoded (`ks-core/src/protocol.rs`): `Ping`,
+Payloads are postcard-encoded (`ks-core/src/protocol/`): `Ping`,
 `GetProcessBase`, `Read`/`Write` (with `rva` and `mdl` flags), `BatchRead`,
 `BatchWrite`, `TraverseChain`, `Shutdown`, `Lock`, `Unlock`, `UnlockAll`.
 The response is a fixed 64-byte
@@ -287,7 +287,7 @@ itself — so a cleanly exited driver leaves the key absent; only a crash
 keeps stale values, and those are overwritten by the next load's publish.
 
 The names are randomized at every startup: `RingNames::generate`
-(`ks-driver/src/comm.rs`) draws a 64-bit token with `RtlRandomEx`, seeded
+(`ks-driver/src/comm/`) draws a 64-bit token with `RtlRandomEx`, seeded
 from interrupt time and a stack address, and appends it as 16 lowercase
 hex chars to the fixed prefixes — the published values change per load,
 so nobody can predict the next load's names to squat them in advance.
@@ -481,12 +481,15 @@ needs a `binPath`):
   `dt-loader/assets/drivers/` (`include_bytes!` through dt-loader's
   `assets.rs`),
   extracted from KDU's packed database by `build_loader_drivers.ps1`.
-  The retained ids are 44 / 56 / 57 / 60 / 67 plus 34 (WinIo64.sys,
-  "MSI Foundation Service": map/unmap protocol, device `\Device\WinIo`,
+  `provider/mod.rs`: `ProviderDef::id` is the `PROVIDERS` table index,
+  numbered 0..6 — 0 PdFwKrnl, 1 TPwSav, 2 LnvMSRIO, 3 WinHwDriver,
+  4 hpwks, 5 WinIo64 (KDU id 34, "MSI Foundation Service": map/unmap
+  protocol, device `\Device\WinIo`,
   the 40-byte `WINIO_PHYSICAL_MEMORY_INFO`, page-aligned `SectionOffset`
   with the page offset walked in user mode — probe-verified map/IOCTL
-  round trip, staged separately by `dt-loader/tools/winio_probe.ps1`) and 68
-  (Kinkajou.sys, hand-extracted, not in KDU's database: WHQL-signed
+  round trip, staged separately by `dt-loader/tools/winio_probe.ps1`) and
+  6 Kinkajou (KDU id 68, hand-extracted, not in KDU's database:
+  WHQL-signed
   Microsoft lab driver, device `\Device\Kinkajou`, METHOD_BUFFERED
   IOCTLs with no length validation — `register_driver` sends init
   0x221C08 (live-ntoskrnl byte-pattern scan + raw EPROCESS offsets
@@ -497,10 +500,13 @@ needs a `binPath`):
   (read: size then destination; write: source then size) and move the
   data through per-process user buffers — the read/walk path runs
   against THIS process's DirectoryTableBase. Field-verified on build
-  26300: `ks-test loadone 68 1712` and a pinned manual-map-only `full`
+  26300: `ks-test loadone 6 1712` and a pinned manual-map-only `full`
   suite pass end to end, which also confirms the expired-but-timestamped
   WHQL certificate loads (not blocklisted), the needle matches the live
   ntoskrnl, and the Germanium 0x1D0/0x1D8 offsets are correct).
+  KDU's original provider numbers (44 / 56 / 57 / 60 / 67 for the first
+  five) survive only in the blob filenames (`0_PdFwKrnl.sys`, ...) and
+  each provider module's provenance comment.
   The rest of KDU's providers were removed after field verification on
   the development machine: Intel NAL / EneIo64 / DirectIo64 /
   EtdSupport / AsrDrv107 are signed with certificates Microsoft has
