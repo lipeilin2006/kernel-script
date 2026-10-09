@@ -14,6 +14,14 @@ gui_status.png
 dumps/
 kdu-drivers/
 
+# Private dt-loader repo assets (github.com/lipeilin2006/driver-loader)
+# — the mapper, its vulnerable-driver blobs and the KDU-derived
+# shellcode live ONLY in the private sibling checkout. Never stage
+# anything from it into this public repository.
+ks-sdk/assets/loader_drivers/
+ks-sdk/assets/shellcode_v3.bin
+ks-sdk/tools/
+
 # Local environment and tool state
 .env
 .env.*

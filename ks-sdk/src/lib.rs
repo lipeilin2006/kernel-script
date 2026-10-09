@@ -4,8 +4,8 @@
 //!
 //! * [`start`] / [`stop`] — the driver lifecycle: `start` maps the
 //!   embedded image ([`DRIVER_IMAGE`]) into the kernel in-process
-//!   through the pure-Rust mapper in [`kdu`] (shellcode V3; the only
-//!   C++-derived artifact is the extracted machine code in
+//!   through the `dt-loader` mapper crate (shellcode V3; the only
+//!   C++-derived artifact is the extracted machine code in dt-loader's
 //!   `assets/shellcode_v3.bin`) without writing the target image to
 //!   disk; `stop` shuts the driver down again.
 //! * The whole [`ks_link`] API re-exported at the crate root — session,

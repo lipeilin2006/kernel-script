@@ -6,3 +6,4 @@ rust-version.workspace = true
 
 [dependencies]
 ks-link.workspace = true
+dt-loader.workspace = true

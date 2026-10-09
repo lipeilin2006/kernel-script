@@ -1,10 +1,11 @@
 //! ks-test: correctness harness and benchmark for the KernelScript ring.
 //!
-//! Default lifecycle: the pure-Rust mapper in `ks-sdk/src/kdu/` loads
-//! the driver through `ks_sdk::start()` — the signed image goes through
-//! a normal service load first, and only a rejected service load falls
-//! back to manual mapping (shellcode V3, `DriverEntry` runs in place,
-//! nothing registers with the SCM). Modes: `full`/`minimal` correctness
+//! Default lifecycle: the dt-loader mapper (reached through ks-sdk) loads
+//! the driver through `ks_sdk::start()` — the manual-map provider chain
+//! runs first (shellcode V3, `DriverEntry` runs in place, nothing
+//! registers with the SCM), and a chain that cannot run the driver
+//! falls back to a normal service load of the signed image. Modes:
+//! `full`/`minimal` correctness
 //! suites, `benchmark` performance only, `load` the provider × victim
 //! matrix, `shutdown` recovery. Readiness is the registry publication:
 //! poll `HKLM\SOFTWARE\KernelScript` until the driver publishes its object
@@ -114,9 +115,11 @@ fn open_step_log() {
 /// How the embedded driver image reaches the kernel.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum LoadMode {
-    /// KDU manual mapping (the default): the in-process KDU bridge runs
-    /// `DriverEntry` inside a mapped image (shellcode V3). No service, no
-    /// signature, no unload — teardown is the ring `shutdown` request,
+    /// SDK path (the default): `ks_sdk::start()` runs the manual-map
+    /// chain first (shellcode V3, `DriverEntry` inside a mapped image,
+    /// no signature check) and falls back to a service load when the
+    /// chain cannot run the driver. No unload either way — teardown is
+    /// the ring `shutdown` request,
     /// which makes the driver release its single-instance claim and erase
     /// its registry publication itself.
     Kdu,
@@ -1591,7 +1594,7 @@ fn run() -> i32 {
     let args: Vec<String> = std::env::args().collect();
     let full = args.iter().any(|a| a == "full");
     let iters: usize = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(200);
-    // Default load path is the service load with manual-map fallback;
+    // Default load path is manual mapping with a service-load fallback;
     // `ks-test sc ...` selects the legacy SCM lifecycle for regression
     // runs, `benchmark` runs the performance suite only, and `load`
     // sweeps every provider × victim combination through start_with.
@@ -1613,7 +1616,7 @@ fn run() -> i32 {
         }
     };
     match &embedded.mode {
-        LoadMode::Kdu => say("driver load mode: sdk (service load first, manual-map fallback)"),
+        LoadMode::Kdu => say("driver load mode: sdk (manual mapping first, service-load fallback)"),
         LoadMode::Sc { service } => {
             say(&format!("driver load mode: sc (legacy service {service})"));
         }
