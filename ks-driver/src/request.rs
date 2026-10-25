@@ -11,7 +11,7 @@ use crate::memory;
 use crate::wdm::*;
 use ks_core::ring::{RingHeader, RESPONSE_META_SIZE, RING_VERSION, STATE_RESPONSE};
 use ks_core::{
-    decode_request, encode_response_meta, Request, ResponseMeta, MAX_BATCH_WRITE_ENTRIES,
+    decode_request, encode_response_meta, HookOp, Request, ResponseMeta, MAX_BATCH_WRITE_ENTRIES,
     MAX_CHAIN_OFFSETS, MAX_DRIVER_TRANSFER_SIZE,
 };
 
@@ -326,6 +326,117 @@ fn execute(request: &Request<'_>, response: &mut [u8]) -> (NTSTATUS, ResponseMet
             crate::trace!("free pid=%llu a=%p", *pid, *address as *mut c_void);
             match memory::free(*pid, *address) {
                 Ok(()) => (STATUS_SUCCESS, scalar(0)),
+                Err(status) => (status, failure()),
+            }
+        }
+        Request::Hook { op } => execute_hook(op, bulk),
+    }
+}
+
+/// Kernel hook table operations. `Create` reports the id, the replaced
+/// length and the original prologue bytes (`bulk`); the `*All` variants
+/// report how many hooks they touched.
+fn execute_hook(op: &HookOp<'_>, bulk: &mut [u8]) -> (NTSTATUS, ResponseMeta) {
+    match op {
+        HookOp::Create { target, trampoline } => {
+            crate::trace!(
+                "hook create t=%p d=%p",
+                *target as *mut c_void,
+                *trampoline as *mut c_void
+            );
+            match crate::hook::create(*target, *trampoline) {
+                Ok((id, stolen_len, original)) => {
+                    if bulk.len() < stolen_len {
+                        return (STATUS_BUFFER_TOO_SMALL, failure());
+                    }
+                    bulk[..stolen_len].copy_from_slice(&original[..stolen_len]);
+                    (
+                        STATUS_SUCCESS,
+                        ResponseMeta {
+                            bulk_len: stolen_len as u32,
+                            count: stolen_len as u32,
+                            value: id,
+                        },
+                    )
+                }
+                Err(status) => (status, failure()),
+            }
+        }
+        HookOp::CreateShellcode { target, code } => {
+            crate::trace!(
+                "hook shellcode t=%p n=%lu",
+                *target as *mut c_void,
+                code.len() as u32
+            );
+            match crate::hook::create_shellcode(*target, code) {
+                Ok((id, stolen_len, original, code_address)) => {
+                    // bulk = original prologue bytes, then the little-endian
+                    // buffer address for diagnostics.
+                    let total = stolen_len + core::mem::size_of::<u64>();
+                    if bulk.len() < total {
+                        // The table entry exists now; drop it so a short ring
+                        // buffer cannot leak an enabled shellcode buffer.
+                        let _ = crate::hook::remove(id);
+                        return (STATUS_BUFFER_TOO_SMALL, failure());
+                    }
+                    bulk[..stolen_len].copy_from_slice(&original[..stolen_len]);
+                    bulk[stolen_len..total].copy_from_slice(&code_address.to_le_bytes());
+                    (
+                        STATUS_SUCCESS,
+                        ResponseMeta {
+                            bulk_len: total as u32,
+                            count: stolen_len as u32,
+                            value: id,
+                        },
+                    )
+                }
+                Err(status) => (status, failure()),
+            }
+        }
+        HookOp::Enable { id } => {
+            crate::trace!("hook enable id=%llu", id);
+            match crate::hook::enable(*id) {
+                status if nt_success(status) => (STATUS_SUCCESS, scalar(0)),
+                status => (status, failure()),
+            }
+        }
+        HookOp::Disable { id } => {
+            crate::trace!("hook disable id=%llu", id);
+            match crate::hook::disable(*id) {
+                status if nt_success(status) => (STATUS_SUCCESS, scalar(0)),
+                status => (status, failure()),
+            }
+        }
+        HookOp::Remove { id } => {
+            crate::trace!("hook remove id=%llu", id);
+            match crate::hook::remove(*id) {
+                status if nt_success(status) => (STATUS_SUCCESS, scalar(0)),
+                status => (status, failure()),
+            }
+        }
+        HookOp::EnableAll => match crate::hook::enable_all() {
+            Ok(count) => (STATUS_SUCCESS, scalar(count)),
+            Err(status) => (status, failure()),
+        },
+        HookOp::DisableAll => match crate::hook::disable_all() {
+            Ok(count) => (STATUS_SUCCESS, scalar(count)),
+            Err(status) => (status, failure()),
+        },
+        HookOp::RemoveAll => match crate::hook::remove_all() {
+            Ok(count) => (STATUS_SUCCESS, scalar(count)),
+            Err(status) => (status, failure()),
+        },
+        HookOp::SelfTest => {
+            crate::trace!("hook selftest");
+            match crate::hook::self_test() {
+                Ok(value) => (STATUS_SUCCESS, scalar(value)),
+                Err(status) => (status, failure()),
+            }
+        }
+        HookOp::ShellcodeSelfTest => {
+            crate::trace!("hook shellcode selftest");
+            match crate::hook::shellcode_self_test() {
+                Ok(value) => (STATUS_SUCCESS, scalar(value)),
                 Err(status) => (status, failure()),
             }
         }

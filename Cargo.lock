@@ -535,6 +535,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "ks-hook-test"
+version = "0.1.0"
+dependencies = [
+ "ks-core",
+ "ks-sdk",
+]
+
+[[package]]
 name = "ks-link"
 version = "0.1.0"
 dependencies = [

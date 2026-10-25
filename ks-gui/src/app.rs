@@ -155,11 +155,6 @@ impl EguiOverlay for KernelScriptApp {
                     // close action, not a request to keep the overlay alive.
                     glfw_backend.window.set_should_close(true);
                 }
-                crate::ce_window::CeOutcome::Quit => {
-                    // Same path the window's own close takes: the render
-                    // loop returns and `finish_on_exit` stops the driver.
-                    glfw_backend.window.set_should_close(true);
-                }
             }
         }
     }

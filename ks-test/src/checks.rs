@@ -553,6 +553,35 @@ fn check_alloc(t: &Target, failures: &mut Vec<(String, String)>) {
         }
         Ok(())
     });
+
+    // Kernel hooks are only exercised through their guard rails: creating a
+    // real one would patch live kernel code on the development machine.
+    check(
+        failures,
+        "kernel hook rejects bad addresses and ids",
+        || {
+            if ks_sdk::hook_create(0, 0xFFFF_F800_0000_1000).is_ok() {
+                return Err("null target accepted".into());
+            }
+            if ks_sdk::hook_create(0x1000, 0xFFFF_F800_0000_1000).is_ok() {
+                return Err("user-mode target accepted".into());
+            }
+            if ks_sdk::hook_create(0xFFFF_F800_0000_1000, 0x1000).is_ok() {
+                return Err("user-mode trampoline accepted".into());
+            }
+            if ks_sdk::hook_enable(0).is_ok() {
+                return Err("id 0 accepted".into());
+            }
+            if ks_sdk::hook_remove(0xDEAD_BEEF).is_ok() {
+                return Err("unknown id removed".into());
+            }
+            // Nothing was created, so the bulk calls must touch nothing.
+            if ks_sdk::hook_disable_all().map_err(|e| e.to_string())? != 0 {
+                return Err("disable_all touched an empty table".into());
+            }
+            Ok(())
+        },
+    );
 }
 
 /// Several threads hammer the single-slot ring through the client mutex:

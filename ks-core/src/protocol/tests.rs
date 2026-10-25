@@ -70,6 +70,75 @@ fn every_variant_round_trips() {
         pid: 9,
         address: 0x1A2B_0000,
     });
+    round_trip(&Request::Hook {
+        op: HookOp::Create {
+            target: 0xFFFF_F800_1234_5678,
+            trampoline: 0xFFFF_F800_9ABC_DEF0,
+        },
+    });
+    round_trip(&Request::Hook {
+        op: HookOp::Enable { id: 3 },
+    });
+    round_trip(&Request::Hook {
+        op: HookOp::Disable { id: 3 },
+    });
+    round_trip(&Request::Hook {
+        op: HookOp::Remove { id: 3 },
+    });
+    round_trip(&Request::Hook {
+        op: HookOp::EnableAll,
+    });
+    round_trip(&Request::Hook {
+        op: HookOp::DisableAll,
+    });
+    round_trip(&Request::Hook {
+        op: HookOp::RemoveAll,
+    });
+    round_trip(&Request::Hook {
+        op: HookOp::SelfTest,
+    });
+}
+
+#[test]
+fn hook_validation_requires_kernel_addresses() {
+    let mut buffer = [0u8; 8192];
+    // User-mode target/trampoline is refused before the driver sees it.
+    for (target, trampoline) in [
+        (0x1000_u64, 0xFFFF_F800_0000_1000_u64),
+        (0xFFFF_F800_0000_1000_u64, 0x2000_u64),
+        (0, 0),
+    ] {
+        assert_eq!(
+            encode_request(
+                &Request::Hook {
+                    op: HookOp::Create { target, trampoline }
+                },
+                &mut buffer
+            ),
+            Err(ProtocolError::InvalidPayload)
+        );
+    }
+    assert!(encode_request(
+        &Request::Hook {
+            op: HookOp::Create {
+                target: 0xFFFF_F800_0000_1000,
+                trampoline: 0xFFFF_F800_0000_2000,
+            }
+        },
+        &mut buffer
+    )
+    .is_ok());
+    assert_eq!(
+        encode_request(
+            &Request::Hook {
+                op: HookOp::Enable { id: 0 }
+            },
+            &mut buffer
+        ),
+        Err(ProtocolError::InvalidPayload)
+    );
+    assert!(is_kernel_address(0xFFFF_8000_0000_0000));
+    assert!(!is_kernel_address(0x7FFF_FFFF_FFFF));
 }
 #[test]
 fn batch_write_round_trips_at_every_supported_count() {

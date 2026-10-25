@@ -6,6 +6,7 @@ members = [
     "ks-sdk",
     "ks-gui",
     "ks-test",
+    "ks-hook-test",
 ]
 resolver = "2"
 

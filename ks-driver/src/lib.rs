@@ -5,6 +5,7 @@
 #![allow(clippy::macro_metavars_in_unsafe)]
 
 pub mod comm;
+pub mod hook;
 pub mod lock;
 pub mod memory;
 pub mod request;

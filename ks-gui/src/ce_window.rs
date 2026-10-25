@@ -504,8 +504,6 @@ pub(crate) enum CeOutcome {
     Running,
     /// The user closed the memory-tool window; the overlay keeps running.
     Closed,
-    /// The user asked to quit the whole GUI.
-    Quit,
 }
 
 /// The CE-style window: glfw window, own egui context and renderer.
@@ -725,9 +723,8 @@ impl CeWindow {
         let ctx = self.ctx.clone();
         let commands = self.commands.clone();
         let state = &mut self.state;
-        let mut quit_requested = false;
         let full_output = ctx.run(raw_input, |ctx| {
-            draw_ui(ctx, state, &commands, driver, &mut quit_requested);
+            draw_ui(ctx, state, &commands, driver);
         });
         let primitives = ctx.tessellate(full_output.shapes, full_output.pixels_per_point);
         let framebuffer = self.framebuffer;
@@ -753,11 +750,7 @@ impl CeWindow {
         // The overlay renders right after `gui_run`; hand the GL context
         // back so its painter sees the context it was created for.
         overlay.window.make_current();
-        if quit_requested {
-            CeOutcome::Quit
-        } else {
-            CeOutcome::Running
-        }
+        CeOutcome::Running
     }
 
     /// Queues the current hex page read when none is in flight, so the view
@@ -999,45 +992,7 @@ fn draw_ui(
     state: &mut ToolState,
     commands: &Sender<Command>,
     driver: &crate::driver::DriverControl,
-    quit: &mut bool,
 ) {
-    egui::TopBottomPanel::top("ce_menu").show(ctx, |ui| {
-        egui::menu::bar(ui, |ui| {
-            ui.menu_button("文件", |ui| {
-                if ui.button("退出程序").clicked() {
-                    *quit = true;
-                    ui.close_menu();
-                }
-            });
-            ui.menu_button("进程", |ui| {
-                if ui.button("刷新进程列表").clicked() {
-                    let _ = commands.send(Command::ListProcesses);
-                    ui.close_menu();
-                }
-                let has_process = state.selected_pid.is_some();
-                if ui
-                    .add_enabled(has_process, egui::Button::new("关闭进程"))
-                    .clicked()
-                {
-                    state.forget_process(commands);
-                    ui.close_menu();
-                }
-            });
-            ui.menu_button("帮助", |ui| {
-                ui.label("KernelScript 内存工具");
-                ui.label("驱动内存读取 · 十六进制监视 · Lua 脚本编辑");
-            });
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let label = match (state.selected_pid, state.base) {
-                    (Some(pid), Some(base)) => format!("进程 {pid}  基址 0x{base:X}"),
-                    (Some(pid), None) => format!("进程 {pid}（读取基址...）"),
-                    (None, _) => "未选择进程".to_owned(),
-                };
-                ui.label(label);
-            });
-        });
-    });
-
     // Full-width log bar: driver phase + lifecycle/startup log. Added before
     // the side panels so it spans the whole window.
     egui::TopBottomPanel::bottom("ce_logs")
@@ -1072,6 +1027,15 @@ fn draw_ui(
                         .desired_width(90.0)
                         .hint_text("过滤"),
                 );
+                if ui.small_button("刷新").clicked() {
+                    let _ = commands.send(Command::ListProcesses);
+                }
+                if ui
+                    .add_enabled(state.selected_pid.is_some(), egui::Button::new("关闭"))
+                    .clicked()
+                {
+                    state.forget_process(commands);
+                }
             });
             ui.separator();
             let filter = state.filter.to_lowercase();

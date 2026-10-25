@@ -15,8 +15,9 @@ mod session;
 
 use heapless::Vec as SmallVec;
 use ks_core::protocol::{
-    valid_alloc_protect, BatchWriteItem, ProtocolError, Request, MAX_ALLOC_SIZE, MAX_BATCH_ENTRIES,
-    MAX_BATCH_WRITE_ENTRIES, MAX_CHAIN_OFFSETS,
+    is_kernel_address, valid_alloc_protect, BatchWriteItem, HookOp, ProtocolError, Request,
+    ResponseMeta, MAX_ALLOC_SIZE, MAX_BATCH_ENTRIES, MAX_BATCH_WRITE_ENTRIES, MAX_CHAIN_OFFSETS,
+    MAX_HOOK_SHELLCODE, MAX_HOOK_STOLEN_LEN,
 };
 
 pub use error::LinkError;
@@ -183,6 +184,162 @@ pub fn alloc(pid: u64, size: usize, protect: u32) -> Result<u64, LinkError> {
 pub fn free(pid: u64, address: u64) -> Result<(), LinkError> {
     let mut buffer = [0u8; SMALL_REQUEST_BUFFER];
     submit(&Request::Free { pid, address }, &mut buffer, &mut []).map(|_| ())
+}
+
+/// A recorded kernel hook, as returned by [`hook_create`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct KernelHook {
+    /// Table id used by the enable/disable/remove calls (never 0).
+    pub id: u64,
+    /// Number of instruction bytes the jump replaces.
+    pub replaced_len: usize,
+    /// Original bytes at the target, in order.
+    pub original: Vec<u8>,
+}
+
+fn hook_request(op: HookOp) -> Result<(ResponseMeta, usize), LinkError> {
+    let mut buffer = [0u8; SMALL_REQUEST_BUFFER];
+    submit(&Request::Hook { op }, &mut buffer, &mut [])
+}
+
+/// Records a MinHook-style kernel inline hook on `target` and leaves it
+/// **disabled**. `trampoline` must be an executable kernel address the
+/// caller already owns: the driver only jumps to it, it never builds one.
+///
+/// The driver decodes the prologue to decide how many bytes the jump
+/// replaces (never splitting an instruction) and returns them so the caller
+/// can inspect/rebuild the trampoline. Call [`hook_enable`] to apply it.
+///
+/// Both addresses must be in the kernel half (`>= 0xFFFF8000_00000000`).
+/// The caller guarantees nothing executes the prologue during patching, and
+/// must [`hook_remove`] before freeing the trampoline.
+pub fn hook_create(target: u64, trampoline: u64) -> Result<KernelHook, LinkError> {
+    if !is_kernel_address(target) || !is_kernel_address(trampoline) {
+        return Err(LinkError::Encode(ProtocolError::InvalidPayload));
+    }
+    let mut original = vec![0u8; MAX_HOOK_STOLEN_LEN];
+    let mut buffer = [0u8; SMALL_REQUEST_BUFFER];
+    let (meta, copied) = submit(
+        &Request::Hook {
+            op: HookOp::Create { target, trampoline },
+        },
+        &mut buffer,
+        &mut original,
+    )?;
+    original.truncate(copied);
+    Ok(KernelHook {
+        id: meta.value,
+        replaced_len: meta.count as usize,
+        original,
+    })
+}
+
+/// Applies a recorded hook's jump.
+pub fn hook_enable(id: u64) -> Result<(), LinkError> {
+    hook_request(HookOp::Enable { id }).map(|_| ())
+}
+
+/// Restores a hook's original prologue bytes, keeping the entry so it can be
+/// enabled again.
+pub fn hook_disable(id: u64) -> Result<(), LinkError> {
+    hook_request(HookOp::Disable { id }).map(|_| ())
+}
+
+/// Disables (if enabled) and drops a hook. Unknown ids fail.
+pub fn hook_remove(id: u64) -> Result<(), LinkError> {
+    hook_request(HookOp::Remove { id }).map(|_| ())
+}
+
+/// Enables every recorded hook; returns how many were touched.
+pub fn hook_enable_all() -> Result<u64, LinkError> {
+    hook_request(HookOp::EnableAll).map(|(meta, _)| meta.value)
+}
+
+/// Restores every patched hook; returns how many were touched.
+pub fn hook_disable_all() -> Result<u64, LinkError> {
+    hook_request(HookOp::DisableAll).map(|(meta, _)| meta.value)
+}
+
+/// Removes every hook in reverse creation order; returns how many were
+/// touched. The `Shutdown` request and the unload path do this implicitly.
+pub fn hook_remove_all() -> Result<u64, LinkError> {
+    hook_request(HookOp::RemoveAll).map(|(meta, _)| meta.value)
+}
+
+/// Exercises the whole MDL patch path on a function inside the driver itself
+/// (create → enable → verify → disable → verify → remove). Returns `1` when
+/// a jump was applied and the original bytes were restored, `0` when the
+/// platform refused the write (HVCI keeps driver text read-only).
+pub fn hook_self_test() -> Result<u64, LinkError> {
+    hook_request(HookOp::SelfTest).map(|(meta, _)| meta.value)
+}
+
+/// A shellcode hook: the driver owns the executable detour buffer.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ShellcodeHook {
+    /// Table id used by `hook_enable`/`hook_disable`/`hook_remove`.
+    pub id: u64,
+    /// Number of instruction bytes the jump replaces.
+    pub replaced_len: usize,
+    /// Original bytes at the target, in order.
+    pub original: Vec<u8>,
+    /// Kernel address of the driver-allocated copy of `code`.
+    pub code_address: u64,
+}
+
+/// Records a kernel inline hook whose detour is the supplied machine code.
+///
+/// The driver allocates non-paged kernel memory, copies `code` into it, marks
+/// it executable (`MmProtectMdlSystemAddress`) and points the target's jump
+/// there. The buffer belongs to the hook entry: [`hook_remove`],
+/// [`hook_remove_all`] and driver shutdown free it (after restoring the
+/// original bytes).
+///
+/// `code` must be position-independent x64 that returns to the hook's caller
+/// (or jumps back into the trampoline the caller built). Maximum
+/// [`ks_core::protocol::MAX_HOOK_SHELLCODE`] bytes. The same safety contract
+/// as [`hook_create`] applies: nothing may execute the prologue while it is
+/// being patched, and the target must be a real kernel address.
+pub fn hook_shellcode(target: u64, code: &[u8]) -> Result<ShellcodeHook, LinkError> {
+    if !is_kernel_address(target) {
+        return Err(LinkError::Encode(ProtocolError::InvalidPayload));
+    }
+    if code.is_empty() || code.len() > MAX_HOOK_SHELLCODE {
+        return Err(LinkError::Encode(ProtocolError::TooLarge));
+    }
+    let mut bulk = vec![0u8; MAX_HOOK_STOLEN_LEN + core::mem::size_of::<u64>()];
+    let mut buffer = vec![0u8; SMALL_REQUEST_BUFFER + code.len()];
+    let (meta, copied) = submit(
+        &Request::Hook {
+            op: HookOp::CreateShellcode { target, code },
+        },
+        &mut buffer,
+        &mut bulk,
+    )?;
+    let replaced_len = meta.count as usize;
+    if copied < replaced_len + core::mem::size_of::<u64>() {
+        return Err(LinkError::Decode(ProtocolError::InvalidPayload));
+    }
+    let code_address = u64::from_le_bytes(
+        bulk[replaced_len..replaced_len + 8]
+            .try_into()
+            .map_err(|_| LinkError::Decode(ProtocolError::InvalidPayload))?,
+    );
+    Ok(ShellcodeHook {
+        id: meta.value,
+        replaced_len,
+        original: bulk[..replaced_len].to_vec(),
+        code_address,
+    })
+}
+
+/// Runs the driver's shellcode self test: allocates executable kernel memory,
+/// hooks an internal leaf function with a `mov eax, imm32; ret` stub, calls
+/// through the hook, disables, calls again and removes. Returns `1` when the
+/// call observed the stub value and the original value afterwards, `0` when
+/// the platform refused the executable allocation (HVCI).
+pub fn hook_shellcode_self_test() -> Result<u64, LinkError> {
+    hook_request(HookOp::ShellcodeSelfTest).map(|(meta, _)| meta.value)
 }
 
 fn addresses_small_vec<const N: usize>(

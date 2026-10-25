@@ -15,17 +15,18 @@ pub use windows_sys::Wdk::Storage::FileSystem::{
     KeStackAttachProcess, KeUnstackDetachProcess, PsLookupProcessByProcessId, KAPC_STATE,
 };
 pub use windows_sys::Wdk::System::SystemServices::{
-    ExAcquireFastMutex, ExReleaseFastMutex, Executive, IoAllocateMdl, IoFreeMdl, IoReadAccess,
-    KeInitializeEvent, KeSetPriorityThread, KeWaitForSingleObject, KernelMode, MmCached,
-    MmGetSystemRoutineAddress, MmMapLockedPagesSpecifyCache, MmMapViewInSystemSpace, MmUnlockPages,
-    MmUnmapLockedPages, MmUnmapViewInSystemSpace, NormalPagePriority, ObReferenceObjectByHandle,
-    PsTerminateSystemThread, UserMode,
+    ExAcquireFastMutex, ExFreePoolWithTag, ExReleaseFastMutex, Executive, IoAllocateMdl, IoFreeMdl,
+    IoReadAccess, KeInitializeEvent, KeSetPriorityThread, KeWaitForSingleObject, KernelMode,
+    MmCached, MmGetSystemRoutineAddress, MmMapLockedPagesSpecifyCache, MmMapViewInSystemSpace,
+    MmUnlockPages, MmUnmapLockedPages, MmUnmapViewInSystemSpace, NormalPagePriority,
+    ObReferenceObjectByHandle, PsTerminateSystemThread, UserMode,
 };
 pub use windows_sys::Win32::Foundation::{
     HANDLE, NTSTATUS, OBJ_CASE_INSENSITIVE, STATUS_ACCESS_VIOLATION, STATUS_BUFFER_TOO_SMALL,
     STATUS_INSUFFICIENT_RESOURCES, STATUS_INTEGER_OVERFLOW, STATUS_INVALID_ADDRESS,
-    STATUS_INVALID_PARAMETER, STATUS_NOT_SUPPORTED, STATUS_OBJECT_NAME_COLLISION,
-    STATUS_OBJECT_NAME_NOT_FOUND, STATUS_QUOTA_EXCEEDED, STATUS_SUCCESS, UNICODE_STRING,
+    STATUS_INVALID_PAGE_PROTECTION, STATUS_INVALID_PARAMETER, STATUS_NOT_SUPPORTED,
+    STATUS_OBJECT_NAME_COLLISION, STATUS_OBJECT_NAME_NOT_FOUND, STATUS_QUOTA_EXCEEDED,
+    STATUS_SUCCESS, UNICODE_STRING,
 };
 pub use windows_sys::Win32::Security::{ACL, ACL_REVISION, PSID, SECURITY_DESCRIPTOR};
 pub use windows_sys::Win32::System::Kernel::{SynchronizationEvent, EVENT_TYPE};
@@ -36,6 +37,8 @@ pub type Pvoid = *mut c_void;
 pub const OBJ_KERNEL_HANDLE: u32 = 0x0000_0200;
 /// Read/write, non-executable backing for the ring section.
 pub const PAGE_READWRITE: u32 = 0x0000_0004;
+/// Executable protection applied to driver-owned shellcode buffers.
+pub const PAGE_EXECUTE_READWRITE: u32 = 0x0000_0040;
 /// Commit the section's pages rather than reserving them.
 pub const SEC_COMMIT: u32 = 0x0800_0000;
 pub const SECTION_ALL_ACCESS: u32 = 0x000F_001F;
@@ -206,6 +209,16 @@ extern "system" {
 
     pub fn ObDereferenceObject(object: Pvoid);
 
+    /// Executable non-paged pool (`ExAllocatePool2` with
+    /// `POOL_FLAG_NON_PAGED_EXECUTE`). Returns NULL when policy refuses
+    /// executable pool; freed with [`ExFreePoolWithTag`].
+    pub fn ExAllocatePool2(flags: u64, number_of_bytes: usize, tag: u32) -> Pvoid;
+
+    /// Page-table probe used before patching kernel code: every page the
+    /// hook write touches is checked first, so a bad address fails instead
+    /// of bugchecking inside `MmProbeAndLockPages`.
+    pub fn MmIsAddressValid(virtual_address: Pvoid) -> u8;
+
     /// Target-process virtual-memory allocation through the attached
     /// address space (`NT_CURRENT_PROCESS`). The kernel rounds `region_size`
     /// up to whole pages and writes the rounded size back.
@@ -235,7 +248,10 @@ extern "system" {
 // Implemented in seh_shim.c: MmCopyVirtualMemory and MmProbeAndLockPages
 // need an SEH boundary that Rust frames cannot provide. These stay in a
 // plain extern block so the references resolve against the bundled shim
-// object instead of a generated import table.
+// object instead of a generated import table. Framework builds (plain
+// `cargo check`/`cargo test`, no WDK) get non-functional Rust stubs below so
+// the lib test binary links without the C object.
+#[cfg(feature = "wdk")]
 extern "system" {
     pub fn ks_copy_process_memory(
         source_process: isize,
@@ -252,6 +268,40 @@ extern "system" {
         copied: *mut usize,
     ) -> NTSTATUS;
     pub fn ks_probe_and_lock_pages(mdl: *mut MDL, mode: i8, access: i32) -> NTSTATUS;
+}
+
+/// Framework-mode stub: never reached by a real driver image.
+#[cfg(not(feature = "wdk"))]
+pub unsafe extern "system" fn ks_copy_process_memory(
+    _source_process: isize,
+    _source_address: Pvoid,
+    _target_address: Pvoid,
+    _size: usize,
+    _copied: *mut usize,
+) -> NTSTATUS {
+    STATUS_NOT_SUPPORTED
+}
+
+/// Framework-mode stub: never reached by a real driver image.
+#[cfg(not(feature = "wdk"))]
+pub unsafe extern "system" fn ks_write_process_memory(
+    _target_process: isize,
+    _source_address: Pvoid,
+    _target_address: Pvoid,
+    _size: usize,
+    _copied: *mut usize,
+) -> NTSTATUS {
+    STATUS_NOT_SUPPORTED
+}
+
+/// Framework-mode stub: never reached by a real driver image.
+#[cfg(not(feature = "wdk"))]
+pub unsafe extern "system" fn ks_probe_and_lock_pages(
+    _mdl: *mut MDL,
+    _mode: i8,
+    _access: i32,
+) -> NTSTATUS {
+    STATUS_NOT_SUPPORTED
 }
 
 /// Size of `OBJECT_ATTRIBUTES` as the kernel expects it in `Length`.

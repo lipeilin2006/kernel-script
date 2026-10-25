@@ -16,7 +16,6 @@ use core::fmt;
 
 use heapless::Vec as SmallVec;
 use serde::{Deserialize, Serialize};
-
 /// Largest single memory operation accepted by the driver.
 pub const MAX_DRIVER_TRANSFER_SIZE: usize = 4096;
 /// Entries in one batch read.
@@ -43,6 +42,73 @@ pub const ALLOC_PROTECT_EXECUTE_READWRITE: u32 = 0x40;
 /// accepts. Everything else is rejected at every trust boundary.
 pub const fn valid_alloc_protect(protect: u32) -> bool {
     protect == ALLOC_PROTECT_READWRITE || protect == ALLOC_PROTECT_EXECUTE_READWRITE
+}
+
+/// Slots in the driver-side kernel hook table.
+pub const MAX_KERNEL_HOOKS: usize = 16;
+/// Longest entry prologue a hook may replace, in bytes (absolute jump plus
+/// alignment headroom).
+pub const MAX_HOOK_STOLEN_LEN: usize = 16;
+/// Smallest replacement length: a `jmp rel32` is five bytes.
+pub const MIN_HOOK_STOLEN_LEN: usize = 5;
+/// Largest shellcode blob [`HookOp::CreateShellcode`] accepts.
+pub const MAX_HOOK_SHELLCODE: usize = 1024;
+/// Lowest address treated as kernel space on x64 (`0xFFFF8000_00000000`).
+pub const MIN_KERNEL_ADDRESS: u64 = 0xFFFF_8000_0000_0000;
+
+/// Whether `address` is in the x64 kernel half of the address space.
+pub const fn is_kernel_address(address: u64) -> bool {
+    address >= MIN_KERNEL_ADDRESS
+}
+
+/// One kernel-hook table operation, MinHook-style: `Create` only records the
+/// hook (state `disabled`), `Enable`/`Disable` toggle the patched bytes, and
+/// `Remove` restores the original bytes and drops the entry.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum HookOp<'a> {
+    /// Record a hook on `target`. The driver decodes the prologue to find the
+    /// replaced length and builds the jump; `trampoline` is the caller's
+    /// already-executable detour target.
+    Create {
+        target: u64,
+        trampoline: u64,
+    },
+    /// Record a hook whose detour is `code`: the driver allocates executable
+    /// kernel memory, copies the bytes there and points the jump at that
+    /// buffer. The buffer is owned by the hook entry and freed by
+    /// `Remove`/`RemoveAll`/shutdown. The response carries the original
+    /// prologue bytes followed by the buffer address (little-endian u64).
+    CreateShellcode {
+        target: u64,
+        #[serde(borrow)]
+        code: &'a [u8],
+    },
+    /// Patch the target so calls reach the trampoline again.
+    Enable {
+        id: u64,
+    },
+    /// Restore the original prologue bytes.
+    Disable {
+        id: u64,
+    },
+    /// Restore the original bytes (if enabled) and drop the entry.
+    Remove {
+        id: u64,
+    },
+    EnableAll,
+    DisableAll,
+    RemoveAll,
+    /// Runs one create → enable → verify → disable → remove cycle against a
+    /// function inside the driver itself, so the whole MDL patch path can be
+    /// exercised without touching foreign kernel code. Answers
+    /// `value = 1` (patched and restored) or `0` (write refused, e.g. HVCI).
+    SelfTest,
+    /// Same as [`HookOp::SelfTest`] for the shellcode path: allocates
+    /// executable kernel memory, hooks the driver's own leaf function with a
+    /// tiny `mov eax, imm32; ret` stub, calls it, disables and removes.
+    /// Answers `value = 1` (verified) or `0` (allocation/protection refused,
+    /// e.g. HVCI).
+    ShellcodeSelfTest,
 }
 
 /// One entry of a batch write. `data` borrows straight out of the ring.
@@ -135,6 +201,13 @@ pub enum Request<'a> {
     Free {
         pid: u64,
         address: u64,
+    },
+    /// One kernel-hook table operation (see [`HookOp`]). `Create` returns the
+    /// new id in [`ResponseMeta::value`], the replaced length in
+    /// [`ResponseMeta::count`] and the original prologue bytes in the bulk
+    /// region; the `*All` variants return the number of affected hooks.
+    Hook {
+        op: HookOp<'a>,
     },
 }
 
@@ -321,6 +394,32 @@ impl<'a> Request<'a> {
                 }
                 Ok(())
             }
+            Self::Hook { op } => match op {
+                HookOp::Create { target, trampoline } => {
+                    if !is_kernel_address(*target) || !is_kernel_address(*trampoline) {
+                        return Err(ProtocolError::InvalidPayload);
+                    }
+                    Ok(())
+                }
+                HookOp::CreateShellcode { target, code } => {
+                    if !is_kernel_address(*target) {
+                        return Err(ProtocolError::InvalidPayload);
+                    }
+                    if code.is_empty() || code.len() > MAX_HOOK_SHELLCODE {
+                        return Err(ProtocolError::InvalidPayload);
+                    }
+                    Ok(())
+                }
+                HookOp::Enable { id } | HookOp::Disable { id } | HookOp::Remove { id } => {
+                    if *id == 0 {
+                        Err(ProtocolError::InvalidPayload)
+                    } else {
+                        Ok(())
+                    }
+                }
+                HookOp::EnableAll | HookOp::DisableAll | HookOp::RemoveAll => Ok(()),
+                HookOp::SelfTest | HookOp::ShellcodeSelfTest => Ok(()),
+            },
         }
     }
 }

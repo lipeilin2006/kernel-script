@@ -161,6 +161,8 @@ pub fn start() -> NTSTATUS {
         // The lock table's fast mutex must exist before the first `Lock`
         // request can arrive; initialisation cannot fail.
         crate::lock::init();
+        // Same for the kernel hook table.
+        crate::hook::init();
         let status = spawn_worker();
         if !nt_success(status) {
             crate::trace!("worker spawn failed 0x%lx", status as u32);
@@ -251,6 +253,9 @@ pub unsafe fn stop() {
     // clear; dropping the table keeps every target write inside the
     // driver's lifetime.
     crate::lock::clear_table();
+    // Kernel hooks write kernel code: restore every patched prologue before
+    // the trampolines they point at can go away.
+    crate::hook::shutdown();
     let response_event = RESPONSE_EVENT.swap(0, Ordering::SeqCst) as HANDLE;
     let section = SECTION_HANDLE.swap(0, Ordering::SeqCst) as HANDLE;
     let mapped = MAPPED_BASE.swap(0, Ordering::SeqCst) as *mut u8;
@@ -312,6 +317,9 @@ unsafe extern "system" fn worker(_context: *mut c_void) {
                 // The response is already published; drop the lock table
                 // so a shut-down driver performs no further target writes.
                 crate::lock::clear_table();
+                // Restore patched kernel prologues before the worker exits:
+                // a hook left pointing at freed pages crashes the machine.
+                crate::hook::shutdown();
                 // Then release everything `start` acquired. A manually
                 // mapped image (KDU) never runs `DriverUnload`, so this is
                 // its only chance to free the ring objects, the registry

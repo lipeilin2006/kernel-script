@@ -5,9 +5,10 @@ pub mod ring;
 
 pub use protocol::{
     decode_request, decode_response_meta, encode_request, encode_response_meta, BatchWriteItem,
-    ProtocolError, Request, ResponseMeta, MAX_BATCH_ENTRIES, MAX_BATCH_WRITE_ENTRIES,
-    MAX_CHAIN_OFFSETS, MAX_DRIVER_TRANSFER_SIZE, MAX_MEMORY_LOCKS, MAX_MEMORY_LOCK_SIZE,
-    MAX_WRITE_SIZE,
+    HookOp, ProtocolError, Request, ResponseMeta, MAX_BATCH_ENTRIES, MAX_BATCH_WRITE_ENTRIES,
+    MAX_CHAIN_OFFSETS, MAX_DRIVER_TRANSFER_SIZE, MAX_HOOK_SHELLCODE, MAX_HOOK_STOLEN_LEN,
+    MAX_KERNEL_HOOKS, MAX_MEMORY_LOCKS, MAX_MEMORY_LOCK_SIZE, MAX_WRITE_SIZE, MIN_HOOK_STOLEN_LEN,
+    MIN_KERNEL_ADDRESS,
 };
 pub use ring::{
     header, request_bytes, response_bytes, RingHeader, REQUEST_EVENT_CLIENT_NAME,

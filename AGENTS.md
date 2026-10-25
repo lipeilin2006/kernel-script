@@ -4,7 +4,7 @@
 
 ## Project Scope
 
-`kernel-script` is a Windows-only Rust workspace with five crates:
+`kernel-script` is a Windows-only Rust workspace with six crates:
 
 - `ks-core`: shared `no_std`, allocation-free protocol and ring-layout
   definitions (postcard/serde/heapless only; no Windows API dependencies).
@@ -42,8 +42,15 @@
   whole table in order until one maps the driver. Neither the target
   image nor anything else mapper-related
   is ever compiled: no `build.rs`, no `cc`, no MSVC requirement for the
-  workspace build. `ks-gui` and `ks-test` depend on `ks-sdk`
-  (not `ks-link` directly).
+  workspace build. `ks-gui`, `ks-test` and `ks-hook-test` depend on
+  `ks-sdk` (not `ks-link` directly).
+- `ks-hook-test`: minimal end-to-end harness for the kernel hook API. It
+  starts (or reuses) the driver, checks the SDK guard rails, runs the
+  driver's own hook self test (`HookOp::SelfTest`: create → enable →
+  verify the jump → disable → verify the original bytes → remove on a leaf
+  function inside the driver image) and stops the driver. It never patches
+  foreign kernel code; a `0` result means the platform refused the write
+  (HVCI). Release builds embed the elevation manifest.
 - `ks-gui`: user-mode egui/eframe OpenGL GUI and Lua runtime. It owns the
    Lua VM, the synchronous `sync_ipc` facade over `ks-sdk` (the re-exported
    link API), the draw command
@@ -150,8 +157,8 @@ Rules:
   created on the GUI thread with its own `egui::Context` and
   `ThreeDBackend`. It opens automatically at startup; closing it leaves
   the overlay running (the overlay's `内存工具` window reopens it). Layout:
-  a menu bar (`文件`/`进程`/`帮助`), the process list on the left, a
-  full-width log bar at the bottom (driver phase plus lifecycle/startup
+  the process list on the left, a full-width log bar at the bottom (driver
+  phase plus lifecycle/startup
   log) and a tabbed centre (`内存查看` / `Lua 脚本` / `修改`, also
   Ctrl+1/2/3):
   - `内存查看`: hex view anchored at the target's module base, paged
@@ -279,7 +286,7 @@ Round-trip rules (implemented in `ks-link/src/session.rs`):
 Payloads are postcard-encoded (`ks-core/src/protocol/`): `Ping`,
 `GetProcessBase`, `Read`/`Write` (with `rva` and `mdl` flags), `BatchRead`,
 `BatchWrite`, `TraverseChain`, `Shutdown`, `Lock`, `Unlock`, `UnlockAll`,
-`Alloc`, `Free`.
+`Alloc`, `Free`, `Hook` (with a `HookOp` payload).
 The response is a fixed 64-byte
 `ResponseMeta` slot followed by a raw bulk region the driver fills in
 place.
@@ -387,6 +394,60 @@ the first kernel lock worker:
   are held, do not move the polling wait to a blocking wait while the
   table is non-empty (requests would stall behind a whole sweep), and do
   not move the table back to user mode.
+
+## Kernel Hooks (MDL, MinHook-style)
+
+`ks-driver/src/hook.rs` implements a MinHook-shaped hook manager for
+kernel code. The driver owns everything MinHook owns except trampoline
+generation: it decodes the target prologue, builds the jump, keeps an
+enabled/disabled state machine, rejects duplicate targets and tears hooks
+down LIFO. The caller supplies an already-executable detour/trampoline.
+
+- Protocol: `Request::Hook { op }` with `HookOp::{Create, Enable, Disable,
+  Remove, EnableAll, DisableAll, RemoveAll}`. `Create` answers `value = id`,
+  `count = replaced_len` and the original prologue bytes in bulk.
+- SDK surface (`ks-sdk` re-export of ks-link): `hook_create(target,
+  trampoline) -> KernelHook`, `hook_enable`, `hook_disable`, `hook_remove`,
+  `hook_enable_all`, `hook_disable_all`, `hook_remove_all`. Rust only —
+  not exposed to Lua: a script cannot own the trampoline lifetime.
+- Shellcode variant: `hook_shellcode(target, code) -> ShellcodeHook` and
+  `hook_shellcode_self_test()`. The driver allocates executable non-paged
+  pool (`ExAllocatePool2` with `POOL_FLAG_NON_PAGED_EXECUTE`), copies `code`
+  there and points the jump at that buffer; the buffer belongs to the hook
+  entry and is freed by `hook_remove`/`hook_remove_all`/shutdown *after* the
+  original bytes are restored. Max `MAX_HOOK_SHELLCODE` (1 KiB). HVCI (W^X)
+  makes the allocation fail — that is reported as
+  `STATUS_INVALID_PAGE_PROTECTION` and the self test treats it as skipped.
+- Both addresses must be in the kernel half
+  (`ks_core::protocol::is_kernel_address`, `>= 0xFFFF8000_00000000`);
+  ks-core rejects anything else before the driver sees it.
+- Jump encoding: `E9 rel32` (5 bytes) when the trampoline is within
+  ±2 GiB of `target + 5`, otherwise the 14-byte `FF 25 00000000 <addr64>`.
+  `replaced_len` covers whole instructions only — the decoder never splits
+  an instruction, and returns `STATUS_NOT_SUPPORTED` for prologues it
+  cannot decode (VEX/EVEX, three-byte maps, unknown opcodes) instead of
+  guessing.
+- Patching goes through an MDL: `IoAllocateMdl` →
+  `ks_probe_and_lock_pages(KernelMode)` → `MmMapLockedPagesSpecifyCache`
+  → copy → unmap/unlock/free, at `PASSIVE_LEVEL` with no other driver lock
+  held. `MmIsAddressValid` guards every touched page first so a bad
+  address fails with `STATUS_INVALID_ADDRESS` instead of bugchecking in
+  the probe.
+- `Request::Shutdown`, `comm::stop` and `DriverUnload` all restore every
+  patched prologue (`hook::shutdown`) before the lock table is dropped and
+  before the ring objects go away — never leave a jump pointing at memory
+  that is about to disappear.
+- Limits: 16 entries (`MAX_KERNEL_HOOKS`), 16 storable bytes per entry
+  (`MAX_HOOK_STOLEN_LEN`), ids start at 1 and are never reused. Duplicate
+  targets answer `STATUS_OBJECT_NAME_COLLISION`, unknown ids
+  `STATUS_OBJECT_NAME_NOT_FOUND`, a full table `STATUS_QUOTA_EXCEEDED`.
+- Hard limits of kernel inline hooking, which the API does **not** detect
+  or work around: PatchGuard-protected bytes, HVCI-enforced code pages
+  (`STATUS_INVALID_PAGE_PROTECTION`), a thread already executing inside
+  the replaced prologue (kernel code has no safe thread-freeze), and a
+  trampoline that does not reproduce the stolen instructions plus a jump
+  back to `target + replaced_len`. Misuse bugchecks the machine; the
+  caller must remove hooks before freeing the trampoline.
 
 ## Driver Import Rules (ntdll.dll trap)
 
