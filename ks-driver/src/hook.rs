@@ -1,4 +1,4 @@
-//! MinHook-style kernel inline hooks, applied through MDL mappings.
+//! MinHook-style inline hooks, applied through MDL mappings.
 //!
 //! The driver owns the whole lifecycle a user-mode hook library would own —
 //! entry-prologue instruction decoding, jump construction, an
@@ -6,6 +6,15 @@
 //! except trampoline generation: the caller supplies an already-executable
 //! detour address (its own trampoline: relocated stolen instructions plus a
 //! jump back to `target + replaced_len`).
+//!
+//! Every operation names a target space through `pid`: `0` means the kernel
+//! half (global kernel text, patched through a kernel MDL), anything else
+//! means that process's user half — the driver reads the prologue with
+//! `MmCopyVirtualMemory` and writes the patch through an MDL attach that
+//! bypasses user write-protection, exactly like `memory::write_process_memory_mdl`.
+//! Executable detour buffers are allocated in the same space the target
+//! lives in: kernel pool for `pid = 0`, `ZwAllocateVirtualMemory` in the
+//! target process otherwise.
 //!
 //! Safety contract (also mirrored in AGENTS.md):
 //! - the caller guarantees no thread is executing the patched prologue while
@@ -19,7 +28,7 @@
 //! - all operations run on the ring worker at `PASSIVE_LEVEL`, without any
 //!   other driver lock held, and are panic-free.
 
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use core::{cell::UnsafeCell, ptr};
 
 use ks_core::protocol::{MAX_HOOK_SHELLCODE, MAX_HOOK_STOLEN_LEN, MAX_KERNEL_HOOKS};
@@ -35,6 +44,8 @@ const RELATIVE_JUMP_LEN: usize = 5;
 #[derive(Clone, Copy)]
 struct HookEntry {
     id: u64,
+    /// `0` = kernel half; otherwise the owning process.
+    pid: u64,
     target: u64,
     /// Bytes replaced at `target` (an instruction boundary, >= patch_len).
     stolen_len: usize,
@@ -42,8 +53,8 @@ struct HookEntry {
     patch_len: usize,
     patch: [u8; MAX_HOOK_STOLEN_LEN],
     original: [u8; MAX_HOOK_STOLEN_LEN],
-    /// Driver-owned executable buffer holding the detour bytes, if this hook
-    /// was created from shellcode. Freed by `remove`/`shutdown`.
+    /// Executable buffer holding the detour bytes, if this hook was created
+    /// from shellcode/detour. Freed by `remove`/`shutdown`.
     owned_code: u64,
     enabled: bool,
 }
@@ -53,6 +64,16 @@ const SHELLCODE_TAG: u32 = 0x6368_536B;
 /// Executable non-paged pool flag for `ExAllocatePool2`
 /// (`POOL_FLAG_NON_PAGED_EXECUTE`).
 const POOL_FLAG_NON_PAGED_EXECUTE: u64 = 0x0000_0000_0000_0080;
+
+/// Pid of the client whose request is being executed. Set by the request
+/// dispatcher before any hook operation runs, so [`write_code`] can skip the
+/// self-hook suspension (which would deadlock the caller).
+static CLIENT_PID: AtomicU32 = AtomicU32::new(0);
+
+/// Publishes the pid of the client that owns the in-flight request.
+pub(crate) fn set_client_pid(pid: u32) {
+    CLIENT_PID.store(pid, Ordering::SeqCst);
+}
 
 struct HookTable {
     entries: [Option<HookEntry>; MAX_KERNEL_HOOKS],
@@ -80,10 +101,10 @@ impl HookTable {
             .position(|entry| matches!(entry, Some(entry) if entry.id == id))
     }
 
-    fn find_target(&self, target: u64) -> Option<usize> {
-        self.entries
-            .iter()
-            .position(|entry| matches!(entry, Some(entry) if entry.target == target))
+    fn find_target(&self, pid: u64, target: u64) -> Option<usize> {
+        self.entries.iter().position(
+            |entry| matches!(entry, Some(entry) if entry.pid == pid && entry.target == target),
+        )
     }
 
     fn free_slot(&self) -> Option<usize> {
@@ -131,39 +152,387 @@ fn initialized() -> bool {
     INITIALIZED.load(Ordering::SeqCst)
 }
 
+/// `pid == 0` must name a kernel address; anything else must name a user
+/// address, so the caller cannot mix spaces.
+fn target_ok(pid: u64, target: u64) -> bool {
+    ks_core::protocol::check_hook_address(pid, target)
+}
+
+/// Reads up to [`MAX_HOOK_STOLEN_LEN`] prologue bytes in the selected space.
+///
+/// Kernel space is read directly after a page-table probe; a user space is
+/// read through an MDL attach, which faults safely instead of bugchecking.
+fn read_prologue(pid: u64, address: u64) -> Result<[u8; MAX_HOOK_STOLEN_LEN], NTSTATUS> {
+    let mut buffer = [0u8; MAX_HOOK_STOLEN_LEN];
+    if pid == 0 {
+        let read = read_kernel_bytes(address, MAX_HOOK_STOLEN_LEN).ok_or(STATUS_INVALID_ADDRESS)?;
+        buffer.copy_from_slice(&read);
+        Ok(buffer)
+    } else {
+        crate::memory::read_process_memory_mdl(pid, address, &mut buffer)?;
+        Ok(buffer)
+    }
+}
+
+/// Writes `data` over `address` in the selected space.
+///
+/// Both paths go through an MDL, so user pages are locked and the kernel
+/// mapping bypasses their user-mode write protection exactly like
+/// `memory::write_process_memory_mdl`.
+/// Writes `data` over `address` in the selected space.
+///
+/// Both paths go through an MDL, so user pages are locked and the kernel
+/// mapping bypasses their user-mode write protection exactly like
+/// `memory::write_process_memory_mdl`.
+///
+/// **Invariant (enforced here, not by the caller):** patching a user
+/// process's executable memory is always bracketed by `suspend`/`resume` of
+/// that process, so no thread of the target can be executing the bytes
+/// while they change. A refusal to suspend fails the write instead of
+/// patching anyway.
+///
+/// The one exception is a target that is the calling client itself:
+/// suspending it would deadlock — the client's thread is blocked in this
+/// very round trip — so the write proceeds unsuspended and the caller's
+/// "nothing executes the prologue" contract is the only protection. The
+/// kernel path (`pid == 0`) is never suspended either: `PsSuspendProcess`
+/// does not stop kernel threads, so there is no freeze to apply.
+fn write_code(pid: u64, address: u64, data: &[u8]) -> NTSTATUS {
+    if pid == 0 {
+        // SAFETY: the caller validated the kernel address (page probe).
+        unsafe { write_kernel_code(address, data) }
+    } else {
+        let client_pid = CLIENT_PID.load(Ordering::SeqCst) as u64;
+        // Skip only the self-hook case: freezing the process that is
+        // waiting for this round trip would deadlock it.
+        let mut suspended = false;
+        if pid != client_pid {
+            match crate::suspend::suspend(pid, client_pid) {
+                // `1`: we froze it, so the resume below is ours to make.
+                Ok(1) => suspended = true,
+                // `0`: already frozen by us (an explicit `suspend` from the
+                // client); leave it frozen, do not resume it here.
+                Ok(_) => {}
+                Err(status) => return status,
+            }
+        }
+        let result = match crate::memory::write_process_memory_mdl(pid, address, data) {
+            Ok(()) => STATUS_SUCCESS,
+            Err(status) => status,
+        };
+        if suspended {
+            let _ = crate::suspend::resume(pid, client_pid);
+        }
+        result
+    }
+}
+
+/// Allocates executable memory in the selected space.
+fn allocate_exec(pid: u64, size: usize) -> Result<u64, NTSTATUS> {
+    if pid == 0 {
+        allocate_executable(size)
+    } else {
+        crate::memory::allocate(pid, size, PAGE_EXECUTE_READWRITE)
+    }
+}
+
+/// Frees a buffer previously returned by [`allocate_exec`].
+fn free_exec(pid: u64, address: u64) {
+    if address == 0 {
+        return;
+    }
+    if pid == 0 {
+        // SAFETY: allocated by `allocate_executable` with this tag.
+        unsafe { ExFreePoolWithTag(address as *mut _, SHELLCODE_TAG) };
+    } else {
+        let _ = crate::memory::free(pid, address);
+    }
+}
+
+/// Read-only prologue report, used to plan a detour before installing it.
+pub struct ProbeInfo {
+    pub replaced_len: usize,
+    /// Bytes a 14-byte absolute jump needs, or 0 when the prologue cannot
+    /// be covered within [`MAX_HOOK_STOLEN_LEN`].
+    pub absolute_len: usize,
+    pub original: [u8; MAX_HOOK_STOLEN_LEN],
+    pub rip_relative: bool,
+    pub relative_branch: bool,
+}
+
+/// Decodes the target prologue without touching it.
+pub fn probe(pid: u64, target: u64) -> Result<ProbeInfo, NTSTATUS> {
+    if !initialized() {
+        return Err(STATUS_NOT_SUPPORTED);
+    }
+    if !target_ok(pid, target) {
+        return Err(STATUS_INVALID_PARAMETER);
+    }
+    let original = read_prologue(pid, target)?;
+    let replaced_len = decode_prologue(&original, RELATIVE_JUMP_LEN)?;
+    let absolute_len = decode_prologue(&original, ABSOLUTE_JUMP_LEN).unwrap_or(0);
+
+    let mut rip_relative = false;
+    let mut relative_branch = false;
+    let mut cursor = 0usize;
+    while cursor < replaced_len {
+        let Some(decoded) = decode(&original[cursor..]) else {
+            return Err(STATUS_NOT_SUPPORTED);
+        };
+        rip_relative |= decoded.rip_disp.is_some();
+        relative_branch |= decoded.relative_branch;
+        cursor += decoded.len;
+    }
+    Ok(ProbeInfo {
+        replaced_len,
+        absolute_len,
+        original,
+        rip_relative,
+        relative_branch,
+    })
+}
+
+/// Layout of a driver-built detour buffer:
+///
+/// ```text
+/// +0                  : trampoline address (filled in by the driver)
+/// +8                  : user code (execution starts here)
+/// +8+align8(code_len) : trampoline (relocated prologue + jump back)
+/// ```
+pub struct DetourInfo {
+    pub id: u64,
+    pub replaced_len: usize,
+    pub original: [u8; MAX_HOOK_STOLEN_LEN],
+    /// Address the target now jumps to (buffer + 8).
+    pub code_address: u64,
+    /// Address of the relocated-original trampoline; also stored at
+    /// `buffer + 0` so the shellcode can `call [rip-14]`.
+    pub trampoline_address: u64,
+}
+
+/// Byte offset of the trampoline pointer inside the detour buffer.
+const DETOUR_HEADER: usize = 8;
+/// `FF 25 00000000 <addr64>` used to jump back from the trampoline.
+const MAX_TRAMPOLINE: usize = MAX_HOOK_STOLEN_LEN + ABSOLUTE_JUMP_LEN;
+
+const fn align8(value: usize) -> usize {
+    (value + 7) & !7
+}
+
+/// Installs a detour whose original prologue the driver replays for it.
+///
+/// The driver copies `code` to `buffer + 8`, builds a trampoline from the
+/// stolen instructions (fixing up RIP-relative displacements so they still
+/// point at the same data), appends a jump back to `target + replaced_len`
+/// and stores the trampoline address at `buffer + 0`. Code that wants to
+/// call the original can therefore use the fixed 6-byte sequence
+/// `call qword ptr [rip-14]` (`FF 15 F2 FF FF FF`).
+///
+/// Relative branches inside the stolen prologue are refused with
+/// `STATUS_NOT_SUPPORTED`: relocating them needs full branch rewriting.
+pub fn create_detour(pid: u64, target: u64, code: &[u8]) -> Result<DetourInfo, NTSTATUS> {
+    if !initialized() {
+        return Err(STATUS_NOT_SUPPORTED);
+    }
+    if !target_ok(pid, target) || code.is_empty() || code.len() > MAX_HOOK_SHELLCODE {
+        return Err(STATUS_INVALID_PARAMETER);
+    }
+    let original = read_prologue(pid, target)?;
+
+    let total = DETOUR_HEADER + align8(code.len()) + MAX_TRAMPOLINE;
+    let mut last_status = STATUS_INVALID_ADDRESS;
+    for _attempt in 0..DETOUR_ALLOC_ATTEMPTS {
+        let buffer = allocate_exec(pid, total)?;
+        let code_address = buffer + DETOUR_HEADER as u64;
+        let trampoline_address = code_address + align8(code.len()) as u64;
+        let (_, patch_len) = build_patch(target, code_address);
+        let Ok(stolen_len) = decode_prologue(&original, patch_len) else {
+            free_exec(pid, buffer);
+            return Err(STATUS_NOT_SUPPORTED);
+        };
+        // RIP-relative operands can only be rebased within ±2 GiB; try
+        // another allocation when this one landed too far away.
+        if !rebase_is_possible(&original[..stolen_len], target, trampoline_address) {
+            free_exec(pid, buffer);
+            last_status = STATUS_NOT_SUPPORTED;
+            continue;
+        }
+        match build_detour_at(pid, buffer, target, code, &original[..stolen_len]) {
+            Ok(info) => {
+                return match insert(pid, target, info.code_address, buffer) {
+                    Ok((id, replaced_len, stored)) => Ok(DetourInfo {
+                        id,
+                        replaced_len,
+                        original: stored,
+                        code_address: info.code_address,
+                        trampoline_address: info.trampoline_address,
+                    }),
+                    Err(status) => {
+                        free_exec(pid, buffer);
+                        Err(status)
+                    }
+                };
+            }
+            Err(status) => {
+                free_exec(pid, buffer);
+                return Err(status);
+            }
+        }
+    }
+    Err(last_status)
+}
+
+/// How many executable buffers the driver tries before giving up on finding
+/// one whose distance lets RIP-relative operands be rebased.
+const DETOUR_ALLOC_ATTEMPTS: usize = 8;
+
+/// Whether every RIP-relative operand in `stolen` stays encodable after the
+/// move to `trampoline_address`, and whether relocation is possible at all.
+fn rebase_is_possible(stolen: &[u8], target: u64, trampoline_address: u64) -> bool {
+    let delta = (target as i64).wrapping_sub(trampoline_address as i64);
+    let mut cursor = 0usize;
+    while cursor < stolen.len() {
+        let Some(decoded) = decode(&stolen[cursor..]) else {
+            return false;
+        };
+        if decoded.relative_branch {
+            return false;
+        }
+        if let Some(offset) = decoded.rip_disp {
+            let at = cursor + offset;
+            let Some(bytes) = stolen.get(at..at + 4) else {
+                return false;
+            };
+            let displacement = i32::from_le_bytes(bytes.try_into().unwrap()) as i64;
+            if i32::try_from(displacement + delta).is_err() {
+                return false;
+            }
+        }
+        cursor += decoded.len;
+    }
+    true
+}
+
+struct BuiltDetour {
+    code_address: u64,
+    trampoline_address: u64,
+}
+
+/// Fills the executable buffer: header, user code, relocated trampoline.
+fn build_detour_at(
+    pid: u64,
+    buffer: u64,
+    target: u64,
+    code: &[u8],
+    stolen: &[u8],
+) -> Result<BuiltDetour, NTSTATUS> {
+    let code_address = buffer + DETOUR_HEADER as u64;
+    let trampoline_address = code_address + align8(code.len()) as u64;
+
+    let mut trampoline = [0u8; MAX_TRAMPOLINE];
+    let trampoline_len = build_trampoline(target, stolen, trampoline_address, &mut trampoline)?;
+
+    // The buffer lives in the target space; write it through the same
+    // MDL-dispatching path so user allocations are handled by an attach.
+    let mut header = [0u8; DETOUR_HEADER];
+    header.copy_from_slice(&trampoline_address.to_le_bytes());
+    let status = write_code(pid, buffer, &header);
+    if !nt_success(status) {
+        return Err(status);
+    }
+    let status = write_code(pid, buffer + DETOUR_HEADER as u64, code);
+    if !nt_success(status) {
+        return Err(status);
+    }
+    let status = write_code(
+        pid,
+        buffer + DETOUR_HEADER as u64 + align8(code.len()) as u64,
+        &trampoline[..trampoline_len],
+    );
+    if !nt_success(status) {
+        return Err(status);
+    }
+    Ok(BuiltDetour {
+        code_address,
+        trampoline_address,
+    })
+}
+/// Copies the stolen instructions into `out`, rebases RIP-relative operands
+/// and appends an absolute jump back to `target + stolen.len()`.
+fn build_trampoline(
+    target: u64,
+    stolen: &[u8],
+    trampoline_address: u64,
+    out: &mut [u8; MAX_TRAMPOLINE],
+) -> Result<usize, NTSTATUS> {
+    out[..stolen.len()].copy_from_slice(stolen);
+    let delta = (target as i64).wrapping_sub(trampoline_address as i64);
+
+    let mut cursor = 0usize;
+    while cursor < stolen.len() {
+        let Some(decoded) = decode(&stolen[cursor..]) else {
+            return Err(STATUS_NOT_SUPPORTED);
+        };
+        if decoded.relative_branch {
+            return Err(STATUS_NOT_SUPPORTED);
+        }
+        if let Some(offset) = decoded.rip_disp {
+            let at = cursor + offset;
+            let displacement = i32::from_le_bytes(
+                out[at..at + 4]
+                    .try_into()
+                    .map_err(|_| STATUS_NOT_SUPPORTED)?,
+            );
+            let rebased = i32::try_from((displacement as i64).wrapping_add(delta))
+                .map_err(|_| STATUS_NOT_SUPPORTED)?;
+            out[at..at + 4].copy_from_slice(&rebased.to_le_bytes());
+        }
+        cursor += decoded.len;
+    }
+
+    // FF 25 00000000 <target + stolen_len>
+    out[cursor] = 0xFF;
+    out[cursor + 1] = 0x25;
+    out[cursor + 2..cursor + 6].copy_from_slice(&0u32.to_le_bytes());
+    let back = target.wrapping_add(stolen.len() as u64);
+    out[cursor + 6..cursor + 14].copy_from_slice(&back.to_le_bytes());
+    Ok(cursor + ABSOLUTE_JUMP_LEN)
+}
+
 /// Records a hook (`disabled`). Returns `(id, replaced_len, original_bytes)`.
 pub fn create(
+    pid: u64,
     target: u64,
     trampoline: u64,
 ) -> Result<(u64, usize, [u8; MAX_HOOK_STOLEN_LEN]), NTSTATUS> {
-    insert(target, trampoline, 0)
+    insert(pid, target, trampoline, 0)
 }
 
-/// Allocates executable kernel memory, copies `code` there and records a
-/// hook whose detour is that buffer. Returns
+/// Allocates executable memory in the target's space, copies `code` there
+/// and records a hook whose detour is that buffer. Returns
 /// `(id, replaced_len, original_bytes, code_address)`. The buffer belongs to
 /// the hook entry from here on: `remove`, `remove_all` and shutdown free it.
 pub fn create_shellcode(
+    pid: u64,
     target: u64,
     code: &[u8],
 ) -> Result<(u64, usize, [u8; MAX_HOOK_STOLEN_LEN], u64), NTSTATUS> {
     if !initialized() {
         return Err(STATUS_NOT_SUPPORTED);
     }
-    if code.is_empty() || code.len() > MAX_HOOK_SHELLCODE {
+    if !target_ok(pid, target) || code.is_empty() || code.len() > MAX_HOOK_SHELLCODE {
         return Err(STATUS_INVALID_PARAMETER);
     }
-    let buffer = allocate_executable(code.len())?;
-    // SAFETY: `buffer` is a fresh non-paged allocation of `code.len()` bytes
-    // that has just been made executable.
-    unsafe {
-        ptr::copy_nonoverlapping(code.as_ptr(), buffer as *mut u8, code.len());
+    let buffer = allocate_exec(pid, code.len())?;
+    let copied = write_code(pid, buffer, code);
+    if !nt_success(copied) {
+        free_exec(pid, buffer);
+        return Err(copied);
     }
-    match insert(target, buffer, buffer) {
+    match insert(pid, target, buffer, buffer) {
         Ok((id, stolen_len, original)) => Ok((id, stolen_len, original, buffer)),
         Err(status) => {
-            // SAFETY: allocation created above and not stored in the table.
-            unsafe { ExFreePoolWithTag(buffer as *mut _, SHELLCODE_TAG) };
+            free_exec(pid, buffer);
             Err(status)
         }
     }
@@ -171,6 +540,7 @@ pub fn create_shellcode(
 
 /// Shared create path: `owned_code` is 0 for caller-provided trampolines.
 fn insert(
+    pid: u64,
     target: u64,
     trampoline: u64,
     owned_code: u64,
@@ -178,14 +548,10 @@ fn insert(
     if !initialized() {
         return Err(STATUS_NOT_SUPPORTED);
     }
-    if target == 0 || trampoline == 0 {
+    if !target_ok(pid, target) || !target_ok(pid, trampoline) {
         return Err(STATUS_INVALID_PARAMETER);
     }
-    // The caller-supplied trampoline is only ever jumped to, so an
-    // unreachable far jump costs bytes but is not an error.
-    let Some(original) = read_kernel_bytes(target, MAX_HOOK_STOLEN_LEN) else {
-        return Err(STATUS_INVALID_ADDRESS);
-    };
+    let original = read_prologue(pid, target)?;
 
     let (patch, patch_len) = build_patch(target, trampoline);
     let stolen_len = decode_prologue(&original, patch_len)?;
@@ -196,7 +562,7 @@ fn insert(
     patch_bytes[..patch_len].copy_from_slice(&patch[..patch_len]);
 
     with_table(|table| {
-        if table.find_target(target).is_some() {
+        if table.find_target(pid, target).is_some() {
             return Err(STATUS_OBJECT_NAME_COLLISION);
         }
         let Some(slot) = table.free_slot() else {
@@ -205,6 +571,7 @@ fn insert(
         let id = table.allocate_id();
         table.entries[slot] = Some(HookEntry {
             id,
+            pid,
             target,
             stolen_len,
             patch_len,
@@ -234,7 +601,7 @@ fn allocate_executable(size: usize) -> Result<u64, NTSTATUS> {
 }
 
 /// Applies the jump. Already-enabled hooks report success.
-pub fn enable(id: u64) -> NTSTATUS {
+pub fn enable(pid: u64, id: u64) -> NTSTATUS {
     if !initialized() {
         return STATUS_NOT_SUPPORTED;
     }
@@ -242,11 +609,13 @@ pub fn enable(id: u64) -> NTSTATUS {
     let Some(entry) = entry else {
         return STATUS_OBJECT_NAME_NOT_FOUND;
     };
+    if entry.pid != pid {
+        return STATUS_OBJECT_NAME_NOT_FOUND;
+    }
     if entry.enabled {
         return STATUS_SUCCESS;
     }
-    // SAFETY: patch bytes were built by `create` from the same entry.
-    let status = unsafe { write_kernel_code(entry.target, &entry.patch[..entry.patch_len]) };
+    let status = write_code(pid, entry.target, &entry.patch[..entry.patch_len]);
     if !nt_success(status) {
         return status;
     }
@@ -261,7 +630,7 @@ pub fn enable(id: u64) -> NTSTATUS {
 }
 
 /// Restores the original prologue. A disabled hook reports success.
-pub fn disable(id: u64) -> NTSTATUS {
+pub fn disable(pid: u64, id: u64) -> NTSTATUS {
     if !initialized() {
         return STATUS_NOT_SUPPORTED;
     }
@@ -269,11 +638,13 @@ pub fn disable(id: u64) -> NTSTATUS {
     let Some(entry) = entry else {
         return STATUS_OBJECT_NAME_NOT_FOUND;
     };
+    if entry.pid != pid {
+        return STATUS_OBJECT_NAME_NOT_FOUND;
+    }
     if !entry.enabled {
         return STATUS_SUCCESS;
     }
-    // SAFETY: `original` holds the bytes that were at `target`.
-    let status = unsafe { write_kernel_code(entry.target, &entry.original[..entry.stolen_len]) };
+    let status = write_code(pid, entry.target, &entry.original[..entry.stolen_len]);
     if !nt_success(status) {
         return status;
     }
@@ -288,38 +659,46 @@ pub fn disable(id: u64) -> NTSTATUS {
 }
 
 /// Disables (if needed) and forgets the hook. Unknown ids fail.
-pub fn remove(id: u64) -> NTSTATUS {
-    let status = disable(id);
+pub fn remove(pid: u64, id: u64) -> NTSTATUS {
+    let status = disable(pid, id);
     if !nt_success(status) {
         return status;
     }
-    let owned = with_table(|table| match table.find(id) {
+    // Remove the entry and extract its owned buffer, if any.
+    let removed = with_table(|table| match table.find(id) {
         Some(slot) => {
-            let owned = table.entries[slot].map(|entry| entry.owned_code);
+            let entry = table.entries[slot];
+            if entry.map(|entry| entry.pid) != Some(pid) {
+                return None;
+            }
             table.entries[slot] = None;
-            owned
+            entry
         }
         None => None,
     });
-    let Some(owned) = owned else {
-        return STATUS_OBJECT_NAME_NOT_FOUND;
-    };
-    // The detour buffer is released only after the jump is gone, so no core
-    // can fetch instructions from a freed page.
-    if owned != 0 {
-        // SAFETY: the buffer was allocated by `allocate_executable` and is no
-        // longer referenced by any table entry.
-        unsafe { ExFreePoolWithTag(owned as *mut _, SHELLCODE_TAG) };
+    match removed {
+        Some(entry) => {
+            // The detour buffer is released only after the jump is gone, so
+            // no core can fetch instructions from a freed page.
+            free_exec(entry.pid, entry.owned_code);
+            STATUS_SUCCESS
+        }
+        None => {
+            if with_table(|table| table.find(id).is_some()) {
+                STATUS_INVALID_PARAMETER
+            } else {
+                STATUS_OBJECT_NAME_NOT_FOUND
+            }
+        }
     }
-    STATUS_SUCCESS
 }
 
 /// Enables every recorded hook; stops at the first patch failure.
 pub fn enable_all() -> Result<u64, NTSTATUS> {
-    let (ids, count) = collect_ids();
+    let (entries, count) = collect_entries();
     let mut touched = 0u64;
-    for id in &ids[..count] {
-        let status = enable(*id);
+    for &(pid, id) in &entries[..count] {
+        let status = enable(pid, id);
         if !nt_success(status) {
             return Err(status);
         }
@@ -330,10 +709,10 @@ pub fn enable_all() -> Result<u64, NTSTATUS> {
 
 /// Restores every patched hook.
 pub fn disable_all() -> Result<u64, NTSTATUS> {
-    let (ids, count) = collect_ids();
+    let (entries, count) = collect_entries();
     let mut touched = 0u64;
-    for id in &ids[..count] {
-        let status = disable(*id);
+    for &(pid, id) in &entries[..count] {
+        let status = disable(pid, id);
         if !nt_success(status) {
             return Err(status);
         }
@@ -345,11 +724,11 @@ pub fn disable_all() -> Result<u64, NTSTATUS> {
 /// Disables and forgets every hook, newest first (LIFO), so nested patches
 /// restore in the reverse order they were applied.
 pub fn remove_all() -> Result<u64, NTSTATUS> {
-    let (mut ids, count) = collect_ids();
-    ids[..count].reverse();
+    let (mut entries, count) = collect_entries();
+    entries[..count].reverse();
     let mut touched = 0u64;
-    for id in &ids[..count] {
-        let status = remove(*id);
+    for &(pid, id) in &entries[..count] {
+        let status = remove(pid, id);
         if !nt_success(status) {
             return Err(status);
         }
@@ -358,20 +737,20 @@ pub fn remove_all() -> Result<u64, NTSTATUS> {
     Ok(touched)
 }
 
-/// Snapshot of the live ids plus how many slots are valid. Ids are never 0,
-/// so the unused tail of the array stays clearly distinguishable.
-fn collect_ids() -> ([u64; MAX_KERNEL_HOOKS], usize) {
-    let mut ids = [0u64; MAX_KERNEL_HOOKS];
+/// Snapshot of the live `(pid, id)` pairs, in table order. Ids are never 0,
+/// so unused slots stay clearly distinguishable.
+fn collect_entries() -> ([(u64, u64); MAX_KERNEL_HOOKS], usize) {
+    let mut entries = [(0u64, 0u64); MAX_KERNEL_HOOKS];
     let mut count = 0usize;
     with_table(|table| {
         for entry in table.entries.iter().flatten() {
-            if count < ids.len() {
-                ids[count] = entry.id;
+            if count < entries.len() {
+                entries[count] = (entry.pid, entry.id);
                 count += 1;
             }
         }
     });
-    (ids, count)
+    (entries, count)
 }
 
 /// Restores every patch and drops the table. Called from the `Shutdown`
@@ -381,33 +760,43 @@ pub fn shutdown() {
     if !initialized() {
         return;
     }
-    let (ids, count) = collect_ids();
-    for id in &ids[..count] {
-        let _ = disable(*id);
+    let (entries, count) = collect_entries();
+    for &(pid, id) in &entries[..count] {
+        let _ = disable(pid, id);
     }
     let mut owned = [0u64; MAX_KERNEL_HOOKS];
+    let mut pids = [0u64; MAX_KERNEL_HOOKS];
     with_table(|table| {
         for (index, entry) in table.entries.iter().enumerate() {
             if let Some(entry) = entry {
                 owned[index] = entry.owned_code;
+                pids[index] = entry.pid;
             }
         }
         table.entries = [None; MAX_KERNEL_HOOKS];
     });
-    for buffer in owned {
-        if buffer != 0 {
-            // SAFETY: allocation owned by the entry that was just dropped;
-            // its jump is already restored.
-            unsafe { ExFreePoolWithTag(buffer as *mut _, SHELLCODE_TAG) };
+    for (index, buffer) in owned.iter().enumerate() {
+        if *buffer != 0 {
+            free_exec(pids[index], *buffer);
         }
     }
 }
 
 /// Target of the hook self test: a leaf function in the driver's own `.text`
 /// that nothing calls, so patching it cannot disturb the running driver.
+/// Scratch byte the self-test target writes so its prologue is long enough
+/// for either jump form (two 7-byte volatile stores: 7 and 14 bytes tile
+/// both a 5-byte and a 14-byte patch without running past the function).
+static SELFTEST_PAD: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
 #[no_mangle]
 #[inline(never)]
 pub extern "system" fn ks_hook_selftest_target() -> u64 {
+    // SAFETY: the byte lives in the driver's own data section.
+    unsafe {
+        ptr::write_volatile(SELFTEST_PAD.as_ptr(), 0x5A);
+        ptr::write_volatile(SELFTEST_PAD.as_ptr(), 0xA5);
+    }
     0x1111_1111
 }
 
@@ -426,11 +815,11 @@ pub extern "system" fn ks_hook_selftest_detour() -> u64 {
 pub fn self_test() -> Result<u64, NTSTATUS> {
     let target = ks_hook_selftest_target as *const () as u64;
     let detour = ks_hook_selftest_detour as *const () as u64;
-    let (id, replaced_len, original) = create(target, detour)?;
+    let (id, replaced_len, original) = create(0, target, detour)?;
 
-    let status = enable(id);
+    let status = enable(0, id);
     if !nt_success(status) {
-        let _ = remove(id);
+        let _ = remove(0, id);
         return if status == STATUS_INVALID_PAGE_PROTECTION {
             Ok(0)
         } else {
@@ -443,7 +832,7 @@ pub fn self_test() -> Result<u64, NTSTATUS> {
     unsafe { ptr::copy_nonoverlapping(target as *const u8, patched.as_mut_ptr(), 2) };
     let applied = patched[0] == 0xE9 || (patched[0] == 0xFF && patched[1] == 0x25);
 
-    let status = disable(id);
+    let status = disable(0, id);
     if !nt_success(status) {
         return Err(status);
     }
@@ -455,7 +844,7 @@ pub fn self_test() -> Result<u64, NTSTATUS> {
     }
     let restored_ok = restored[..replaced_len] == original[..replaced_len];
 
-    let status = remove(id);
+    let status = remove(0, id);
     if !nt_success(status) {
         return Err(status);
     }
@@ -479,16 +868,16 @@ pub fn shellcode_self_test() -> Result<u64, NTSTATUS> {
     let target_fn: extern "system" fn() -> u64 = ks_hook_selftest_target;
     let target = ks_hook_selftest_target as *const () as u64;
 
-    let (id, _replaced_len, _original, _code) = match create_shellcode(target, &SELFTEST_SHELLCODE)
-    {
-        Ok(created) => created,
-        Err(status) if status == STATUS_INVALID_PAGE_PROTECTION => return Ok(0),
-        Err(status) => return Err(status),
-    };
+    let (id, _replaced_len, _original, _code) =
+        match create_shellcode(0, target, &SELFTEST_SHELLCODE) {
+            Ok(created) => created,
+            Err(status) if status == STATUS_INVALID_PAGE_PROTECTION => return Ok(0),
+            Err(status) => return Err(status),
+        };
 
-    let status = enable(id);
+    let status = enable(0, id);
     if !nt_success(status) {
-        let _ = remove(id);
+        let _ = remove(0, id);
         return if status == STATUS_INVALID_PAGE_PROTECTION {
             Ok(0)
         } else {
@@ -499,18 +888,72 @@ pub fn shellcode_self_test() -> Result<u64, NTSTATUS> {
     // SAFETY: the target is this driver's own leaf function; while patched it
     // jumps to the stub above, which returns without touching any state.
     let through_hook = (core::hint::black_box(target_fn))();
-    let status = disable(id);
+    let status = disable(0, id);
     if !nt_success(status) {
         return Err(status);
     }
     // SAFETY: after `disable` the prologue is restored.
     let restored = (core::hint::black_box(target_fn))();
-    let status = remove(id);
+    let status = remove(0, id);
     if !nt_success(status) {
         return Err(status);
     }
 
     if through_hook == 0x2222_2222 && restored == 0x1111_1111 {
+        Ok(1)
+    } else {
+        Err(STATUS_INVALID_PARAMETER)
+    }
+}
+
+/// Detour self-test code: `call qword ptr [rip-14]` (replays the original
+/// prologue through the driver-built trampoline), `add rax, 1`, `ret`.
+/// Uses `48 83 C0 01` (`add rax, imm8`) so the full 64-bit return value is
+/// preserved, matching the client-side `ShellcodeBuilder` output.
+const DETOUR_SELFTEST_CODE: [u8; 11] = [
+    0xFF, 0x15, 0xF2, 0xFF, 0xFF, 0xFF, 0x48, 0x83, 0xC0, 0x01, 0xC3,
+];
+
+/// Exercises the driver-built trampoline end to end: install a detour that
+/// calls the original prologue and adds one, call through it, disable, call
+/// again, remove. Returns 1 when the detour observed `original + 1` and the
+/// restored function the original value, 0 when executable pool was refused
+/// (HVCI).
+pub fn detour_self_test() -> Result<u64, NTSTATUS> {
+    let target_fn: extern "system" fn() -> u64 = ks_hook_selftest_target;
+    let target = ks_hook_selftest_target as *const () as u64;
+
+    let info = match create_detour(0, target, &DETOUR_SELFTEST_CODE) {
+        Ok(info) => info,
+        Err(status) if status == STATUS_INVALID_PAGE_PROTECTION => return Ok(0),
+        Err(status) => return Err(status),
+    };
+
+    let status = enable(0, info.id);
+    if !nt_success(status) {
+        let _ = remove(0, info.id);
+        return if status == STATUS_INVALID_PAGE_PROTECTION {
+            Ok(0)
+        } else {
+            Err(status)
+        };
+    }
+
+    // SAFETY: the target is the driver's own function; the detour calls only
+    // the trampoline and returns.
+    let through_hook = (core::hint::black_box(target_fn))();
+    let status = disable(0, info.id);
+    if !nt_success(status) {
+        return Err(status);
+    }
+    // SAFETY: the original prologue is restored at this point.
+    let restored = (core::hint::black_box(target_fn))();
+    let status = remove(0, info.id);
+    if !nt_success(status) {
+        return Err(status);
+    }
+
+    if through_hook == 0x1111_1112 && restored == 0x1111_1111 {
         Ok(1)
     } else {
         Err(STATUS_INVALID_PARAMETER)
@@ -599,7 +1042,9 @@ fn page_readable(page: u64) -> bool {
 /// writable system mapping without touching CR0.WP; HVCI-protected pages
 /// refuse the write and the status is returned unchanged.
 unsafe fn write_kernel_code(address: u64, data: &[u8]) -> NTSTATUS {
-    if data.is_empty() || data.len() > MAX_HOOK_STOLEN_LEN {
+    // Bounded by the largest thing a hook ever writes into one place: the
+    // shellcode buffer (trampoline writes are smaller, patches are smaller).
+    if data.is_empty() || data.len() > MAX_HOOK_SHELLCODE {
         return STATUS_INVALID_PARAMETER;
     }
     let mut offset = 0usize;
@@ -647,246 +1092,9 @@ unsafe fn write_kernel_code(address: u64, data: &[u8]) -> NTSTATUS {
     IoFreeMdl(mdl);
     STATUS_SUCCESS
 }
+mod decoder;
 
-// ---------------------------------------------------------------------------
-// x64 instruction length decoder
-//
-// A deliberately conservative subset of HDE64: it returns the instruction
-// length for the opcode families that appear in function prologues/epilogs,
-// and `None` for anything it does not understand (VEX/EVEX, 3-byte maps,
-// LOOP/JCXZ edge cases). A wrong length would split an instruction, so
-// refusing is always better than guessing.
-// ---------------------------------------------------------------------------
-
-/// Returns the length of the instruction at the start of `code`.
-pub(crate) fn instruction_len(code: &[u8]) -> Option<usize> {
-    let mut index = 0usize;
-    let mut rex_w = false;
-    let mut opsize = false;
-    let mut addrsize = false;
-
-    // Legacy prefixes, then at most one REX.
-    loop {
-        let byte = *code.get(index)?;
-        match byte {
-            0x66 => opsize = true,
-            0x67 => addrsize = true,
-            0xF0 | 0xF2 | 0xF3 | 0x2E | 0x36 | 0x3E | 0x26 | 0x64 | 0x65 => {}
-            _ => break,
-        }
-        index += 1;
-        if index > 14 {
-            return None;
-        }
-    }
-    if let Some(&byte) = code.get(index) {
-        if (0x40..=0x4F).contains(&byte) {
-            rex_w = byte & 0x08 != 0;
-            index += 1;
-        }
-    }
-
-    let opcode = *code.get(index)?;
-    index += 1;
-
-    let length = match opcode {
-        0x0F => two_byte(code, &mut index, rex_w, opsize),
-        0xC4 | 0xC5 | 0x62 => None, // VEX / EVEX: unsupported on purpose
-        0x9A | 0xEA => None,        // far call/jmp, invalid in long mode
-        0xE8 | 0xE9 => Some(index + 4),
-        0xEB | 0x70..=0x7F | 0xE0..=0xE3 => Some(index + 1),
-        0xA0..=0xA3 => Some(index + if addrsize { 4 } else { 8 }),
-        0xA8 | 0xCD | 0xD4 | 0xD5 | 0xE4..=0xE7 => Some(index + 1),
-        0xA9 => Some(index + imm_32(opsize)),
-        0xB0..=0xB7 => Some(index + 1),
-        0xB8..=0xBF => Some(index + if rex_w { 8 } else { imm_16_32(opsize) }),
-        0xC2 | 0xCA => Some(index + 2),
-        0xC8 => Some(index + 3),
-        0x68 => Some(index + imm_16_32(opsize)),
-        0x6A => Some(index + 1),
-        0x69 | 0x6B => {
-            let (modrm_len, _) = modrm_len(&code[index..], addrsize)?;
-            let immediate = if opcode == 0x6B { 1 } else { imm_16_32(opsize) };
-            Some(index + modrm_len + immediate)
-        }
-        0x80 | 0x82 | 0x83 => {
-            let (modrm_len, _) = modrm_len(&code[index..], addrsize)?;
-            Some(index + modrm_len + 1)
-        }
-        0x81 => {
-            let (modrm_len, _) = modrm_len(&code[index..], addrsize)?;
-            Some(index + modrm_len + imm_16_32(opsize))
-        }
-        0xC0 | 0xC1 => {
-            let (modrm_len, _) = modrm_len(&code[index..], addrsize)?;
-            Some(index + modrm_len + 1)
-        }
-        0xC6 => {
-            let (modrm_len, _) = modrm_len(&code[index..], addrsize)?;
-            Some(index + modrm_len + 1)
-        }
-        0xC7 => {
-            let (modrm_len, _) = modrm_len(&code[index..], addrsize)?;
-            Some(index + modrm_len + imm_16_32(opsize))
-        }
-        0xF6 | 0xF7 => {
-            let (modrm_len, register) = modrm_len(&code[index..], addrsize)?;
-            let immediate = if register <= 1 {
-                if opcode == 0xF6 {
-                    1
-                } else {
-                    imm_16_32(opsize)
-                }
-            } else {
-                0
-            };
-            Some(index + modrm_len + immediate)
-        }
-        0x00..=0x3F => {
-            if (opcode & 0x07) > 3 {
-                // Segment push/pop, daa/das, aaa/aas, and the segment
-                // prefix slots when they appear as an opcode: no operands.
-                Some(index)
-            } else {
-                let (modrm_len, _) = modrm_len(&code[index..], addrsize)?;
-                Some(index + modrm_len)
-            }
-        }
-        0x50..=0x5F => Some(index), // push/pop r64
-        0x63 | 0x84..=0x8F | 0xD0..=0xD3 | 0xD8..=0xDF | 0xFE | 0xFF => {
-            let (modrm_len, _) = modrm_len(&code[index..], addrsize)?;
-            Some(index + modrm_len)
-        }
-        // Remaining single-byte forms take no ModRM and no immediate.
-        0x60 | 0x61 => None,
-        0x90..=0x99
-        | 0x9B..=0x9F
-        | 0xC3
-        | 0xC9
-        | 0xCB
-        | 0xCC
-        | 0xCE
-        | 0xCF
-        | 0xD7
-        | 0xEC..=0xEF
-        | 0xF1
-        | 0xF4
-        | 0xF5
-        | 0xF8..=0xFD => Some(index),
-        _ => None,
-    }?;
-
-    // A length is only usable when the whole instruction is present in the
-    // buffer; otherwise the caller could believe in bytes it never read.
-    (code.len() >= length && length <= 15).then_some(length)
-}
-
-fn imm_16_32(opsize: bool) -> usize {
-    if opsize {
-        2
-    } else {
-        4
-    }
-}
-
-fn imm_32(_opsize: bool) -> usize {
-    4
-}
-
-fn two_byte(code: &[u8], index: &mut usize, rex_w: bool, opsize: bool) -> Option<usize> {
-    let opcode = *code.get(*index)?;
-    *index += 1;
-    match opcode {
-        0x05
-        | 0x06
-        | 0x07
-        | 0x08
-        | 0x09
-        | 0x0B
-        | 0x0E
-        | 0x30..=0x37
-        | 0x77
-        | 0xA0..=0xA2
-        | 0xA8
-        | 0xA9
-        | 0xAA
-        | 0xC8..=0xCF => Some(*index),
-        0x80..=0x8F => Some(*index + 4),
-        0x38 => None, // 3-byte map: immediate sizes vary
-        0x3A => {
-            let (modrm_len, _) = modrm_len(&code[*index..], false)?;
-            Some(*index + modrm_len + 1)
-        }
-        0x0F => {
-            let (modrm_len, _) = modrm_len(&code[*index..], false)?;
-            Some(*index + modrm_len + 1)
-        }
-        0x70 | 0x71 | 0x72 | 0x73 | 0xA4 | 0xAC | 0xBA | 0xC2 | 0xC4 | 0xC5 | 0xC6 => {
-            let (modrm_len, _) = modrm_len(&code[*index..], false)?;
-            Some(*index + modrm_len + 1)
-        }
-        0x0D
-        | 0x10..=0x17
-        | 0x18..=0x1F
-        | 0x28..=0x2F
-        | 0x40..=0x4F
-        | 0x50..=0x6F
-        | 0x74..=0x76
-        | 0x78
-        | 0x79
-        | 0x7C..=0x7F
-        | 0x90..=0x9F
-        | 0xA3
-        | 0xA5
-        | 0xAB
-        | 0xAD
-        | 0xAE
-        | 0xAF
-        | 0xB0..=0xB9
-        | 0xBB..=0xC1
-        | 0xC3
-        | 0xC7
-        | 0xD0..=0xFF => {
-            let (modrm_len, _) = modrm_len(&code[*index..], false)?;
-            Some(*index + modrm_len)
-        }
-        _ => {
-            let _ = (rex_w, opsize);
-            None
-        }
-    }
-}
-
-/// Decodes ModRM/SIB/displacement bytes and returns
-/// `(total_len, reg_field)`.
-fn modrm_len(code: &[u8], addrsize: bool) -> Option<(usize, u8)> {
-    let modrm = *code.first()?;
-    let mode = modrm >> 6;
-    let register = (modrm >> 3) & 0x07;
-    let rm = modrm & 0x07;
-    let mut length = 1usize;
-
-    if mode != 0b11 {
-        let needs_sib = rm == 0b100;
-        if needs_sib {
-            let sib = *code.get(length)?;
-            length += 1;
-            if mode == 0 && (sib & 0x07) == 0b101 {
-                length += 4;
-            }
-        } else if mode == 0 && rm == 0b101 {
-            // RIP-relative (or absolute with 0x67): always disp32.
-            length += 4;
-        }
-        match mode {
-            0b01 => length += 1,
-            0b10 => length += 4,
-            _ => {}
-        }
-    }
-    let _ = addrsize;
-    Some((length, register))
-}
+use decoder::{decode, instruction_len};
 
 #[cfg(test)]
 mod tests {
@@ -984,5 +1192,67 @@ mod tests {
         assert_eq!(first, 1);
         assert_eq!(second, 2);
         assert_ne!(first, second);
+    }
+
+    #[test]
+    fn decoder_reports_relocation_metadata() {
+        // mov rax, [rip+0x10]
+        let decoded = decode(&[0x48, 0x8B, 0x05, 0x10, 0, 0, 0]).unwrap();
+        assert_eq!(decoded.len, 7);
+        assert_eq!(decoded.rip_disp, Some(3));
+        assert!(!decoded.relative_branch);
+
+        // Address-size prefix turns the same ModRM into absolute disp32.
+        let decoded = decode(&[0x67, 0x8B, 0x05, 0x10, 0, 0, 0]).unwrap();
+        assert_eq!(decoded.rip_disp, None);
+
+        // Relative branches are flagged.
+        assert!(decode(&[0xE9, 0, 0, 0, 0]).unwrap().relative_branch);
+        assert!(decode(&[0xEB, 0x10]).unwrap().relative_branch);
+        assert!(decode(&[0x0F, 0x84, 0, 0, 0, 0]).unwrap().relative_branch);
+
+        // SIB with a base register is not RIP-relative; base-less SIB is.
+        assert_eq!(decode(&[0x8B, 0x04, 0x24]).unwrap().rip_disp, None);
+        assert_eq!(
+            decode(&[0x8B, 0x04, 0x25, 0, 0, 0, 0]).unwrap().rip_disp,
+            None
+        );
+    }
+
+    #[test]
+    fn trampoline_rebases_rip_relative_operands() {
+        // mov rax, [rip+0x10]; ret
+        let stolen = [0x48u8, 0x8B, 0x05, 0x10, 0, 0, 0, 0xC3];
+        let target = 0xFFFF_F800_0000_1000u64;
+        // Within ±2 GiB: RIP-relative operands are only rebasable that far.
+        let trampoline = 0xFFFF_F800_1000_0000u64;
+        let mut out = [0u8; MAX_TRAMPOLINE];
+        let len = build_trampoline(target, &stolen, trampoline, &mut out).unwrap();
+
+        assert_eq!(&out[..3], &[0x48, 0x8B, 0x05]);
+        let expected = (0x10i64 + (target as i64 - trampoline as i64)) as i32;
+        assert_eq!(i32::from_le_bytes(out[3..7].try_into().unwrap()), expected);
+        // Jump back to target + stolen_len.
+        assert_eq!(out[8], 0xFF);
+        assert_eq!(out[9], 0x25);
+        assert_eq!(
+            u64::from_le_bytes(out[14..22].try_into().unwrap()),
+            target + stolen.len() as u64
+        );
+        assert_eq!(len, stolen.len() + ABSOLUTE_JUMP_LEN);
+    }
+
+    #[test]
+    fn trampoline_rejects_relative_branches() {
+        let mut out = [0u8; MAX_TRAMPOLINE];
+        assert_eq!(
+            build_trampoline(
+                0xFFFF_F800_0000_1000,
+                &[0xE9, 0, 0, 0, 0],
+                0xFFFF_F900_0000_0000,
+                &mut out
+            ),
+            Err(STATUS_NOT_SUPPORTED)
+        );
     }
 }

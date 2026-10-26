@@ -347,6 +347,31 @@ fn add_containers<'scope>(
         )?;
     }
 
+    // Row container: widgets drawn inside the body share one horizontal row
+    // (egui 0.29 has no `Ui::same_line`; `horizontal` is the row primitive).
+    {
+        let bridge = Arc::clone(&bridge);
+        module.set(
+            "horizontal",
+            scope.create_function(move |_, body: Function| {
+                let callback_error = std::cell::RefCell::new(None);
+                with_egui_ui(&bridge, |ui| {
+                    ui.horizontal(|inner_ui| {
+                        if let Err(error) =
+                            with_egui_ui_swapped(&bridge, inner_ui, |_ui| body.call::<()>(()))
+                        {
+                            *callback_error.borrow_mut() = Some(error);
+                        }
+                    });
+                })?;
+                match callback_error.into_inner() {
+                    Some(error) => Err(error),
+                    None => Ok(()),
+                }
+            })?,
+        )?;
+    }
+
     Ok(())
 }
 
@@ -455,6 +480,34 @@ fn add_text_widgets<'scope>(
         )?;
     }
 
+    // Body text: `text` is a single unbroken run, `text_wrapped` breaks into
+    // the available width. (`egui` 0.29 has no `Ui::text`; a `Label` widget
+    // is the equivalent.)
+    {
+        let bridge = Arc::clone(&bridge);
+        module.set(
+            "text",
+            scope.create_function(move |_, text: String| {
+                with_egui_ui(&bridge, |ui| {
+                    ui.add(egui::Label::new(text));
+                })?;
+                Ok(())
+            })?,
+        )?;
+    }
+    {
+        let bridge = Arc::clone(&bridge);
+        module.set(
+            "text_wrapped",
+            scope.create_function(move |_, text: String| {
+                with_egui_ui(&bridge, |ui| {
+                    ui.add(egui::Label::new(text).wrap());
+                })?;
+                Ok(())
+            })?,
+        )?;
+    }
+
     Ok(())
 }
 
@@ -499,148 +552,3 @@ fn with_egui_ui_swapped<R>(
     }
     result
 }
-/*
-                    if let Err(error) = body.call::<()>(()) {
-                        *callback_error.borrow_mut() = Some(error);
-                    }
-                });
-            match callback_error.into_inner() {
-                Some(error) => Err(error),
-                None => Ok(()),
-            }
-        })?,
-    )?;
-    module.set(
-        "text",
-        scope.create_function(|_, text: String| {
-            ui.text(text);
-            Ok(())
-        })?,
-    )?;
-    module.set(
-        "text_wrapped",
-        scope.create_function(|_, text: String| {
-            ui.text_wrapped(text);
-            Ok(())
-        })?,
-    )?;
-    module.set(
-        "button",
-        scope.create_function(|_, label: String| Ok(ui.button(label)))?,
-    )?;
-    module.set(
-        "separator",
-        scope.create_function(|_, ()| {
-            ui.separator();
-            Ok(())
-        })?,
-    )?;
-    module.set(
-        "same_line",
-        scope.create_function(|_, ()| {
-            ui.same_line();
-            Ok(())
-        })?,
-    )?;
-    module.set(
-        "checkbox",
-        scope.create_function(|_, (label, mut value): (String, bool)| {
-            let changed = ui.checkbox(label, &mut value);
-            Ok((value, changed))
-        })?,
-    )?;
-    module.set(
-        "input_int",
-        scope.create_function(|_, (label, mut value): (String, i32)| {
-            let changed = ui.input_int(label, &mut value).build();
-            Ok((value, changed))
-        })?,
-    )?;
-    module.set(
-        "input_i64",
-        scope.create_function(|_, (label, mut value): (String, i64)| {
-            let changed = ui.input_scalar(label, &mut value).build();
-            Ok((value, changed))
-        })?,
-    )?;
-    module.set(
-        "input_u64",
-        scope.create_function(|_, (label, mut value): (String, u64)| {
-            let changed = ui.input_scalar(label, &mut value).build();
-            Ok((value, changed))
-        })?,
-    )?;
-    module.set(
-        "input_i8",
-        scope.create_function(|_, (label, mut value): (String, i8)| {
-            let changed = ui.input_scalar(label, &mut value).build();
-            Ok((value, changed))
-        })?,
-    )?;
-    module.set(
-        "input_u8",
-        scope.create_function(|_, (label, mut value): (String, u8)| {
-            let changed = ui.input_scalar(label, &mut value).build();
-            Ok((value, changed))
-        })?,
-    )?;
-    module.set(
-        "input_i16",
-        scope.create_function(|_, (label, mut value): (String, i16)| {
-            let changed = ui.input_scalar(label, &mut value).build();
-            Ok((value, changed))
-        })?,
-    )?;
-    module.set(
-        "input_u16",
-        scope.create_function(|_, (label, mut value): (String, u16)| {
-            let changed = ui.input_scalar(label, &mut value).build();
-            Ok((value, changed))
-        })?,
-    )?;
-    module.set(
-        "input_u32",
-        scope.create_function(|_, (label, mut value): (String, u32)| {
-            let changed = ui.input_scalar(label, &mut value).build();
-            Ok((value, changed))
-        })?,
-    )?;
-    module.set(
-        "input_f32",
-        scope.create_function(|_, (label, mut value): (String, f32)| {
-            let changed = ui.input_scalar(label, &mut value).build();
-            Ok((value, changed))
-        })?,
-    )?;
-    module.set(
-        "input_f64",
-        scope.create_function(|_, (label, mut value): (String, f64)| {
-            let changed = ui.input_scalar(label, &mut value).build();
-            Ok((value, changed))
-        })?,
-    )?;
-    module.set(
-        "input_isize",
-        scope.create_function(|_, (label, mut value): (String, isize)| {
-            let changed = ui.input_scalar(label, &mut value).build();
-            Ok((value, changed))
-        })?,
-    )?;
-    module.set(
-        "input_usize",
-        scope.create_function(|_, (label, mut value): (String, usize)| {
-            let changed = ui.input_scalar(label, &mut value).build();
-            Ok((value, changed))
-        })?,
-    )?;
-    module.set(
-        "input_text",
-        scope.create_function(|_, (label, mut value): (String, String)| {
-            let changed = ui.input_text(label, &mut value).build();
-            Ok((value, changed))
-        })?,
-    )?;
-    Ok(module)
-}
-
-*/

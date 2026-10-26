@@ -22,11 +22,11 @@ pub use windows_sys::Wdk::System::SystemServices::{
     ObReferenceObjectByHandle, PsTerminateSystemThread, UserMode,
 };
 pub use windows_sys::Win32::Foundation::{
-    HANDLE, NTSTATUS, OBJ_CASE_INSENSITIVE, STATUS_ACCESS_VIOLATION, STATUS_BUFFER_TOO_SMALL,
-    STATUS_INSUFFICIENT_RESOURCES, STATUS_INTEGER_OVERFLOW, STATUS_INVALID_ADDRESS,
-    STATUS_INVALID_PAGE_PROTECTION, STATUS_INVALID_PARAMETER, STATUS_NOT_SUPPORTED,
-    STATUS_OBJECT_NAME_COLLISION, STATUS_OBJECT_NAME_NOT_FOUND, STATUS_QUOTA_EXCEEDED,
-    STATUS_SUCCESS, UNICODE_STRING,
+    HANDLE, NTSTATUS, OBJ_CASE_INSENSITIVE, STATUS_ACCESS_DENIED, STATUS_ACCESS_VIOLATION,
+    STATUS_BUFFER_TOO_SMALL, STATUS_INSUFFICIENT_RESOURCES, STATUS_INTEGER_OVERFLOW,
+    STATUS_INVALID_ADDRESS, STATUS_INVALID_PAGE_PROTECTION, STATUS_INVALID_PARAMETER,
+    STATUS_NOT_SUPPORTED, STATUS_OBJECT_NAME_COLLISION, STATUS_OBJECT_NAME_NOT_FOUND,
+    STATUS_QUOTA_EXCEEDED, STATUS_SUCCESS, UNICODE_STRING,
 };
 pub use windows_sys::Win32::Security::{ACL, ACL_REVISION, PSID, SECURITY_DESCRIPTOR};
 pub use windows_sys::Win32::System::Kernel::{SynchronizationEvent, EVENT_TYPE};
@@ -208,6 +208,14 @@ extern "system" {
     pub fn PsGetCurrentThread() -> PKTHREAD;
 
     pub fn ObDereferenceObject(object: Pvoid);
+
+    /// Freezes every thread of the process (`ntoskrnl` export, undocumented
+    /// but stable since Windows 7). The return value is ignored by the
+    /// caller; see `suspend.rs` for the contract.
+    pub fn PsSuspendProcess(process: Pvoid) -> NTSTATUS;
+
+    /// Continues a process frozen by [`PsSuspendProcess`].
+    pub fn PsResumeProcess(process: Pvoid) -> NTSTATUS;
 
     /// Executable non-paged pool (`ExAllocatePool2` with
     /// `POOL_FLAG_NON_PAGED_EXECUTE`). Returns NULL when policy refuses

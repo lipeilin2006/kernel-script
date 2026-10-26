@@ -15,17 +15,20 @@ mod session;
 
 use heapless::Vec as SmallVec;
 use ks_core::protocol::{
-    is_kernel_address, valid_alloc_protect, BatchWriteItem, HookOp, ProtocolError, Request,
+    check_hook_address, valid_alloc_protect, BatchWriteItem, HookOp, ProtocolError, Request,
     ResponseMeta, MAX_ALLOC_SIZE, MAX_BATCH_ENTRIES, MAX_BATCH_WRITE_ENTRIES, MAX_CHAIN_OFFSETS,
     MAX_HOOK_SHELLCODE, MAX_HOOK_STOLEN_LEN,
 };
 
 pub use error::LinkError;
-pub use lock::{lock, lock_rva, unlock, unlock_all, unlock_rva};
-pub use lock::{MAX_MEMORY_LOCKS, MAX_MEMORY_LOCK_SIZE};
-pub use names::{instance_claim_present, published_object_names, published_object_names_strict};
+pub use lock::{lock, lock_list, lock_rva, unlock, unlock_all, unlock_rva};
+pub use lock::{LockListEntry, MAX_MEMORY_LOCKS, MAX_MEMORY_LOCK_SIZE};
+pub use names::{
+    clear_stale_publication, instance_claim_present, published_object_names,
+    published_object_names_strict,
+};
 pub use process::{find_pid, list, ProcessError, ProcessInfo};
-pub use session::close_session;
+pub use session::{close_session, shutdown_incompatible};
 
 use session::submit;
 
@@ -186,6 +189,27 @@ pub fn free(pid: u64, address: u64) -> Result<(), LinkError> {
     submit(&Request::Free { pid, address }, &mut buffer, &mut []).map(|_| ())
 }
 
+/// Freezes every thread of the process `pid` (kernel `PsSuspendProcess`).
+///
+/// Refuses `pid = 0` (Idle), `pid = 4` (System) and this client's own pid.
+/// Idempotent: a process the driver already froze reports success without
+/// freezing it twice, so a matching [`resume`] still runs it once.
+///
+/// Suspends survive a driver shutdown: they are *not* undone when the
+/// driver unloads, so a frozen process stays frozen until resumed.
+pub fn suspend(pid: u64) -> Result<(), LinkError> {
+    let mut buffer = [0u8; SMALL_REQUEST_BUFFER];
+    submit(&Request::Suspend { pid }, &mut buffer, &mut []).map(|_| ())
+}
+
+/// Continues a process this driver previously suspended. A `pid` the driver
+/// never froze is a no-op (`Ok(())`): the driver never decrements a suspend
+/// count it did not increment.
+pub fn resume(pid: u64) -> Result<(), LinkError> {
+    let mut buffer = [0u8; SMALL_REQUEST_BUFFER];
+    submit(&Request::Resume { pid }, &mut buffer, &mut []).map(|_| ())
+}
+
 /// A recorded kernel hook, as returned by [`hook_create`].
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct KernelHook {
@@ -202,26 +226,31 @@ fn hook_request(op: HookOp) -> Result<(ResponseMeta, usize), LinkError> {
     submit(&Request::Hook { op }, &mut buffer, &mut [])
 }
 
-/// Records a MinHook-style kernel inline hook on `target` and leaves it
-/// **disabled**. `trampoline` must be an executable kernel address the
+/// Records a MinHook-style inline hook on `target` and leaves it
+/// **disabled**. `pid` selects the target space: `0` means the kernel half
+/// (global kernel text), anything else means that process's user half.
+/// `trampoline` must be an executable address in the *same* space that the
 /// caller already owns: the driver only jumps to it, it never builds one.
 ///
 /// The driver decodes the prologue to decide how many bytes the jump
 /// replaces (never splitting an instruction) and returns them so the caller
 /// can inspect/rebuild the trampoline. Call [`hook_enable`] to apply it.
 ///
-/// Both addresses must be in the kernel half (`>= 0xFFFF8000_00000000`).
 /// The caller guarantees nothing executes the prologue during patching, and
 /// must [`hook_remove`] before freeing the trampoline.
-pub fn hook_create(target: u64, trampoline: u64) -> Result<KernelHook, LinkError> {
-    if !is_kernel_address(target) || !is_kernel_address(trampoline) {
+pub fn hook_create(pid: u64, target: u64, trampoline: u64) -> Result<KernelHook, LinkError> {
+    if !check_hook_address(pid, target) || !check_hook_address(pid, trampoline) {
         return Err(LinkError::Encode(ProtocolError::InvalidPayload));
     }
     let mut original = vec![0u8; MAX_HOOK_STOLEN_LEN];
     let mut buffer = [0u8; SMALL_REQUEST_BUFFER];
     let (meta, copied) = submit(
         &Request::Hook {
-            op: HookOp::Create { target, trampoline },
+            op: HookOp::Create {
+                pid,
+                target,
+                trampoline,
+            },
         },
         &mut buffer,
         &mut original,
@@ -235,19 +264,19 @@ pub fn hook_create(target: u64, trampoline: u64) -> Result<KernelHook, LinkError
 }
 
 /// Applies a recorded hook's jump.
-pub fn hook_enable(id: u64) -> Result<(), LinkError> {
-    hook_request(HookOp::Enable { id }).map(|_| ())
+pub fn hook_enable(pid: u64, id: u64) -> Result<(), LinkError> {
+    hook_request(HookOp::Enable { pid, id }).map(|_| ())
 }
 
 /// Restores a hook's original prologue bytes, keeping the entry so it can be
 /// enabled again.
-pub fn hook_disable(id: u64) -> Result<(), LinkError> {
-    hook_request(HookOp::Disable { id }).map(|_| ())
+pub fn hook_disable(pid: u64, id: u64) -> Result<(), LinkError> {
+    hook_request(HookOp::Disable { pid, id }).map(|_| ())
 }
 
 /// Disables (if enabled) and drops a hook. Unknown ids fail.
-pub fn hook_remove(id: u64) -> Result<(), LinkError> {
-    hook_request(HookOp::Remove { id }).map(|_| ())
+pub fn hook_remove(pid: u64, id: u64) -> Result<(), LinkError> {
+    hook_request(HookOp::Remove { pid, id }).map(|_| ())
 }
 
 /// Enables every recorded hook; returns how many were touched.
@@ -283,14 +312,16 @@ pub struct ShellcodeHook {
     pub replaced_len: usize,
     /// Original bytes at the target, in order.
     pub original: Vec<u8>,
-    /// Kernel address of the driver-allocated copy of `code`.
+    /// Address of the driver-allocated copy of `code` (kernel or the target
+    /// process's user half, matching `pid`).
     pub code_address: u64,
 }
 
-/// Records a kernel inline hook whose detour is the supplied machine code.
+/// Records an inline hook whose detour is the supplied machine code.
 ///
-/// The driver allocates non-paged kernel memory, copies `code` into it, marks
-/// it executable (`MmProtectMdlSystemAddress`) and points the target's jump
+/// `pid` selects the target space: `0` means the kernel half, anything else
+/// means that process's user half. The driver allocates executable memory in
+/// the *same* space, copies `code` into it and points the target's jump
 /// there. The buffer belongs to the hook entry: [`hook_remove`],
 /// [`hook_remove_all`] and driver shutdown free it (after restoring the
 /// original bytes).
@@ -299,9 +330,9 @@ pub struct ShellcodeHook {
 /// (or jumps back into the trampoline the caller built). Maximum
 /// [`ks_core::protocol::MAX_HOOK_SHELLCODE`] bytes. The same safety contract
 /// as [`hook_create`] applies: nothing may execute the prologue while it is
-/// being patched, and the target must be a real kernel address.
-pub fn hook_shellcode(target: u64, code: &[u8]) -> Result<ShellcodeHook, LinkError> {
-    if !is_kernel_address(target) {
+/// being patched.
+pub fn hook_shellcode(pid: u64, target: u64, code: &[u8]) -> Result<ShellcodeHook, LinkError> {
+    if !check_hook_address(pid, target) {
         return Err(LinkError::Encode(ProtocolError::InvalidPayload));
     }
     if code.is_empty() || code.len() > MAX_HOOK_SHELLCODE {
@@ -311,7 +342,7 @@ pub fn hook_shellcode(target: u64, code: &[u8]) -> Result<ShellcodeHook, LinkErr
     let mut buffer = vec![0u8; SMALL_REQUEST_BUFFER + code.len()];
     let (meta, copied) = submit(
         &Request::Hook {
-            op: HookOp::CreateShellcode { target, code },
+            op: HookOp::CreateShellcode { pid, target, code },
         },
         &mut buffer,
         &mut bulk,
@@ -340,6 +371,124 @@ pub fn hook_shellcode(target: u64, code: &[u8]) -> Result<ShellcodeHook, LinkErr
 /// the platform refused the executable allocation (HVCI).
 pub fn hook_shellcode_self_test() -> Result<u64, LinkError> {
     hook_request(HookOp::ShellcodeSelfTest).map(|(meta, _)| meta.value)
+}
+
+/// Read-only prologue report, the planning step before a detour.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HookProbe {
+    /// Bytes a 5-byte relative jump must replace.
+    pub replaced_len: usize,
+    /// Bytes a 14-byte absolute jump needs, or 0 when the prologue is too
+    /// long to cover within `MAX_HOOK_STOLEN_LEN`.
+    pub absolute_len: usize,
+    /// Original prologue bytes (`replaced_len` of them are valid).
+    pub original: Vec<u8>,
+    /// Contains a RIP-relative operand (rebased by a detour).
+    pub rip_relative: bool,
+    /// Contains a relative branch; `hook_detour` will refuse it.
+    pub relative_branch: bool,
+}
+
+/// Decodes `target`'s prologue without modifying anything. `pid` selects the
+/// target space (see [`hook_create`]).
+pub fn hook_probe(pid: u64, target: u64) -> Result<HookProbe, LinkError> {
+    if !check_hook_address(pid, target) {
+        return Err(LinkError::Encode(ProtocolError::InvalidPayload));
+    }
+    let mut bulk = vec![0u8; MAX_HOOK_STOLEN_LEN + 4];
+    let mut buffer = [0u8; SMALL_REQUEST_BUFFER];
+    let (meta, copied) = submit(
+        &Request::Hook {
+            op: HookOp::Probe { pid, target },
+        },
+        &mut buffer,
+        &mut bulk,
+    )?;
+    let replaced_len = meta.count as usize;
+    if replaced_len == 0 || copied < replaced_len + 4 {
+        return Err(LinkError::Decode(ProtocolError::InvalidPayload));
+    }
+    let absolute_len =
+        u32::from_le_bytes(bulk[replaced_len..replaced_len + 4].try_into().unwrap()) as usize;
+    Ok(HookProbe {
+        replaced_len,
+        absolute_len,
+        original: bulk[..replaced_len].to_vec(),
+        rip_relative: meta.value & ks_core::HOOK_PROBE_RIP_RELATIVE != 0,
+        relative_branch: meta.value & ks_core::HOOK_PROBE_RELATIVE_BRANCH != 0,
+    })
+}
+
+/// A detour whose original-function trampoline the driver built.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DetourHook {
+    pub id: u64,
+    pub replaced_len: usize,
+    pub original: Vec<u8>,
+    /// Address the target jumps to (the driver's copy of the code).
+    pub code_address: u64,
+    /// Relocated original prologue plus a jump back; also stored at
+    /// `code_address - 8`, so `call qword ptr [rip-14]` reaches it.
+    pub trampoline_address: u64,
+}
+
+/// Installs a detour and lets the driver build the trampoline. `pid` selects
+/// the target space (see [`hook_create`]).
+///
+/// The code is copied to a fresh executable buffer, and the driver replays
+/// the stolen prologue in a trampoline whose address sits right before the
+/// code. Calling the original from the code is therefore the fixed 6-byte
+/// sequence `FF 15 F2 FF FF FF` (`call qword ptr [rip-14]`).
+///
+/// Fails with `STATUS_NOT_SUPPORTED` (`LinkError::NtStatus`) when the stolen
+/// prologue contains a relative branch (it cannot be relocated) and with
+/// `STATUS_INVALID_PAGE_PROTECTION` when executable memory is refused (HVCI).
+pub fn hook_detour(pid: u64, target: u64, code: &[u8]) -> Result<DetourHook, LinkError> {
+    if !check_hook_address(pid, target) {
+        return Err(LinkError::Encode(ProtocolError::InvalidPayload));
+    }
+    if code.is_empty() || code.len() > MAX_HOOK_SHELLCODE {
+        return Err(LinkError::Encode(ProtocolError::TooLarge));
+    }
+    let mut bulk = vec![0u8; MAX_HOOK_STOLEN_LEN + 16];
+    let mut buffer = vec![0u8; SMALL_REQUEST_BUFFER + code.len()];
+    let (meta, copied) = submit(
+        &Request::Hook {
+            op: HookOp::CreateDetour { pid, target, code },
+        },
+        &mut buffer,
+        &mut bulk,
+    )?;
+    let replaced_len = meta.count as usize;
+    if replaced_len == 0 || copied < replaced_len + 16 {
+        return Err(LinkError::Decode(ProtocolError::InvalidPayload));
+    }
+    let code_address = u64::from_le_bytes(
+        bulk[replaced_len..replaced_len + 8]
+            .try_into()
+            .map_err(|_| LinkError::Decode(ProtocolError::InvalidPayload))?,
+    );
+    let trampoline_address = u64::from_le_bytes(
+        bulk[replaced_len + 8..replaced_len + 16]
+            .try_into()
+            .map_err(|_| LinkError::Decode(ProtocolError::InvalidPayload))?,
+    );
+    Ok(DetourHook {
+        id: meta.value,
+        replaced_len,
+        original: bulk[..replaced_len].to_vec(),
+        code_address,
+        trampoline_address,
+    })
+}
+
+/// Runs the driver's detour self test: installs a detour whose code calls the
+/// original prologue (`call [rip-14]`) and adds one to its result, calls the
+/// target, disables, calls it again and removes. Returns `1` when the detour
+/// observed `truth + 1` and the restored function `truth`, `0` when the
+/// platform refused the executable allocation (HVCI).
+pub fn hook_detour_self_test() -> Result<u64, LinkError> {
+    hook_request(HookOp::DetourSelfTest).map(|(meta, _)| meta.value)
 }
 
 fn addresses_small_vec<const N: usize>(

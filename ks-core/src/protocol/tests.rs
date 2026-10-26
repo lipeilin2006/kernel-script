@@ -70,20 +70,24 @@ fn every_variant_round_trips() {
         pid: 9,
         address: 0x1A2B_0000,
     });
+    round_trip(&Request::LockList);
+    round_trip(&Request::Suspend { pid: 1234 });
+    round_trip(&Request::Resume { pid: 1234 });
     round_trip(&Request::Hook {
         op: HookOp::Create {
+            pid: 0,
             target: 0xFFFF_F800_1234_5678,
             trampoline: 0xFFFF_F800_9ABC_DEF0,
         },
     });
     round_trip(&Request::Hook {
-        op: HookOp::Enable { id: 3 },
+        op: HookOp::Enable { pid: 0, id: 3 },
     });
     round_trip(&Request::Hook {
-        op: HookOp::Disable { id: 3 },
+        op: HookOp::Disable { pid: 0, id: 3 },
     });
     round_trip(&Request::Hook {
-        op: HookOp::Remove { id: 3 },
+        op: HookOp::Remove { pid: 0, id: 3 },
     });
     round_trip(&Request::Hook {
         op: HookOp::EnableAll,
@@ -100,9 +104,9 @@ fn every_variant_round_trips() {
 }
 
 #[test]
-fn hook_validation_requires_kernel_addresses() {
+fn hook_validation_checks_pid_and_target() {
     let mut buffer = [0u8; 8192];
-    // User-mode target/trampoline is refused before the driver sees it.
+    // pid=0 requires kernel addresses.
     for (target, trampoline) in [
         (0x1000_u64, 0xFFFF_F800_0000_1000_u64),
         (0xFFFF_F800_0000_1000_u64, 0x2000_u64),
@@ -111,16 +115,46 @@ fn hook_validation_requires_kernel_addresses() {
         assert_eq!(
             encode_request(
                 &Request::Hook {
-                    op: HookOp::Create { target, trampoline }
+                    op: HookOp::Create {
+                        pid: 0,
+                        target,
+                        trampoline
+                    }
                 },
                 &mut buffer
             ),
             Err(ProtocolError::InvalidPayload)
         );
     }
+    // A user pid requires user addresses.
     assert!(encode_request(
         &Request::Hook {
             op: HookOp::Create {
+                pid: 0x1234,
+                target: 0x0000_0000_0040_1000,
+                trampoline: 0x0000_0000_0040_2000,
+            }
+        },
+        &mut buffer
+    )
+    .is_ok());
+    assert_eq!(
+        encode_request(
+            &Request::Hook {
+                op: HookOp::Create {
+                    pid: 0x1234,
+                    target: 0xFFFF_F800_0000_1000,
+                    trampoline: 0x0000_0000_0040_2000,
+                }
+            },
+            &mut buffer
+        ),
+        Err(ProtocolError::InvalidPayload)
+    );
+    assert!(encode_request(
+        &Request::Hook {
+            op: HookOp::Create {
+                pid: 0,
                 target: 0xFFFF_F800_0000_1000,
                 trampoline: 0xFFFF_F800_0000_2000,
             }
@@ -131,7 +165,7 @@ fn hook_validation_requires_kernel_addresses() {
     assert_eq!(
         encode_request(
             &Request::Hook {
-                op: HookOp::Enable { id: 0 }
+                op: HookOp::Enable { pid: 0, id: 0 }
             },
             &mut buffer
         ),
@@ -139,6 +173,29 @@ fn hook_validation_requires_kernel_addresses() {
     );
     assert!(is_kernel_address(0xFFFF_8000_0000_0000));
     assert!(!is_kernel_address(0x7FFF_FFFF_FFFF));
+    assert!(check_hook_address(0, 0xFFFF_F800_0000_1000));
+    assert!(!check_hook_address(0, 0x1000));
+    assert!(check_hook_address(0x1234, 0x0000_0000_0040_1000));
+    assert!(!check_hook_address(0x1234, 0xFFFF_F800_0000_1000));
+}
+
+#[test]
+fn suspend_resume_validation() {
+    let mut buffer = [0u8; 4096];
+    for pid in [0u64, 4] {
+        assert_eq!(
+            encode_request(&Request::Suspend { pid }, &mut buffer),
+            Err(ProtocolError::InvalidPayload),
+            "pid {pid} must be refused"
+        );
+        assert_eq!(
+            encode_request(&Request::Resume { pid }, &mut buffer),
+            Err(ProtocolError::InvalidPayload),
+            "pid {pid} must be refused"
+        );
+    }
+    assert!(encode_request(&Request::Suspend { pid: 1234 }, &mut buffer).is_ok());
+    assert!(encode_request(&Request::Resume { pid: 1234 }, &mut buffer).is_ok());
 }
 #[test]
 fn batch_write_round_trips_at_every_supported_count() {

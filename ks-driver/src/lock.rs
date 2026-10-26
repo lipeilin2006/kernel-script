@@ -220,6 +220,44 @@ pub fn clear(pid: u64) -> Result<(), NTSTATUS> {
     with_table(|table| table.clear(pid))
 }
 
+/// One lock-table entry as reported by [`list`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LockListEntry {
+    pub id: u64,
+    pub pid: u64,
+    pub address: u64,
+    pub len: usize,
+}
+
+/// Snapshot of the whole table, in table order. Runs entirely under the
+/// mutex — only copies — so the caller never points into the table. Used by
+/// the `LockList` request so a UI can show locks created by *any* client
+/// (Rust SDK, GUI worker, Lua script) and not just its own rows.
+pub fn list() -> ([LockListEntry; MAX_MEMORY_LOCKS], usize) {
+    let mut entries = [LockListEntry {
+        id: 0,
+        pid: 0,
+        address: 0,
+        len: 0,
+    }; MAX_MEMORY_LOCKS];
+    let mut count = 0usize;
+    with_table(|table| {
+        for entry in table.entries.iter().flatten() {
+            if count >= entries.len() {
+                break;
+            }
+            entries[count] = LockListEntry {
+                id: entry.id,
+                pid: entry.pid,
+                address: entry.address,
+                len: entry.len,
+            };
+            count += 1;
+        }
+    });
+    (entries, count)
+}
+
 /// Drops the whole table (shutdown, unload, start-failure cleanup). A
 /// no-op before [`init`], when no mutex exists yet.
 pub fn clear_table() {

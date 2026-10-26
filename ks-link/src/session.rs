@@ -45,6 +45,9 @@ pub(crate) struct Session {
     response_event: windows_sys::Win32::Foundation::HANDLE,
     mutex: windows_sys::Win32::Foundation::HANDLE,
     client_pid: u32,
+    /// Opened for a best-effort teardown of a ring from an older build:
+    /// only the header magic is required, not the protocol version.
+    relaxed: bool,
 }
 
 unsafe impl Send for Session {}
@@ -54,6 +57,16 @@ impl Session {
     /// Opens every shared object the driver publishes. All-or-nothing: on
     /// failure everything opened so far is released again.
     fn open() -> Result<Self, LinkError> {
+        Self::open_with(false)
+    }
+
+    /// Opens a session that only requires the ring magic. Used to wind down
+    /// a driver left loaded by an older build whose header version differs.
+    fn open_relaxed() -> Result<Self, LinkError> {
+        Self::open_with(true)
+    }
+
+    fn open_with(relaxed: bool) -> Result<Self, LinkError> {
         let names = published_object_names();
         let section_name = wide(&names[0]);
         let request_name = wide(&names[1]);
@@ -87,7 +100,7 @@ impl Session {
         }
         let base = view.Value as *mut u8;
 
-        if let Err(error) = check_ring(base) {
+        if let Err(error) = check_ring(base, relaxed) {
             release_mapping(base, section);
             return Err(error);
         }
@@ -134,12 +147,13 @@ impl Session {
             response_event,
             mutex,
             client_pid: unsafe { GetCurrentProcessId() },
+            relaxed,
         })
     }
 
     /// The ring header view for this mapping, or `RingIncompatible`.
     fn ring(&self) -> Result<&'static ks_core::ring::RingHeader, LinkError> {
-        check_ring(self.base)
+        check_ring(self.base, self.relaxed)
     }
 
     /// Serialized request/response exchange. `request` is an already
@@ -319,11 +333,19 @@ impl Drop for Session {
     }
 }
 
-fn check_ring(base: *mut u8) -> Result<&'static ks_core::ring::RingHeader, LinkError> {
+fn check_ring(
+    base: *mut u8,
+    relaxed: bool,
+) -> Result<&'static ks_core::ring::RingHeader, LinkError> {
     // SAFETY: `base` is a live mapping of RING_TOTAL_SIZE bytes created by
     // `Session::open`, which is the only caller.
     let head = unsafe { header(base) }.ok_or(LinkError::RingIncompatible)?;
-    if head.is_compatible() {
+    let compatible = if relaxed {
+        head.has_our_magic()
+    } else {
+        head.is_compatible()
+    };
+    if compatible {
         Ok(head)
     } else {
         Err(LinkError::RingIncompatible)
@@ -368,6 +390,21 @@ pub(crate) fn session() -> Result<&'static Session, LinkError> {
 }
 
 /// Submits one already-encoded request.
+/// Best-effort `Shutdown` against a ring whose header version differs from
+/// this client's.
+///
+/// The header layout and the `Shutdown` variant index have been stable
+/// across the protocol versions this SDK shipped, so a driver left loaded
+/// by an older build — which would otherwise force a reboot — can still be
+/// wound down. Only the ring magic is checked before writing.
+pub fn shutdown_incompatible() -> Result<(), LinkError> {
+    let session = Session::open_relaxed()?;
+    let mut request = [0u8; 32];
+    let len = encode_request(&Request::Shutdown, &mut request).map_err(LinkError::Encode)?;
+    session.round_trip(&request[..len], &mut [])?;
+    Ok(())
+}
+
 pub(crate) fn submit_encoded(
     request: &[u8],
     out: &mut [u8],

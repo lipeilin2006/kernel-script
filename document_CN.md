@@ -28,6 +28,7 @@ end
 - UI 和 draw API 都在 `OnUpdate` 中使用。
 - 键盘状态在每帧 `OnUpdate` 之前快照一次；同帧内查询与按下沿锁存保持一致。
 - `OnDestroy` 在热重载或 GUI 退出时调用。
+- `engine` 表（见“引擎 API”）提供暂停/恢复、虚拟机内存与计时辅助函数。
 - 所有内存 API 调用都是同步的，阻塞 Lua 线程约 10-15μs。
 - 如果延迟敏感，不要在 `ui.window` 回调中调用内存 API。
 
@@ -302,6 +303,33 @@ memory.unlock_rva(2)
   **客户端进程退出时锁不会自动清除**：脚本宿主崩溃后其锁会继续重写，
   直到停止 driver。
 
+## 挂起 / 继续
+
+### memory.suspend
+
+冻结目标进程的所有线程（内核 `PsSuspendProcess`）。
+
+```lua
+memory.suspend(pid)
+```
+
+### memory.resume
+
+继续此前被 `memory.suspend` 冻结的目标进程（内核 `PsResumeProcess`）。
+
+```lua
+memory.resume(pid)
+```
+
+约束：
+
+- `pid = 0`（Idle）与 `pid = 4`（System）被拒绝；冻结 System 会挂死整机。
+- 幂等：重复 `suspend` 不会重复冻结；`resume` 只解冻 driver 冻结过的进程。
+- **挂起不会被 driver 卸载清除**：脚本必须保证最终调用 `resume`，
+  否则目标进程会一直冻结。
+- 挂起/继续期间，对目标进程的 MDL 写（代码补丁）也自动先挂起再写，
+  见 SDK 文档的 hook 章节。
+
 ## MDL Memory API
 
 MDL 读写通过内核 MDL 重映射访问目标进程内存：附加到目标进程后以只读方式
@@ -497,6 +525,48 @@ end
 `GetWindowRect`。
 
 约束：`pid` 必须为正整数。
+
+## 引擎 API
+
+脚本级的引擎控制与诊断。全部函数都是同步且廉价的（不涉及驱动往返）。
+
+### engine.is_paused
+
+引擎暂停生效时返回 `true`。暂停期间 `OnUpdate` 仍会执行，但
+`delta_time` 为 `0`。
+
+```lua
+if engine.is_paused() then return end
+```
+
+### engine.pause / engine.resume
+
+切换引擎暂停：一个"冻结逻辑、继续绘制"的开关。暂停时 UI 与键盘仍然可用，
+`delta_time` 变为 `0`，定时器和移动类代码可以据此挂起。
+
+```lua
+if keyboard.is_key_press("f8") then
+    if engine.is_paused() then engine.resume() else engine.pause() end
+end
+```
+
+### engine.memory_used
+
+Lua 虚拟机当前占用的字节数（受每脚本内存上限约束）。
+
+```lua
+ui.label(string.format("lua: %.1f KiB", engine.memory_used() / 1024))
+```
+
+### engine.time_us
+
+单调递增的微秒时间戳，适合在 `OnUpdate` 内测量代码段耗时。
+
+```lua
+local t0 = engine.time_us()
+-- ... 处理 ...
+print("耗时", engine.time_us() - t0, "us")
+```
 
 ## Draw API
 
@@ -695,6 +765,18 @@ ui.scroll_area(240, function()
 end)
 ```
 
+### ui.horizontal
+
+行容器：body 内的控件排在同一水平行，而不是逐个换行堆叠。
+
+```lua
+ui.horizontal(function()
+    ui.label("PID:")
+    ui.monospace(tostring(pid))
+    if ui.button("Refresh") then state.pid = memory.get_pid(name) end
+end)
+```
+
 ### ui.selectable_label
 
 可选列表项。返回本次是否点击和传入的选中状态。
@@ -708,6 +790,15 @@ clicked, selected = ui.selectable_label("Process", selected)
 ```lua
 ui.heading("Memory Viewer")
 ui.monospace("0x140000000: 4D 5A")
+```
+
+### ui.text / ui.text_wrapped
+
+正文文本。`text` 作为一整行不折行渲染；`text_wrapped` 在可用宽度内自动换行。
+
+```lua
+ui.text("single line run")
+ui.text_wrapped("this long sentence wraps inside the window width")
 ```
 
 ### ui.hyperlink_to

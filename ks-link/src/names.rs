@@ -5,7 +5,7 @@ use core::ffi::c_void;
 use ks_core::ring::{REQUEST_EVENT_CLIENT_NAME, RESPONSE_EVENT_CLIENT_NAME, SECTION_CLIENT_NAME};
 use windows_sys::Win32::Foundation::ERROR_FILE_NOT_FOUND;
 use windows_sys::Win32::System::Registry::{
-    RegGetValueW, HKEY_LOCAL_MACHINE, RRF_RT_REG_DWORD, RRF_RT_REG_SZ,
+    RegDeleteKeyW, RegGetValueW, HKEY_LOCAL_MACHINE, RRF_RT_REG_DWORD, RRF_RT_REG_SZ,
 };
 
 use super::error::{wide, LinkError};
@@ -123,4 +123,25 @@ pub fn instance_claim_present() -> Result<bool, LinkError> {
             code,
         }),
     }
+}
+
+/// Erases the driver's whole registry publication — the three randomized
+/// object names, the `Instance` claim and the key itself — when no live
+/// instance owns it any more.
+///
+/// Only `ks_sdk::start` calls this, and only
+/// after the ring proved silent (the events are gone or the round trip
+/// timed out). A leftover publication from a crashed run would otherwise
+/// make the readiness poll report a driver that no longer exists and keep
+/// the single-instance claim looking live.
+///
+/// Best effort: a missing key is the desired end state, and any other
+/// failure is harmless because the next successful load overwrites the
+/// values anyway.
+pub fn clear_stale_publication() {
+    let key = wide(NAMES_KEY);
+    // SAFETY: `key` is a live NUL-terminated buffer; the key has no
+    // subkeys (the driver only writes values).
+    let status = unsafe { RegDeleteKeyW(HKEY_LOCAL_MACHINE, key.as_ptr()) };
+    let _ = status;
 }

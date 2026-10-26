@@ -30,6 +30,8 @@ Notes:
 - Keyboard state is snapshotted once per frame before `OnUpdate`; queries and
   press latches are consistent within a frame.
 - `OnDestroy` is called on hot-reload or GUI exit.
+- The `engine` table (see Engine API) exposes pause/resume, VM memory and
+  timing helpers.
 - All memory API calls are synchronous and block the Lua thread for ~10-15μs.
 - Do not call memory APIs inside `ui.window` callbacks if latency is critical.
 
@@ -320,6 +322,35 @@ Constraints:
   a crashed script host leaves its locks rewriting until the driver is
   stopped.
 
+## Process Suspend / Resume
+
+### memory.suspend
+
+Freezes every thread of the target process (kernel `PsSuspendProcess`).
+
+```lua
+memory.suspend(pid)
+```
+
+### memory.resume
+
+Continues a process this driver previously froze (kernel `PsResumeProcess`).
+
+```lua
+memory.resume(pid)
+```
+
+Constraints:
+
+- `pid = 0` (Idle) and `pid = 4` (System) are refused; freezing the System
+  process hangs the machine.
+- Idempotent: repeating `suspend` does not freeze twice; `resume` only
+  thaws processes this driver froze.
+- **Suspends are NOT cleared by driver shutdown**: a script must
+  guarantee a matching `resume`, otherwise the target stays frozen.
+- MDL writes (code patching) inside the hook API automatically suspend the
+  target first; see the SDK guide's hook section.
+
 ## MDL Memory API
 
 MDL read/write access target process memory through kernel MDL remapping: the
@@ -529,6 +560,51 @@ falls back to `DwmGetWindowAttribute(DWMWA_EXTENDED_FRAME_BOUNDS)` and then
 
 Constraints: requires `pid` as a positive integer.
 
+## Engine API
+
+Script-level engine control and diagnostics. All functions are synchronous
+and cheap (no driver round trip).
+
+### engine.is_paused
+
+True while the engine pause is active. `OnUpdate` keeps running while
+paused, but `delta_time` is delivered as `0`.
+
+```lua
+if engine.is_paused() then return end
+```
+
+### engine.pause / engine.resume
+
+Toggles the engine pause: a "freeze logic, keep drawing" switch. UI and
+keyboard keep working, `delta_time` becomes `0`, so timers and movement
+code can gate on it.
+
+```lua
+if keyboard.is_key_press("f8") then
+    if engine.is_paused() then engine.resume() else engine.pause() end
+end
+```
+
+### engine.memory_used
+
+Bytes currently allocated by the Lua VM (against the per-script memory
+limit).
+
+```lua
+ui.label(string.format("lua: %.1f KiB", engine.memory_used() / 1024))
+```
+
+### engine.time_us
+
+Monotonic microsecond timestamp, for measuring sections inside `OnUpdate`.
+
+```lua
+local t0 = engine.time_us()
+-- ... work ...
+print("took", engine.time_us() - t0, "us")
+```
+
 ## Draw API
 
 Draw commands render on the transparent fullscreen overlay window. All draw
@@ -725,6 +801,19 @@ ui.scroll_area(240, function()
 end)
 ```
 
+### ui.horizontal
+
+Row container: widgets drawn inside the body share one horizontal row
+instead of stacking vertically.
+
+```lua
+ui.horizontal(function()
+    ui.label("PID:")
+    ui.monospace(tostring(pid))
+    if ui.button("Refresh") then state.pid = memory.get_pid(name) end
+end)
+```
+
 ### ui.selectable_label
 
 Selectable list item. Returns whether it was clicked and the current selection
@@ -739,6 +828,16 @@ clicked, selected = ui.selectable_label("Process", selected)
 ```lua
 ui.heading("Memory Viewer")
 ui.monospace("0x140000000: 4D 5A")
+```
+
+### ui.text / ui.text_wrapped
+
+Body text. `text` renders as a single unbroken run; `text_wrapped` breaks
+into the available width.
+
+```lua
+ui.text("single line run")
+ui.text_wrapped("this long sentence wraps inside the window width")
 ```
 
 ### ui.hyperlink_to

@@ -119,6 +119,28 @@ pub fn free(pid: u64, address: u64) -> Result<(), String> {
     ks_sdk::free(pid, address).map_err(reason)
 }
 
+/// Freezes every thread of the process `pid` (kernel `PsSuspendProcess`).
+/// Refuses `pid = 0`/`pid = 4` and this GUI's own pid; idempotent. Suspends
+/// survive a driver shutdown, so a matching [`resume`] is still required.
+pub fn suspend(pid: u64) -> Result<(), String> {
+    gate()?;
+    ks_sdk::suspend(pid).map_err(reason)
+}
+
+/// Continues a process this driver previously suspended; a `pid` never
+/// frozen by it is a no-op.
+pub fn resume(pid: u64) -> Result<(), String> {
+    gate()?;
+    ks_sdk::resume(pid).map_err(reason)
+}
+
+/// Dumps every lock the driver is replaying, including locks created by
+/// other clients (a Lua script, another tool).
+pub fn lock_list() -> Result<Vec<ks_sdk::LockListEntry>, String> {
+    gate()?;
+    ks_sdk::lock_list().map_err(reason)
+}
+
 pub fn lock(id: u64, pid: u64, address: u64, data: &[u8]) -> Result<(), String> {
     gate()?;
     ks_sdk::lock(id, pid, address, data).map_err(reason)

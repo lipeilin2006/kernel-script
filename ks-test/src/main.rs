@@ -90,72 +90,70 @@ fn run_minimal(target: &Target, failures: &mut Vec<(String, String)>) -> i32 {
     report(failures, "=== ALL CHECKS PASSED (minimal read-only) ===")
 }
 
-/// Single-instance guard: a second driver load while this one is live
-/// must fail inside DriverEntry (the marker object is openable ->
-/// STATUS_OBJECT_NAME_COLLISION), and the live instance must keep
-/// answering afterwards. KDU mode re-runs the mapper (the second image
-/// never reaches a service); the legacy path uses a duplicate service.
+/// Instance handling on restart. In the default (manual-map) mode
+/// `ks_sdk::start` self-heals instead of failing: a live instance is shut
+/// down first, so a second call replaces it and publishes fresh randomized
+/// names — that is what this check verifies. The kernel-side single-instance
+/// guard itself is still enforced; the legacy `sc` path proves it with a
+/// duplicate service load.
 fn check_second_instance(embedded: &EmbeddedDriver, failures: &mut Vec<(String, String)>) {
-    check(failures, "second driver instance rejected", || {
-        match &embedded.mode {
-            LoadMode::Kdu => {
-                match ks_sdk::start() {
-                    Ok(()) => return Err("second instance mapped (guard missing)".into()),
-                    // STATUS_OBJECT_NAME_COLLISION, exactly what the
-                    // marker probe returns.
-                    Err(ks_sdk::Error::DriverEntry(0xC000_0035)) => {}
-                    Err(ks_sdk::Error::DriverEntry(status)) => {
-                        return Err(format!(
-                            "second map failed for the wrong reason (0x{status:08X}, \
-                             expected 0xC0000035)"
-                        ));
+    check(
+        failures,
+        "restart replaces the live driver instance",
+        || {
+            match &embedded.mode {
+                LoadMode::Kdu => {
+                    let before = ks_sdk::published_object_names();
+                    ks_sdk::start().map_err(|e| format!("restart: {e}"))?;
+                    let after = ks_sdk::published_object_names();
+                    if before == after {
+                        return Err("restart did not publish fresh object names".into());
                     }
-                    Err(error) => return Err(format!("second map failed: {error}")),
+                    ks_sdk::ping().map_err(|e| format!("ping after restart: {e}"))
                 }
-                ks_sdk::ping().map_err(|e| format!("ping after rejected load: {e}"))
-            }
-            LoadMode::Sc { service } => {
-                let duplicate_service = format!("{service}dup");
-                // A separate copy at a distinct path: same bytes,
-                // independent load, so the guard (not loader path
-                // aliasing) is what rejects it.
-                let duplicate_image = embedded.root.join("ks-driver-dup.sys");
-                fs::copy(embedded.root.join("ks-driver.sys"), &duplicate_image)
-                    .map_err(|e| format!("copy image: {e}"))?;
-                let image_arg = duplicate_image.to_string_lossy().into_owned();
-                if let Err(error) = sc(&[
-                    "create",
-                    &duplicate_service,
-                    "type=",
-                    "kernel",
-                    "start=",
-                    "demand",
-                    "binPath=",
-                    &image_arg,
-                ]) {
+                LoadMode::Sc { service } => {
+                    let duplicate_service = format!("{service}dup");
+                    // A separate copy at a distinct path: same bytes,
+                    // independent load, so the guard (not loader path
+                    // aliasing) is what rejects it.
+                    let duplicate_image = embedded.root.join("ks-driver-dup.sys");
+                    fs::copy(embedded.root.join("ks-driver.sys"), &duplicate_image)
+                        .map_err(|e| format!("copy image: {e}"))?;
+                    let image_arg = duplicate_image.to_string_lossy().into_owned();
+                    if let Err(error) = sc(&[
+                        "create",
+                        &duplicate_service,
+                        "type=",
+                        "kernel",
+                        "start=",
+                        "demand",
+                        "binPath=",
+                        &image_arg,
+                    ]) {
+                        let _ = fs::remove_file(&duplicate_image);
+                        return Err(format!("sc create: {error}"));
+                    }
+                    let started = sc(&["start", &duplicate_service]);
+                    let _ = sc(&["delete", &duplicate_service]);
                     let _ = fs::remove_file(&duplicate_image);
-                    return Err(format!("sc create: {error}"));
-                }
-                let started = sc(&["start", &duplicate_service]);
-                let _ = sc(&["delete", &duplicate_service]);
-                let _ = fs::remove_file(&duplicate_image);
-                let error = match started {
-                    Err(error) => error,
-                    Ok(()) => return Err("second instance started (guard missing)".into()),
-                };
-                match sc_failure_code(&error) {
-                    Some(183) => {}
-                    other => {
-                        return Err(format!(
-                            "second start failed for the wrong reason (code {other:?}): \
+                    let error = match started {
+                        Err(error) => error,
+                        Ok(()) => return Err("second instance started (guard missing)".into()),
+                    };
+                    match sc_failure_code(&error) {
+                        Some(183) => {}
+                        other => {
+                            return Err(format!(
+                                "second start failed for the wrong reason (code {other:?}): \
                              {error}"
-                        ));
+                            ));
+                        }
                     }
+                    ks_sdk::ping().map_err(|e| format!("ping after rejected load: {e}"))
                 }
-                ks_sdk::ping().map_err(|e| format!("ping after rejected load: {e}"))
             }
-        }
-    });
+        },
+    );
 }
 
 /// Sends the destructive ring `shutdown` request and checks that the
@@ -374,6 +372,29 @@ fn main() {
     // before run()'s interactive paths.
     if std::env::args().nth(1).as_deref() == Some("shutdown") {
         std::process::exit(shutdown_standalone());
+    }
+    // `ks-test heartbeat <path>`: a tiny child process used by the
+    // suspend/resume check. It appends one byte to `<path>` every 100 ms,
+    // so the parent can observe whether it is frozen or running.
+    if std::env::args().nth(1).as_deref() == Some("heartbeat") {
+        let path = match std::env::args().nth(2) {
+            Some(path) => path,
+            None => {
+                eprintln!("usage: ks-test heartbeat <path>");
+                std::process::exit(2);
+            }
+        };
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .expect("heartbeat: open file");
+        loop {
+            file.write_all(b".").expect("heartbeat: write");
+            file.flush().ok();
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
     }
     // `ks-test loadone <provider> <victim>`: one pinned matrix cell,
     // driven by `run_load_matrix` (fresh process per driver generation).

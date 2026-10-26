@@ -46,12 +46,16 @@
   `ks-sdk` (not `ks-link` directly).
 - `ks-hook-test`: minimal end-to-end harness for the kernel hook API. It
   starts (or reuses) the driver, checks the SDK guard rails, runs the
-  driver's own hook self test (`HookOp::SelfTest`: create → enable →
+  driver's own hook self tests (`HookOp::SelfTest`: create → enable →
   verify the jump → disable → verify the original bytes → remove on a leaf
-  function inside the driver image) and stops the driver. It never patches
-  foreign kernel code; a `0` result means the platform refused the write
-  (HVCI). Release builds embed the elevation manifest.
-- `ks-gui`: user-mode egui/eframe OpenGL GUI and Lua runtime. It owns the
+  function inside the driver image), then runs a **user-mode detour test**
+  against a function in its own process (`pid = own pid`), and stops the
+  driver. It never patches foreign code; a `0` result means the platform
+  refused the write (HVCI). Release builds embed the elevation manifest.
+- `ks-gui`: user-mode egui GUI and Lua runtime, hosted by the `egui_overlay`
+   stack (GLFW click-through window via `egui_window_glfw_passthrough`,
+   `three_d` OpenGL backend via `egui_render_three_d`, direct `glow` calls
+   for viewport management). It owns the
    Lua VM, the synchronous `sync_ipc` facade over `ks-sdk` (the re-exported
    link API), the draw command
    pipeline, and the Lua config store (`config.json`, module
@@ -169,7 +173,10 @@ Rules:
     (Ctrl+S saves). Saving writes the file, which the overlay's file-watch
     hot reload then picks up; unsaved edits of a switched-away file stay
     in memory as drafts. `新建` creates a script in the same directory.
-  - `修改`: manual address list with read/write and freeze/unfreeze
+  - `修改`: the driver's whole lock table first (including locks created
+    by a Lua script or another tool — refreshed on a timer, each entry
+    unlockable by id, refreshed on a timer via the `LockList` request),
+    then the manual address list with read/write and freeze/unfreeze
     through the driver lock table; clicking an address jumps the hex tab
     to its page.
 
@@ -222,6 +229,8 @@ memory.unlock(id)
 memory.unlock_all(pid)
 memory.lock_rva(id, pid, relative_address, data)
 memory.unlock_rva(id)
+memory.suspend(pid)
+memory.resume(pid)
 keyboard.is_key_down(key)
 keyboard.is_key_up(key)
 keyboard.is_key_press(key)
@@ -286,7 +295,8 @@ Round-trip rules (implemented in `ks-link/src/session.rs`):
 Payloads are postcard-encoded (`ks-core/src/protocol/`): `Ping`,
 `GetProcessBase`, `Read`/`Write` (with `rva` and `mdl` flags), `BatchRead`,
 `BatchWrite`, `TraverseChain`, `Shutdown`, `Lock`, `Unlock`, `UnlockAll`,
-`Alloc`, `Free`, `Hook` (with a `HookOp` payload).
+`Alloc`, `Free`, `Hook` (with a `HookOp` payload), `Suspend`, `Resume`,
+`LockList`.
 The response is a fixed 64-byte
 `ResponseMeta` slot followed by a raw bulk region the driver fills in
 place.
@@ -406,10 +416,15 @@ down LIFO. The caller supplies an already-executable detour/trampoline.
 - Protocol: `Request::Hook { op }` with `HookOp::{Create, Enable, Disable,
   Remove, EnableAll, DisableAll, RemoveAll}`. `Create` answers `value = id`,
   `count = replaced_len` and the original prologue bytes in bulk.
-- SDK surface (`ks-sdk` re-export of ks-link): `hook_create(target,
-  trampoline) -> KernelHook`, `hook_enable`, `hook_disable`, `hook_remove`,
-  `hook_enable_all`, `hook_disable_all`, `hook_remove_all`. Rust only —
-  not exposed to Lua: a script cannot own the trampoline lifetime.
+- SDK surface (`ks-sdk` re-export of ks-link): every operation takes `pid`
+  as its first parameter — `hook_create(pid, target, trampoline)`,
+  `hook_enable(pid, id)`, `hook_disable(pid, id)`, `hook_remove(pid, id)`,
+  plus `hook_enable_all`/`hook_disable_all`/`hook_remove_all` (global, no
+  pid). `pid == 0` selects the kernel half (global kernel text); a
+  non-zero `pid` selects that process's user half — the driver reads the
+  prologue with `MmCopyVirtualMemory` and writes the patch through an MDL
+  attach that bypasses user write-protection, exactly like
+  `memory::write_process_memory_mdl`. Rust only — not exposed to Lua.
 - Shellcode variant: `hook_shellcode(target, code) -> ShellcodeHook` and
   `hook_shellcode_self_test()`. The driver allocates executable non-paged
   pool (`ExAllocatePool2` with `POOL_FLAG_NON_PAGED_EXECUTE`), copies `code`
@@ -418,9 +433,26 @@ down LIFO. The caller supplies an already-executable detour/trampoline.
   original bytes are restored. Max `MAX_HOOK_SHELLCODE` (1 KiB). HVCI (W^X)
   makes the allocation fail — that is reported as
   `STATUS_INVALID_PAGE_PROTECTION` and the self test treats it as skipped.
-- Both addresses must be in the kernel half
-  (`ks_core::protocol::is_kernel_address`, `>= 0xFFFF8000_00000000`);
-  ks-core rejects anything else before the driver sees it.
+- Detour variant: `hook_probe(target) -> HookProbe` (read-only prologue
+  report: `replaced_len`, `absolute_len`, RIP-relative/relative-branch
+  flags) and `hook_detour(target, code) -> DetourHook`. The driver copies
+  `code` to `buffer + 8` and builds the trampoline itself at
+  `buffer + 8 + align8(code.len())`: the stolen instructions with
+  RIP-relative displacements rebased, then an absolute jump back to
+  `target + replaced_len`; the trampoline address is also stored at
+  `buffer + 0`, so the detour reaches the original with the fixed 6-byte
+  `FF 15 F2 FF FF FF` (`call qword ptr [rip-14]`). Prologues containing a
+  relative branch are refused (`STATUS_NOT_SUPPORTED`), and because
+  RIP-relative operands can only be rebased within ±2 GiB the driver
+  retries up to 8 allocations before refusing.
+- `ks-sdk::shellcode::ShellcodeBuilder` assembles the client-side detour
+  stubs (push/pop, `call_original`, absolute call/jump, `mov rax, imm64`,
+  `add rax, imm8`, `ret`, `int3`, raw bytes); it is unit-tested byte for
+  byte and keeps assembly out of the kernel.
+- Both addresses must be in the correct space for `pid`
+  (`ks_core::protocol::check_hook_address`): kernel addresses for `pid=0`,
+  user addresses for non-zero `pid`. ks-core rejects anything else before
+  the driver sees it.
 - Jump encoding: `E9 rel32` (5 bytes) when the trampoline is within
   ±2 GiB of `target + 5`, otherwise the 14-byte `FF 25 00000000 <addr64>`.
   `replaced_len` covers whole instructions only — the decoder never splits
@@ -433,6 +465,15 @@ down LIFO. The caller supplies an already-executable detour/trampoline.
   held. `MmIsAddressValid` guards every touched page first so a bad
   address fails with `STATUS_INVALID_ADDRESS` instead of bugchecking in
   the probe.
+- **A user-space write is always bracketed by `suspend`/`resume` of the
+  target process** (enforced inside `hook::write_code`, not by the
+  caller): no thread of the target can be executing the bytes while they
+  change, and a refusal to suspend fails the write instead of patching
+  anyway. The only exception is a target equal to the calling client's own
+  pid — suspending it would deadlock the round trip — where the write
+  proceeds unsuspended under the caller's "nothing executes the prologue"
+  contract. The kernel path (`pid = 0`) is never suspended: `PsSuspendProcess`
+  does not stop kernel threads, so there is no freeze to apply.
 - `Request::Shutdown`, `comm::stop` and `DriverUnload` all restore every
   patched prologue (`hook::shutdown`) before the lock table is dropped and
   before the ring objects go away — never leave a jump pointing at memory
@@ -448,6 +489,40 @@ down LIFO. The caller supplies an already-executable detour/trampoline.
   trampoline that does not reproduce the stolen instructions plus a jump
   back to `target + replaced_len`. Misuse bugchecks the machine; the
   caller must remove hooks before freeing the trampoline.
+
+## Process Suspend/Resume (kernel `PsSuspendProcess`)
+
+`ks-driver/src/suspend.rs` freezes and continues a whole target process
+using the `ntoskrnl` exports `PsSuspendProcess` / `PsResumeProcess` (both
+present and confirmed via `dumpbin /exports`; `KeSuspendThread` /
+`PsGetNextProcessThread` are *not* exported on this build, so no thread
+enumeration is attempted). SDK surface: `ks_sdk::suspend(pid)` /
+`ks_sdk::resume(pid)` (`Request::Suspend` / `Request::Resume`; Rust only —
+not exposed to Lua).
+
+Rules and caveats:
+
+- `pid = 0` (Idle) and `pid = 4` (System) are refused by ks-core before
+  the driver sees them; freezing the System process hangs the machine. The
+  *client's own pid* is also refused by the driver: freezing the process
+  that is waiting for this round trip would deadlock it.
+- The driver tracks which pids it froze (`MAX_PROCESS_SUSPENDS = 32`).
+  `Suspend` is idempotent (a process already ours is not suspended twice,
+  so a matching `resume` still runs it once) and answers `value = 1`
+  (applied) or `0` (no-op). `Resume` only thaws pids this driver froze —
+  it never decrements a suspend count it did not increment.
+- **Suspends survive a driver shutdown**: `Shutdown` / `stop` / unload
+  forget the bookkeeping but deliberately do **not** resume, so a frozen
+  process stays frozen until a client resumes it.
+- The two `Ps*` primitives are treated as infallible for a valid
+  `EPROCESS` (argument validation happens in
+  `PsLookupProcessByProcessId`), so a garbage return value from the
+  undocumented exports cannot roll the table back into an inconsistent
+  state. `ks-test`'s full suite proves the effect behaviourally with a
+  heartbeat child process (`ks-test heartbeat <path>`): suspend freezes
+  the file writes, resume restarts them.
+- Everything runs on the ring worker at `PASSIVE_LEVEL`; the table mutex
+  critical sections only touch the pid array, never the `Ps*` calls.
 
 ## Driver Import Rules (ntdll.dll trap)
 
@@ -719,6 +794,23 @@ needs a `binPath`):
 - KDU never runs `DriverUnload`: every successful map leaks one
   `THREAD_OBJECT` with its kernel stack and one permanent V3 driver
   object until reboot — accepted for a test harness.
+- `ks_sdk::start` **self-heals a previous run before mapping**
+  (`recover_previous_instance` in `kdu/mod.rs`): if the registry
+  publication (or the `Instance` claim) is present, it drops any cached
+  session and asks the ring. A live instance that answers is shut down
+  through `stop()`; one whose ring reports `RingIncompatible` is wound
+  down by `ks_link::shutdown_incompatible` (the header layout and the
+  `Shutdown` variant index are stable across protocol versions, so an
+  older build's driver can still be stopped instead of forcing a
+  reboot); anything else — events gone or the round trip timed out — is
+  judged dead-run residue and erased by
+  `ks_link::clear_stale_publication`. If no instance could be stopped,
+  the publication is erased anyway (a live-but-unreachable instance
+  still holds its marker, so the map fails with the usual `0xC0000035`
+  — erasing the record cannot allow a second instance). `ks-test full`
+  verifies the live-instance case (`restart replaces the live driver
+  instance`: fresh randomized names afterwards) and `ks-hook-test`
+  forges a stale publication and verifies recovery.
 - Signing is not required in the default mode; `ks-test sc` is the only
   path that loads a signed image through SCM.
 - The `KDU-1.5.0/` C++ tree has been deleted from the workspace
@@ -758,9 +850,13 @@ Before considering a change complete:
 - Process names and process metadata are collected in user mode by
   Toolhelp in `ks-link`; a PID is not a permanent process identity because
   Windows can reuse PIDs.
-- The GUI uses egui/eframe with the `glow` OpenGL backend. The native
-  eframe window is required as the OpenGL host and currently uses the
-  default opaque window configuration.
+- The GUI's OpenGL host is the native GLFW window from the `egui_overlay`
+  stack (`egui_window_glfw_passthrough` + `egui_render_three_d`); direct GL
+  calls (viewport, clear) go through `glow`. The window currently uses the
+  default opaque window configuration. `egui` is pinned at 0.29 by
+  `egui_overlay` 0.9.0, whose upstream has been dormant since early 2025 —
+  a newer egui would require forking/vendoring the whole overlay stack
+  (egui_overlay is 0.9's `egui ^0.29` lockstep family), not a version bump.
 - The GUI loads the first available `msyh.ttc`, `simsun.ttc`, or
   `simhei.ttf` from `C:\Windows\Fonts` so Chinese Lua/UI text renders on
   Windows. The GUI and release `ks-test` binaries embed a

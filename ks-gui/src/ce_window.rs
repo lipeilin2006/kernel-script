@@ -34,6 +34,9 @@ use crate::sync_ipc;
 const HEX_LENGTHS: [usize; 5] = [256, 512, 1024, 2048, 4096];
 /// Default page length.
 const DEFAULT_HEX_LEN: usize = 512;
+/// How often the value-editor tab re-reads the driver's lock table (so
+/// locks created by a Lua script show up without a manual refresh).
+const LOCK_REFRESH_INTERVAL: std::time::Duration = std::time::Duration::from_millis(300);
 
 /// One value type the address list can display and edit.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -181,6 +184,13 @@ enum Command {
     UnlockAll {
         pid: u64,
     },
+    /// Dumps every lock the driver is replaying, whoever created it.
+    ListLocks,
+    /// Removes any lock by id, including one created by another client
+    /// (a Lua script, another tool).
+    UnlockAny {
+        lock_id: u64,
+    },
     ReadHex {
         pid: u64,
         address: u64,
@@ -202,6 +212,8 @@ enum Event {
         size: usize,
         result: Result<Vec<u8>, String>,
     },
+    LockList(Result<Vec<ks_sdk::LockListEntry>, String>),
+    Unlocked(Result<(), String>),
     Message(String),
 }
 
@@ -271,6 +283,8 @@ fn worker(rx: Receiver<Command>, tx: Sender<Event>) {
                 Ok(()) => String::from("已解除全部冻结"),
                 Err(error) => error,
             }),
+            Command::ListLocks => Event::LockList(sync_ipc::lock_list()),
+            Command::UnlockAny { lock_id } => Event::Unlocked(sync_ipc::unlock(lock_id)),
             Command::ReadHex { pid, address, size } => Event::Hex {
                 address,
                 size,
@@ -436,6 +450,13 @@ struct ToolState {
     next_lock_id: u64,
     new_address: String,
     new_kind: ValueType,
+    /// Every lock the driver is replaying, including ones created by other
+    /// clients (a Lua script, another tool). Refreshed on a timer while the
+    /// value-editor tab is visible.
+    driver_locks: Vec<ks_sdk::LockListEntry>,
+    lock_list_status: String,
+    locks_pending: bool,
+    last_lock_refresh: Instant,
     /// Lua editor tab.
     editor: LuaEditor,
     status: String,
@@ -462,6 +483,10 @@ impl ToolState {
             next_lock_id: 1,
             new_address: String::new(),
             new_kind: ValueType::I32,
+            driver_locks: Vec::new(),
+            lock_list_status: String::new(),
+            locks_pending: false,
+            last_lock_refresh: Instant::now() - LOCK_REFRESH_INTERVAL,
             editor: LuaEditor::new(scripts),
             status: "选择左侧进程，查看它的模块内存".to_owned(),
         }
@@ -616,6 +641,7 @@ impl CeWindow {
     ) -> CeOutcome {
         self.drain_results();
         self.pump_hex();
+        self.pump_lock_list();
 
         let mut close_requested = false;
         let mut raw_events = Vec::new();
@@ -775,6 +801,22 @@ impl CeWindow {
         }
     }
 
+    /// Re-reads the driver's whole lock table on a timer while the value
+    /// editor tab is visible, so locks created by a Lua script (or another
+    /// tool) appear without a manual refresh.
+    fn pump_lock_list(&mut self) {
+        if self.state.tab != Tab::Modify || self.state.locks_pending {
+            return;
+        }
+        if self.state.last_lock_refresh.elapsed() < LOCK_REFRESH_INTERVAL {
+            return;
+        }
+        if self.commands.send(Command::ListLocks).is_ok() {
+            self.state.locks_pending = true;
+            self.state.last_lock_refresh = Instant::now();
+        }
+    }
+
     fn drain_results(&mut self) {
         loop {
             match self.results.try_recv() {
@@ -848,6 +890,22 @@ impl CeWindow {
                             },
                         });
                     }
+                }
+                Ok(Event::LockList(result)) => {
+                    self.state.locks_pending = false;
+                    match result {
+                        Ok(entries) => {
+                            self.state.lock_list_status = format!("{} 项", entries.len());
+                            self.state.driver_locks = entries;
+                        }
+                        Err(error) => self.state.lock_list_status = error,
+                    }
+                }
+                Ok(Event::Unlocked(result)) => {
+                    self.state.status = match result {
+                        Ok(()) => String::from("已解锁"),
+                        Err(error) => error,
+                    };
                 }
                 Ok(Event::Message(message)) => self.state.status = message,
                 Err(TryRecvError::Empty) => break,
@@ -1434,6 +1492,73 @@ fn draw_modify(ui: &mut egui::Ui, state: &mut ToolState, commands: &Sender<Comma
     let mut next_lock_id = state.next_lock_id;
     let mut status = None;
     let mut jump_to = None;
+
+    // The driver's whole lock table, including locks created by a Lua
+    // script or another client. Refreshes on a timer while this tab is
+    // visible (see `pump_lock_list`).
+    egui::CollapsingHeader::new(format!(
+        "驱动锁表（含 Lua）{}",
+        if state.lock_list_status.is_empty() {
+            String::new()
+        } else {
+            format!(" · {}", state.lock_list_status)
+        }
+    ))
+    .id_salt("ce_driver_locks")
+    .default_open(true)
+    .show(ui, |ui| {
+        ui.horizontal(|ui| {
+            if ui.small_button("刷新").clicked() {
+                state.last_lock_refresh = Instant::now() - LOCK_REFRESH_INTERVAL;
+            }
+            if ui.small_button("全部解锁").clicked() {
+                for lock in state.driver_locks.iter() {
+                    let _ = commands.send(Command::UnlockAny { lock_id: lock.id });
+                }
+            }
+            ui.label(
+                egui::RichText::new("本窗口的锁也能在下面的地址列表里编辑")
+                    .small()
+                    .weak(),
+            );
+        });
+        if state.driver_locks.is_empty() {
+            ui.label(egui::RichText::new("当前没有活动的锁").small().weak());
+            return;
+        }
+        let own_ids: Vec<u64> = state.rows.iter().map(|row| row.lock_id).collect();
+        let locks = state.driver_locks.clone();
+        egui::ScrollArea::vertical()
+            .id_salt("ce_driver_lock_scroll")
+            .max_height(160.0)
+            .show(ui, |ui| {
+                egui::Grid::new("ce_driver_lock_grid")
+                    .striped(true)
+                    .num_columns(6)
+                    .show(ui, |ui| {
+                        ui.label("锁 ID");
+                        ui.label("进程");
+                        ui.label("地址");
+                        ui.label("长度");
+                        ui.label("来源");
+                        ui.label("");
+                        ui.end_row();
+                        for lock in locks {
+                            ui.monospace(lock.id.to_string());
+                            ui.monospace(lock.pid.to_string());
+                            ui.monospace(format!("0x{:X}", lock.address));
+                            ui.label(format!("{} 字节", lock.len));
+                            let own = own_ids.contains(&lock.id);
+                            ui.label(if own { "本窗口" } else { "Lua/其他" });
+                            if ui.small_button("解锁").clicked() {
+                                let _ = commands.send(Command::UnlockAny { lock_id: lock.id });
+                            }
+                            ui.end_row();
+                        }
+                    });
+            });
+    });
+    ui.separator();
 
     ui.horizontal_wrapped(|ui| {
         ui.label("地址");

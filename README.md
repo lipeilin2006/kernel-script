@@ -1,6 +1,16 @@
 # Kernel Script
 
-[Home](https://github.com/lipeilin2006/kernel-script) | [中文 README](https://github.com/lipeilin2006/kernel-script/blob/main/README_CN.md) | [Lua API](https://github.com/lipeilin2006/kernel-script/blob/main/document.md) | [中文 Lua API](https://github.com/lipeilin2006/kernel-script/blob/main/document_CN.md)
+> **Disclaimer**: This project is provided for security research and
+> educational purposes only. It must not be used for any illegal or
+> unauthorized activity (for example: cheating in online games or defeating
+> anti-cheat systems, intruding on or tampering with systems you do not own,
+> malicious sabotage, or commercial abuse). You bear full responsibility for
+> any consequences arising from misuse.
+>
+> **闲鱼唯一官方商户：米烧酒可玛丽** — the only official Xianyu seller for
+> this project; any other store with a similar name is unofficial.
+
+[Home](https://github.com/lipeilin2006/kernel-script) | [中文 README](https://github.com/lipeilin2006/kernel-script/blob/main/README_CN.md) | [Lua API](https://github.com/lipeilin2006/kernel-script/blob/main/document.md) | [中文 Lua API](https://github.com/lipeilin2006/kernel-script/blob/main/document_CN.md) | [Rust SDK Guide](https://github.com/lipeilin2006/kernel-script/blob/main/SDK_GUIDE.md)
 
 ## Usage
 
@@ -9,8 +19,9 @@
    image ever reaches the disk).
 2. Run `ks-gui.exe` as administrator. The driver starts silently at
    launch: the embedded image is mapped in-process through the in-process
-   KDU mapper — no service, no signing — and a live instance left by a
-   previous run is reused instead.
+   KDU mapper — no service, no signing. A live instance left by a
+   previous run is reused if it answers; otherwise the stale publication is
+   cleaned up and a fresh instance is mapped.
 3. Click `Stop` to close the GUI; it shuts the driver down silently on
    the way out.
 

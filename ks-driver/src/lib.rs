@@ -9,6 +9,7 @@ pub mod hook;
 pub mod lock;
 pub mod memory;
 pub mod request;
+pub mod suspend;
 mod wdm;
 
 pub use ks_core::protocol;

@@ -117,6 +117,39 @@ pub fn unlock_all(pid: u64) -> Result<(), LinkError> {
         .map_err(map_table_full)
 }
 
+/// One entry of the driver's lock table, whoever created it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LockListEntry {
+    pub id: u64,
+    pub pid: u64,
+    pub address: u64,
+    pub len: usize,
+}
+
+/// Dumps the whole driver-side lock table: every entry the driver is
+/// replaying, including locks created by *other* clients (a GUI worker,
+/// a Lua script). One synchronous round trip.
+pub fn lock_list() -> Result<Vec<LockListEntry>, LinkError> {
+    let mut buffer = [0u8; crate::SMALL_REQUEST_BUFFER];
+    let mut bulk = vec![0u8; MAX_MEMORY_LOCKS * ks_core::LOCK_LIST_ENTRY_SIZE];
+    let (meta, copied) = submit(&Request::LockList, &mut buffer, &mut bulk)?;
+    let count = meta.value as usize;
+    let mut entries = Vec::with_capacity(count.min(MAX_MEMORY_LOCKS));
+    for index in 0..count.min(MAX_MEMORY_LOCKS) {
+        let at = index * ks_core::LOCK_LIST_ENTRY_SIZE;
+        if at + ks_core::LOCK_LIST_ENTRY_SIZE > copied {
+            break;
+        }
+        entries.push(LockListEntry {
+            id: u64::from_le_bytes(bulk[at..at + 8].try_into().unwrap()),
+            pid: u64::from_le_bytes(bulk[at + 8..at + 16].try_into().unwrap()),
+            address: u64::from_le_bytes(bulk[at + 16..at + 24].try_into().unwrap()),
+            len: u32::from_le_bytes(bulk[at + 24..at + 28].try_into().unwrap()) as usize,
+        });
+    }
+    Ok(entries)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

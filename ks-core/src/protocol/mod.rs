@@ -28,6 +28,9 @@ pub const MAX_CHAIN_OFFSETS: usize = 32;
 pub const MAX_MEMORY_LOCKS: usize = 64;
 /// Largest payload held by one memory lock.
 pub const MAX_MEMORY_LOCK_SIZE: usize = 4096;
+/// Packed size of one [`Request::LockList`] entry: id, pid and address as
+/// little-endian u64s, then the payload length as a little-endian u32.
+pub const LOCK_LIST_ENTRY_SIZE: usize = 28;
 /// Convenience alias used by the Lua layer for write sizes.
 pub const MAX_WRITE_SIZE: usize = MAX_DRIVER_TRANSFER_SIZE;
 /// Largest single target-process allocation accepted by the driver.
@@ -53,6 +56,8 @@ pub const MAX_HOOK_STOLEN_LEN: usize = 16;
 pub const MIN_HOOK_STOLEN_LEN: usize = 5;
 /// Largest shellcode blob [`HookOp::CreateShellcode`] accepts.
 pub const MAX_HOOK_SHELLCODE: usize = 1024;
+/// Processes the driver can track as "suspended by us" at once.
+pub const MAX_PROCESS_SUSPENDS: usize = 32;
 /// Lowest address treated as kernel space on x64 (`0xFFFF8000_00000000`).
 pub const MIN_KERNEL_ADDRESS: u64 = 0xFFFF_8000_0000_0000;
 
@@ -61,15 +66,41 @@ pub const fn is_kernel_address(address: u64) -> bool {
     address >= MIN_KERNEL_ADDRESS
 }
 
+/// Validates a hook target against its `pid`: `pid == 0` selects the kernel
+/// half (the address must be a kernel address), anything else selects that
+/// process's user half (the address must be below the kernel split). The
+/// trampoline follows the same rule.
+pub const fn check_hook_address(pid: u64, address: u64) -> bool {
+    if pid == 0 {
+        is_kernel_address(address)
+    } else {
+        !is_kernel_address(address) && address != 0
+    }
+}
+
+/// [`HookOp::Probe`] response flag: the stolen prologue contains a
+/// RIP-relative memory operand (the driver rebases it in a detour).
+pub const HOOK_PROBE_RIP_RELATIVE: u64 = 1;
+/// [`HookOp::Probe`] response flag: the stolen prologue contains a relative
+/// branch, which the driver refuses to relocate.
+pub const HOOK_PROBE_RELATIVE_BRANCH: u64 = 2;
+
 /// One kernel-hook table operation, MinHook-style: `Create` only records the
 /// hook (state `disabled`), `Enable`/`Disable` toggle the patched bytes, and
 /// `Remove` restores the original bytes and drops the entry.
+///
+/// Every variant that names a target space carries `pid`: `0` selects the
+/// kernel half (global, patch kernel text directly), any other value selects
+/// that process's user half (the driver attaches to the process and patches
+/// its user pages through an MDL). `pid` on `Enable`/`Disable`/`Remove` must
+/// match the `pid` the hook was created with, so ids stay process-local.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum HookOp<'a> {
     /// Record a hook on `target`. The driver decodes the prologue to find the
     /// replaced length and builds the jump; `trampoline` is the caller's
     /// already-executable detour target.
     Create {
+        pid: u64,
         target: u64,
         trampoline: u64,
     },
@@ -79,20 +110,45 @@ pub enum HookOp<'a> {
     /// `Remove`/`RemoveAll`/shutdown. The response carries the original
     /// prologue bytes followed by the buffer address (little-endian u64).
     CreateShellcode {
+        pid: u64,
         target: u64,
         #[serde(borrow)]
         code: &'a [u8],
     },
+    /// Install a detour whose trampoline the driver builds: it relocates the
+    /// stolen prologue into the same executable buffer and leaves its address
+    /// at `buffer + 0`, so the code can `call qword ptr [rip-14]` to reach
+    /// the original. Response: `value = id`, `count = replaced_len`,
+    /// bulk = original prologue, then the code address and the trampoline
+    /// address (two little-endian u64s).
+    CreateDetour {
+        pid: u64,
+        target: u64,
+        #[serde(borrow)]
+        code: &'a [u8],
+    },
+    /// Read-only prologue probe. Response: `value` = flags
+    /// (bit 0 = RIP-relative operand present, bit 1 = relative branch
+    /// present), `count = replaced_len`, bulk = original prologue followed by
+    /// a little-endian u32 holding the length a 14-byte absolute jump would
+    /// need (0 when the prologue is too long).
+    Probe {
+        pid: u64,
+        target: u64,
+    },
     /// Patch the target so calls reach the trampoline again.
     Enable {
+        pid: u64,
         id: u64,
     },
     /// Restore the original prologue bytes.
     Disable {
+        pid: u64,
         id: u64,
     },
     /// Restore the original bytes (if enabled) and drop the entry.
     Remove {
+        pid: u64,
         id: u64,
     },
     EnableAll,
@@ -109,6 +165,11 @@ pub enum HookOp<'a> {
     /// Answers `value = 1` (verified) or `0` (allocation/protection refused,
     /// e.g. HVCI).
     ShellcodeSelfTest,
+    /// Same for the driver-built trampoline ([`HookOp::CreateDetour`]):
+    /// installs a detour that calls the original prologue, calls the target,
+    /// disables and removes. Answers `value = 1` (verified) or `0`
+    /// (allocation refused, e.g. HVCI).
+    DetourSelfTest,
 }
 
 /// One entry of a batch write. `data` borrows straight out of the ring.
@@ -186,6 +247,12 @@ pub enum Request<'a> {
     UnlockAll {
         pid: u64,
     },
+    /// Dumps the whole driver-side lock table: every entry this driver is
+    /// replaying, whoever created it (Rust SDK, GUI worker, Lua script).
+    /// Response: `value = count`, `count = count`, bulk = `count` packed
+    /// entries of [`LOCK_LIST_ENTRY_SIZE`] bytes (id, pid, address as
+    /// little-endian u64, then length as a little-endian u32).
+    LockList,
     /// Reserve, commit and zero one region of target-process virtual
     /// memory. `protect` must satisfy [`valid_alloc_protect`]; the reply
     /// carries the base address in [`ResponseMeta::value`]. The driver
@@ -201,6 +268,22 @@ pub enum Request<'a> {
     Free {
         pid: u64,
         address: u64,
+    },
+    /// Suspends every thread of the process `pid` (kernel
+    /// `PsSuspendProcess`). Refuses `pid = 0` (Idle), `pid = 4` (System) and
+    /// the calling client's own pid. Idempotent: a process this driver
+    /// already suspended reports success without suspending twice.
+    /// Answers `value = 1` when the suspend was applied, `0` when it was a
+    /// no-op.
+    Suspend {
+        pid: u64,
+    },
+    /// Continues a process this driver previously suspended (kernel
+    /// `PsResumeProcess`). A `pid` this driver never suspended is a no-op
+    /// (`value = 0`): the driver never decrements a suspend count it did not
+    /// increment.
+    Resume {
+        pid: u64,
     },
     /// One kernel-hook table operation (see [`HookOp`]). `Create` returns the
     /// new id in [`ResponseMeta::value`], the replaced length in
@@ -374,6 +457,7 @@ impl<'a> Request<'a> {
                 }
             }
             Self::UnlockAll { pid } => check_pid(*pid),
+            Self::LockList => Ok(()),
             Self::Alloc { pid, size, protect } => {
                 check_pid(*pid)?;
                 if *size == 0 {
@@ -394,15 +478,28 @@ impl<'a> Request<'a> {
                 }
                 Ok(())
             }
+            Self::Suspend { pid } | Self::Resume { pid } => {
+                // pid 0 (Idle) and 4 (System) must never be frozen: the
+                // System process owns kernel worker threads.
+                if *pid == 0 || *pid == 4 {
+                    return Err(ProtocolError::InvalidPayload);
+                }
+                Ok(())
+            }
             Self::Hook { op } => match op {
-                HookOp::Create { target, trampoline } => {
-                    if !is_kernel_address(*target) || !is_kernel_address(*trampoline) {
+                HookOp::Create {
+                    pid,
+                    target,
+                    trampoline,
+                } => {
+                    if !check_hook_address(*pid, *target) || !check_hook_address(*pid, *trampoline)
+                    {
                         return Err(ProtocolError::InvalidPayload);
                     }
                     Ok(())
                 }
-                HookOp::CreateShellcode { target, code } => {
-                    if !is_kernel_address(*target) {
+                HookOp::CreateShellcode { pid, target, code } => {
+                    if !check_hook_address(*pid, *target) {
                         return Err(ProtocolError::InvalidPayload);
                     }
                     if code.is_empty() || code.len() > MAX_HOOK_SHELLCODE {
@@ -410,7 +507,25 @@ impl<'a> Request<'a> {
                     }
                     Ok(())
                 }
-                HookOp::Enable { id } | HookOp::Disable { id } | HookOp::Remove { id } => {
+                HookOp::CreateDetour { pid, target, code } => {
+                    if !check_hook_address(*pid, *target) {
+                        return Err(ProtocolError::InvalidPayload);
+                    }
+                    if code.is_empty() || code.len() > MAX_HOOK_SHELLCODE {
+                        return Err(ProtocolError::InvalidPayload);
+                    }
+                    Ok(())
+                }
+                HookOp::Probe { pid, target } => {
+                    if !check_hook_address(*pid, *target) {
+                        Err(ProtocolError::InvalidPayload)
+                    } else {
+                        Ok(())
+                    }
+                }
+                HookOp::Enable { pid: _, id }
+                | HookOp::Disable { pid: _, id }
+                | HookOp::Remove { pid: _, id } => {
                     if *id == 0 {
                         Err(ProtocolError::InvalidPayload)
                     } else {
@@ -418,7 +533,7 @@ impl<'a> Request<'a> {
                     }
                 }
                 HookOp::EnableAll | HookOp::DisableAll | HookOp::RemoveAll => Ok(()),
-                HookOp::SelfTest | HookOp::ShellcodeSelfTest => Ok(()),
+                HookOp::SelfTest | HookOp::ShellcodeSelfTest | HookOp::DetourSelfTest => Ok(()),
             },
         }
     }

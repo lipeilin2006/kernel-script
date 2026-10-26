@@ -24,7 +24,9 @@ pub(crate) fn run_checks(target: &Arc<Target>, failures: &mut Vec<(String, Strin
     check_batch(t, failures);
     check_chain(t, failures);
     check_locks(t, failures);
+    check_lock_list(t, failures);
     check_alloc(t, failures);
+    check_process_suspend(failures);
 
     check(failures, "concurrent ring access", || {
         run_concurrency_smoke(target)
@@ -497,6 +499,47 @@ fn check_locks(t: &Target, failures: &mut Vec<(String, String)>) {
     });
 }
 
+/// Lock-list export: the driver dumps every lock it is replaying, including
+/// ones created by other clients (a Lua script, another tool). The UI relies
+/// on this to show foreign locks.
+fn check_lock_list(t: &Target, failures: &mut Vec<(String, String)>) {
+    check(failures, "lock list reports driver locks", || {
+        const LOCK_ID: u64 = 0xA1B2_C3D4;
+        let address = t.slot(0xA00);
+        // A lock that this client did not create would need a second
+        // process; the wire format is the same either way, so verifying our
+        // own lock here proves the export works for Lua-created locks too.
+        ks_sdk::lock(LOCK_ID, t.pid, address, &[0x5A, 0x5A]).map_err(|e| format!("lock: {e}"))?;
+        thread::sleep(LOCK_SETTLE);
+
+        let list = ks_sdk::lock_list().map_err(|e| format!("lock_list: {e}"))?;
+        let entry = list
+            .iter()
+            .find(|entry| entry.id == LOCK_ID)
+            .ok_or_else(|| format!("lock {LOCK_ID:#x} missing from the list"))?;
+        if entry.pid != t.pid {
+            return Err(format!("lock pid {}, want {}", entry.pid, t.pid));
+        }
+        if entry.address != address {
+            return Err(format!(
+                "lock address {:#X}, want {address:#X}",
+                entry.address
+            ));
+        }
+        if entry.len != 2 {
+            return Err(format!("lock len {}, want 2", entry.len));
+        }
+
+        ks_sdk::unlock(LOCK_ID).map_err(|e| format!("unlock: {e}"))?;
+        thread::sleep(LOCK_SETTLE);
+        let list = ks_sdk::lock_list().map_err(|e| format!("lock_list: {e}"))?;
+        if list.iter().any(|entry| entry.id == LOCK_ID) {
+            return Err("unlocked lock still present in the list".into());
+        }
+        Ok(())
+    });
+}
+
 /// Target-process allocation: reserve/commit a page in this process,
 /// write and read it back through the normal (non-MDL) paths, then free
 /// it. The second check covers the guard rails the driver enforces before
@@ -560,24 +603,100 @@ fn check_alloc(t: &Target, failures: &mut Vec<(String, String)>) {
         failures,
         "kernel hook rejects bad addresses and ids",
         || {
-            if ks_sdk::hook_create(0, 0xFFFF_F800_0000_1000).is_ok() {
+            // pid=0 (kernel) requires kernel addresses.
+            if ks_sdk::hook_create(0, 0, 0xFFFF_F800_0000_1000).is_ok() {
                 return Err("null target accepted".into());
             }
-            if ks_sdk::hook_create(0x1000, 0xFFFF_F800_0000_1000).is_ok() {
-                return Err("user-mode target accepted".into());
+            if ks_sdk::hook_create(0, 0x1000, 0x1000).is_ok() {
+                return Err("user-mode target accepted for pid=0".into());
             }
-            if ks_sdk::hook_create(0xFFFF_F800_0000_1000, 0x1000).is_ok() {
-                return Err("user-mode trampoline accepted".into());
+            // A user pid requires user addresses.
+            if ks_sdk::hook_create(0x1000, 0xFFFF_F800_0000_1000, 0xFFFF_F800_0000_2000).is_ok() {
+                return Err("kernel target accepted for user pid".into());
             }
-            if ks_sdk::hook_enable(0).is_ok() {
+            if ks_sdk::hook_enable(0, 0).is_ok() {
                 return Err("id 0 accepted".into());
             }
-            if ks_sdk::hook_remove(0xDEAD_BEEF).is_ok() {
+            if ks_sdk::hook_remove(0, 0xDEAD_BEEF).is_ok() {
                 return Err("unknown id removed".into());
             }
             // Nothing was created, so the bulk calls must touch nothing.
             if ks_sdk::hook_disable_all().map_err(|e| e.to_string())? != 0 {
                 return Err("disable_all touched an empty table".into());
+            }
+            Ok(())
+        },
+    );
+}
+
+/// Suspend/resume: spawns a heartbeat child, freezes it, verifies the
+/// heartbeat stops growing, resumes it, verifies it grows again. Also checks
+/// the guard rails (System pid, unknown pid).
+fn check_process_suspend(failures: &mut Vec<(String, String)>) {
+    check(failures, "suspend rejects System and unknown pids", || {
+        if ks_sdk::suspend(0).is_ok() {
+            return Err("pid 0 (Idle) accepted".into());
+        }
+        if ks_sdk::suspend(4).is_ok() {
+            return Err("pid 4 (System) accepted".into());
+        }
+        // A never-suspended pid is a no-op, not an error.
+        if ks_sdk::suspend(0xDEAD_BEEF).is_ok() {
+            return Err("unknown pid suspended".into());
+        }
+        Ok(())
+    });
+
+    check(
+        failures,
+        "suspend freezes a child process, resume continues it",
+        || {
+            let exe = std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
+            let beat =
+                std::env::temp_dir().join(format!("ks-test-heartbeat-{}.bin", std::process::id()));
+            let _ = std::fs::remove_file(&beat);
+            let mut child = std::process::Command::new(&exe)
+                .arg("heartbeat")
+                .arg(&beat)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .map_err(|e| format!("spawn heartbeat: {e}"))?;
+
+            // Give the child time to start appending.
+            std::thread::sleep(Duration::from_millis(300));
+            let pid = child.id() as u64;
+            let size_before = std::fs::metadata(&beat).map(|m| m.len()).unwrap_or(0);
+            if size_before == 0 {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = std::fs::remove_file(&beat);
+                return Err("heartbeat child produced no output".into());
+            }
+
+            // Suspend and confirm the heartbeat freezes.
+            ks_sdk::suspend(pid).map_err(|e| format!("suspend: {e}"))?;
+            std::thread::sleep(Duration::from_millis(350));
+            let size_frozen = std::fs::metadata(&beat).map(|m| m.len()).unwrap_or(0);
+            // Resume and confirm the heartbeat continues.
+            ks_sdk::resume(pid).map_err(|e| format!("resume: {e}"))?;
+            std::thread::sleep(Duration::from_millis(350));
+            let size_after = std::fs::metadata(&beat).map(|m| m.len()).unwrap_or(0);
+
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = std::fs::remove_file(&beat);
+
+            if size_frozen > size_before {
+                return Err(format!(
+                    "heartbeat grew while suspended: {size_before} -> {size_frozen}"
+                ));
+            }
+            if size_after <= size_frozen {
+                return Err(format!(
+                    "heartbeat did not resume: {size_frozen} -> {size_after}"
+                ));
             }
             Ok(())
         },

@@ -28,7 +28,10 @@
 use std::fmt;
 use std::time::{Duration, Instant};
 
-use ks_link::{instance_claim_present, published_object_names_strict, shutdown, LinkError};
+use ks_link::{
+    clear_stale_publication, close_session, instance_claim_present, ping,
+    published_object_names_strict, shutdown, shutdown_incompatible, LinkError,
+};
 
 pub use dt_loader::{cleanup_service_load, provider_ids, set_log_sink, victim_builds};
 
@@ -141,10 +144,9 @@ pub fn start() -> Result<(), Error> {
 /// # Errors
 ///
 /// [`Error::DriverEntry`] when the driver ran and `DriverEntry` itself
-/// failed — including `0xC0000035` while another instance still owns
-/// the marker, which [`stop`] (or a ring `shutdown`) releases. A second
-/// attempt after a successful load is rejected the same way.
-/// [`Error::ScLoad`] when manual mapping did not run the driver and
+/// failed — including `0xC0000035` while an *unreachable* instance still
+/// owns the marker (see [`recover_previous_instance`]). [`Error::ScLoad`]
+/// when manual mapping did not run the driver and
 /// the service-load fallback was rejected too, [`Error::NotReady`] when
 /// the load succeeded but the publication never appeared,
 /// [`Error::Setup`] for temporary directory or working-directory
@@ -154,8 +156,62 @@ pub fn start_with(provider: Option<u32>, victim: Option<u32>) -> Result<(), Erro
     // from a torn-down one through the driver's claim; the claim is
     // ring-side knowledge, so it is injected here.
     dt_loader::set_instance_probe(|| instance_claim_present().unwrap_or(true));
+    // A previous run that crashed or was killed can leave its instance
+    // loaded (manual-mapped images never unload) and its registry
+    // publication behind, which would otherwise block this load.
+    recover_previous_instance();
     dt_loader::start_with_image(DRIVER_IMAGE, provider, victim).map_err(Error::from)?;
     wait_for_publication()
+}
+
+/// Clears a previous run's leftovers before mapping a fresh driver.
+///
+/// Two things can survive a crashed or killed run: the manual-mapped driver
+/// itself (KDU images never unload) and its registry publication under
+/// `HKLM\SOFTWARE\KernelScript`. Before mapping:
+///
+/// - a recorded instance that **answers the ring** is shut down through
+///   [`stop`], so this call can take the single-instance marker;
+/// - a recorded instance whose ring is **silent** (the events are gone, or
+///   the round trip times out) is judged residue from a dead run: the
+///   publication is erased so [`wait_for_publication`] cannot report a
+///   stale driver and the claim no longer looks live;
+/// - a session cached against the previous load's randomized names is
+///   dropped either way.
+///
+/// A genuinely live but unreachable instance (for example one mapped by an
+/// older SDK whose ring version differs) cannot be shut down from here; the
+/// map then fails with the usual `0xC0000035`.
+fn recover_previous_instance() {
+    let recorded =
+        published_object_names_strict().is_some() || instance_claim_present().unwrap_or(false);
+    if !recorded {
+        return;
+    }
+    // Any cached session points at the previous load's objects.
+    close_session();
+    let mut stopped = false;
+    match ping() {
+        // A live instance answering our ring: shut it down cleanly.
+        Ok(()) => stopped = stop().is_ok(),
+        // A live instance from an older build: its `Shutdown` variant still
+        // encodes the same, so wind it down over the relaxed path.
+        Err(LinkError::RingIncompatible) => {
+            stopped = shutdown_incompatible().is_ok();
+        }
+        // The events are gone or the round trip timed out: dead-run residue.
+        Err(_) => {}
+    }
+    // `ping`/`stop`/`shutdown_incompatible` may have opened a session; the
+    // new map publishes fresh names, so drop it again.
+    close_session();
+    if !stopped {
+        // Nothing answered: whatever the registry records is residue from a
+        // dead run (an instance we could not stop keeps its marker, which
+        // refuses the map with the usual 0xC0000035 — erasing its record
+        // cannot create a second instance).
+        clear_stale_publication();
+    }
 }
 
 /// Shuts the loaded driver down: submits the ring `shutdown` request and

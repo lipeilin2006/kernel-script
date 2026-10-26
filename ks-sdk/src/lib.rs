@@ -23,6 +23,11 @@
 
 pub use ks_link::*;
 
+/// Client-side shellcode assembly for the kernel detour API
+/// ([`hook_detour`]): builds the small fixed-encoding stubs the driver copies
+/// into executable memory.
+pub mod shellcode;
+
 /// In-process driver loading (`start`, `stop`, `set_log_sink`, the
 /// [`DRIVER_IMAGE`] bytes and the [`Error`] type).
 pub mod kdu;

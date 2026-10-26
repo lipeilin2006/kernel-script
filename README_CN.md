@@ -1,14 +1,20 @@
 # Kernel Script
 
-[项目主页](https://github.com/lipeilin2006/kernel-script) | [English README](https://github.com/lipeilin2006/kernel-script/blob/main/README.md) | [Lua API](https://github.com/lipeilin2006/kernel-script/blob/main/document.md) | [中文 Lua API](https://github.com/lipeilin2006/kernel-script/blob/main/document_CN.md)
+> **免责声明**：本项目仅供安全研究与学习交流使用，禁止用于任何违法或未
+> 授权用途（例如：网络游戏作弊或破坏反作弊系统、入侵或篡改他人系统、恶意
+> 破坏、商业滥用等）。因不当使用造成的一切后果由使用者自行承担。
+>
+> **闲鱼唯一官方商户：米烧酒可玛丽**；其他同名或近似店铺均与本项目无关。
+
+[项目主页](https://github.com/lipeilin2006/kernel-script) | [English README](https://github.com/lipeilin2006/kernel-script/blob/main/README.md) | [Lua API](https://github.com/lipeilin2006/kernel-script/blob/main/document.md) | [中文 Lua API](https://github.com/lipeilin2006/kernel-script/blob/main/document_CN.md) | [Rust SDK 接入指南](https://github.com/lipeilin2006/kernel-script/blob/main/SDK_GUIDE.md)
 
 ## 使用方法
 
 1. 将 `ks-gui.exe` 与其 `scripts` 目录放在同一目录（驱动镜像内嵌在可执行
    文件中：不安装任何东西，目标镜像不落盘）。
 2. 以管理员身份运行 `ks-gui.exe`：驱动在启动时静默启动——内置镜像经进程内
-   KDU 映射器直接映射进内核（不建服务、不需要签名），若上一次运行留下存活
-   实例则直接复用。
+   KDU 映射器直接映射进内核（不建服务、不需要签名）。上一次运行留下的实例若
+   仍能应答则直接复用；否则先清掉注册表残留，再映射一个新实例。
 3. 点击 `Stop` 关闭 GUI，退出时会静默关闭驱动。
 
 现在没有用户态 service：GUI 通过共享内存 ring 直接与驱动通信。独立诊断请在

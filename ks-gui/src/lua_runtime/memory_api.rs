@@ -313,6 +313,18 @@ pub fn register_memory_api(lua: &Lua) -> mlua::Result<()> {
             crate::sync_ipc::unlock_rva(id).map_err(mlua::Error::runtime)
         })?,
     )?;
+    module.set(
+        "suspend",
+        lua.create_function(|_, pid: u64| {
+            crate::sync_ipc::suspend(pid).map_err(mlua::Error::runtime)
+        })?,
+    )?;
+    module.set(
+        "resume",
+        lua.create_function(|_, pid: u64| {
+            crate::sync_ipc::resume(pid).map_err(mlua::Error::runtime)
+        })?,
+    )?;
 
     module.set(
         "get_window_rect",

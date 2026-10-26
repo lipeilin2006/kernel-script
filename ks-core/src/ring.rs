@@ -20,7 +20,7 @@
 use core::sync::atomic::{AtomicI32, AtomicU32, AtomicU64, Ordering};
 
 pub const RING_MAGIC: u32 = 0x4B53_5231;
-pub const RING_VERSION: u32 = 5;
+pub const RING_VERSION: u32 = 8;
 
 /// Bytes reserved for the header. Payload offsets are relative to the start
 /// of the mapping, so the request region starts at [`HEADER_SPACE`].
@@ -122,6 +122,13 @@ impl RingHeader {
     pub fn is_compatible(&self) -> bool {
         self.magic.load(Ordering::SeqCst) == RING_MAGIC
             && self.version.load(Ordering::SeqCst) == RING_VERSION
+    }
+
+    /// True when the mapping belongs to this protocol family (magic only).
+    /// Lets a client recognise a ring left behind by an older build so it can
+    /// attempt a best-effort `Shutdown` instead of demanding a reboot.
+    pub fn has_our_magic(&self) -> bool {
+        self.magic.load(Ordering::SeqCst) == RING_MAGIC
     }
 
     pub fn state(&self) -> u32 {

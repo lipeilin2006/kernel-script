@@ -163,6 +163,8 @@ pub fn start() -> NTSTATUS {
         crate::lock::init();
         // Same for the kernel hook table.
         crate::hook::init();
+        // And the process-suspend bookkeeping.
+        crate::suspend::init();
         let status = spawn_worker();
         if !nt_success(status) {
             crate::trace!("worker spawn failed 0x%lx", status as u32);
@@ -256,6 +258,9 @@ pub unsafe fn stop() {
     // Kernel hooks write kernel code: restore every patched prologue before
     // the trampolines they point at can go away.
     crate::hook::shutdown();
+    // Suspends are deliberately not undone, but the bookkeeping goes: a
+    // fresh load must not think a stale pid is still ours.
+    crate::suspend::forget_all();
     let response_event = RESPONSE_EVENT.swap(0, Ordering::SeqCst) as HANDLE;
     let section = SECTION_HANDLE.swap(0, Ordering::SeqCst) as HANDLE;
     let mapped = MAPPED_BASE.swap(0, Ordering::SeqCst) as *mut u8;
@@ -320,6 +325,8 @@ unsafe extern "system" fn worker(_context: *mut c_void) {
                 // Restore patched kernel prologues before the worker exits:
                 // a hook left pointing at freed pages crashes the machine.
                 crate::hook::shutdown();
+                // Forget suspend bookkeeping (suspends themselves survive).
+                crate::suspend::forget_all();
                 // Then release everything `start` acquired. A manually
                 // mapped image (KDU) never runs `DriverUnload`, so this is
                 // its only chance to free the ring objects, the registry
