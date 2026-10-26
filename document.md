@@ -309,6 +309,18 @@ Removes a lock by `id`; the original PID and RVA are not needed.
 memory.unlock_rva(2)
 ```
 
+### memory.lock_list
+
+Dumps every lock the driver is replaying, including locks created by
+another client (a Rust tool, another script). Returns an array of
+`{ id, pid, address, len }`.
+
+```lua
+for _, lock in ipairs(memory.lock_list()) do
+    print(lock.id, lock.pid, string.format("0x%X", lock.address), lock.len)
+end
+```
+
 Constraints:
 
 - All lock APIs are synchronous; each one is a single round trip that
@@ -350,6 +362,100 @@ Constraints:
   guarantee a matching `resume`, otherwise the target stays frozen.
 - MDL writes (code patching) inside the hook API automatically suspend the
   target first; see the SDK guide's hook section.
+
+## Hook API (MinHook-style)
+
+Kernel inline hooks reachable from Lua, mirroring the Rust SDK surface.
+Every call is one driver round trip. `pid` selects the target space: `0`
+hooks the kernel's global text, a non-zero `pid` hooks that process's
+user half. Addresses accept a number or a `0x`-prefixed string; address
+fields in the returned tables are hex strings so kernel addresses survive
+Lua's f64 numbers exactly.
+
+Hard limits of kernel inline hooking (the API does **not** detect or work
+around them): PatchGuard-protected bytes, HVCI-enforced code pages
+(`STATUS_INVALID_PAGE_PROTECTION`), a thread already executing inside the
+replaced prologue (kernel code has no safe thread-freeze), and a
+trampoline that does not reproduce the stolen instructions plus a jump
+back to `target + replaced_len`. Misuse bugchecks the machine; remove
+hooks before freeing any trampoline memory you own.
+
+### memory.hook_probe
+
+Read-only prologue report — the planning step before a detour. Returns
+`replaced_len`, `absolute_len`, `original` (byte table), `rip_relative`
+and `relative_branch`. `hook_detour` refuses a prologue containing a
+relative branch.
+
+```lua
+local probe = memory.hook_probe(pid, target)
+if probe.relative_branch then error("cannot relocate a relative branch") end
+```
+
+### memory.hook_create
+
+Records a hook whose trampoline **you** own and leaves it disabled.
+`trampoline` must be executable memory in the same space that stays valid
+until `hook_remove` — for a user-space target, e.g. an
+`memory.alloc(pid, n, 0x40)` buffer holding the stolen instructions plus
+a jump back to `target + replaced_len`. Returns `{ id, replaced_len,
+original }`.
+
+```lua
+local h = memory.hook_create(pid, target, trampoline)
+memory.hook_enable(pid, h.id)
+```
+
+### memory.hook_enable / memory.hook_disable / memory.hook_remove
+
+Applies the jump, restores the original prologue (keeping the entry for a
+later enable), or drops the entry. `hook_remove` also frees driver-owned
+detour/shellcode buffers — call it before any user-owned trampoline goes
+away.
+
+### memory.hook_enable_all / memory.hook_disable_all / memory.hook_remove_all
+
+Global (no `pid`): operate on every hook the driver recorded and return
+how many were touched. Driver shutdown removes all hooks implicitly.
+
+### memory.hook_shellcode
+
+The driver allocates executable non-paged memory in the target space,
+copies `code` (position-independent x64, at most 1024 bytes) there and
+points the target's jump at it. The buffer belongs to the hook entry and
+is freed by `hook_remove`. Returns `{ id, replaced_len, original,
+code_address }`. HVCI makes the allocation fail.
+
+### memory.hook_detour
+
+Same as `hook_shellcode`, but the driver also builds the trampoline
+itself: the stolen instructions with RIP-relative operands rebased, plus
+a jump back to `target + replaced_len`. Call the original from `code`
+with the fixed 6-byte sequence `FF 15 F2 FF FF FF` (`call qword ptr
+[rip-14]`). Returns `{ id, replaced_len, original, code_address,
+trampoline_address }`.
+
+```lua
+-- detour that calls the original, adds one to its result and returns
+local code = {
+    0xFF, 0x15, 0xF2, 0xFF, 0xFF, 0xFF, -- call [rip-14] (original)
+    0x83, 0xC0, 0x01,                   -- add eax, 1
+    0xC3,                               -- ret
+}
+local h = memory.hook_detour(pid, target, code)
+memory.hook_enable(pid, h.id)
+```
+
+Constraints:
+
+- 16 hooks maximum; ids start at 1 and are never reused. Duplicate
+  targets fail with an "object name collision" error.
+- A user-space hook write suspends the target process first; a refusal to
+  suspend fails the write. A `pid` equal to this GUI's own pid skips the
+  suspension (it would deadlock the round trip).
+- The kernel path (`pid = 0`) is never suspended: `PsSuspendProcess` does
+  not stop kernel threads.
+- The driver's own self tests (`ks-hook-test`) stay Rust-only.
 
 ## MDL Memory API
 

@@ -293,6 +293,17 @@ memory.lock_rva(2, pid, 0x1234, {0x90, 0x90})
 memory.unlock_rva(2)
 ```
 
+### memory.lock_list
+
+导出驱动正在重写的全部锁，包括其他客户端（Rust 工具、另一个脚本）
+创建的锁。返回 `{ id, pid, address, len }` 数组。
+
+```lua
+for _, lock in ipairs(memory.lock_list()) do
+    print(lock.id, lock.pid, string.format("0x%X", lock.address), lock.len)
+end
+```
+
 约束：
 
 - 所有 lock API 均为同步调用，每次调用以一次往返修改 driver 侧锁表。
@@ -329,6 +340,90 @@ memory.resume(pid)
   否则目标进程会一直冻结。
 - 挂起/继续期间，对目标进程的 MDL 写（代码补丁）也自动先挂起再写，
   见 SDK 文档的 hook 章节。
+
+## Hook API（MinHook 风格）
+
+与 Rust SDK 表面一一对应的内核内联 hook。每次调用是一次驱动往返。
+`pid` 选择目标空间：`0` 表示内核全局文本，非零 pid 表示该进程的用户
+半区。地址参数接受数字或 `0x` 前缀字符串；返回表中的地址字段一律是
+十六进制字符串，保证内核地址经过 Lua 的 f64 数字后仍然精确。
+
+内核内联 hook 的硬限制（本 API **不会**检测或绕过）：PatchGuard 保护
+的字节、HVCI 强制的代码页（`STATUS_INVALID_PAGE_PROTECTION`）、已经
+执行到被替换 prologue 内部的线程（内核代码没有安全的线程冻结），以及
+不能复现被盗指令并跳回 `target + replaced_len` 的 trampoline。误用会
+直接蓝屏；在释放任何自持有的 trampoline 内存之前必须先 `hook_remove`。
+
+### memory.hook_probe
+
+只读 prologue 报告——detour 前的规划步骤。返回 `replaced_len`、
+`absolute_len`、`original`（字节表）、`rip_relative` 和
+`relative_branch`。prologue 含相对跳转时 `hook_detour` 会拒绝。
+
+```lua
+local probe = memory.hook_probe(pid, target)
+if probe.relative_branch then error("无法重定位相对跳转") end
+```
+
+### memory.hook_create
+
+登记一个 **调用者自持有** trampoline 的 hook，创建后处于禁用状态。
+`trampoline` 必须是同空间内可执行、且在 `hook_remove` 之前保持有效的
+内存——用户态目标可以用 `memory.alloc(pid, n, 0x40)` 分配缓冲区，写入
+被盗指令加一条跳回 `target + replaced_len` 的跳转。返回
+`{ id, replaced_len, original }`。
+
+```lua
+local h = memory.hook_create(pid, target, trampoline)
+memory.hook_enable(pid, h.id)
+```
+
+### memory.hook_enable / memory.hook_disable / memory.hook_remove
+
+分别应用跳转、还原原始 prologue（保留条目以便再次启用）、删除条目。
+`hook_remove` 还会在还原原始字节后释放驱动持有的 detour/shellcode
+缓冲区——务必在自持有 trampoline 释放之前调用。
+
+### memory.hook_enable_all / memory.hook_disable_all / memory.hook_remove_all
+
+全局操作（无 `pid`）：作用于驱动记录的每一个 hook，返回处理条数。
+驱动关闭会隐式移除全部 hook。
+
+### memory.hook_shellcode
+
+驱动在目标空间分配可执行非分页内存，把 `code`（位置无关 x64，最多
+1024 字节）复制进去，并把目标的跳转指向它。缓冲区属于该 hook 条目，
+由 `hook_remove` 释放。返回 `{ id, replaced_len, original,
+code_address }`。HVCI 会让分配失败。
+
+### memory.hook_detour
+
+与 `hook_shellcode` 相同，但驱动还会自行构建 trampoline：被盗指令
+（RIP-relative 操作数已重定位）加一条跳回 `target + replaced_len` 的
+跳转。在 `code` 中用固定的 6 字节序列 `FF 15 F2 FF FF FF`
+（`call qword ptr [rip-14]`）调用原函数。返回 `{ id, replaced_len,
+original, code_address, trampoline_address }`。
+
+```lua
+-- detour：先调用原函数，结果加一后返回
+local code = {
+    0xFF, 0x15, 0xF2, 0xFF, 0xFF, 0xFF, -- call [rip-14]（原函数）
+    0x83, 0xC0, 0x01,                   -- add eax, 1
+    0xC3,                               -- ret
+}
+local h = memory.hook_detour(pid, target, code)
+memory.hook_enable(pid, h.id)
+```
+
+约束：
+
+- 最多 16 个 hook；id 从 1 开始且不复用。重复的 target 会返回
+  “对象名冲突”错误。
+- 用户态 hook 写入会先挂起目标进程；挂起被拒绝时写入直接失败。
+  `pid` 等于本 GUI 自身 pid 时跳过挂起（否则会让等待往返的进程
+  自锁）。
+- 内核路径（`pid = 0`）从不挂起：`PsSuspendProcess` 不会停止内核线程。
+- 驱动自测试（`ks-hook-test`）保持 Rust 专用，不暴露给 Lua。
 
 ## MDL Memory API
 

@@ -313,6 +313,25 @@ pub fn register_memory_api(lua: &Lua) -> mlua::Result<()> {
             crate::sync_ipc::unlock_rva(id).map_err(mlua::Error::runtime)
         })?,
     )?;
+    // memory.lock_list() -> { {id, pid, address, len}, ... }
+    // Every lock the driver is replaying, including locks created by other
+    // clients (a Rust tool, another script).
+    module.set(
+        "lock_list",
+        lua.create_function(|lua, ()| -> mlua::Result<mlua::Table> {
+            let entries = crate::sync_ipc::lock_list().map_err(mlua::Error::runtime)?;
+            let list = lua.create_table()?;
+            for (i, entry) in entries.iter().enumerate() {
+                let item = lua.create_table()?;
+                item.set("id", entry.id)?;
+                item.set("pid", entry.pid)?;
+                item.set("address", entry.address)?;
+                item.set("len", entry.len)?;
+                list.set(i + 1, item)?;
+            }
+            Ok(list)
+        })?,
+    )?;
     module.set(
         "suspend",
         lua.create_function(|_, pid: u64| {
@@ -323,6 +342,123 @@ pub fn register_memory_api(lua: &Lua) -> mlua::Result<()> {
         "resume",
         lua.create_function(|_, pid: u64| {
             crate::sync_ipc::resume(pid).map_err(mlua::Error::runtime)
+        })?,
+    )?;
+
+    // Hook API, mirroring the SDK surface. `pid = 0` selects the kernel
+    // half, anything else that process's user half; addresses accept a
+    // number or a `0x` string. Address fields in the returned tables are
+    // hex strings so kernel addresses survive Lua's f64 numbers exactly.
+    //
+    // memory.hook_probe(pid, target)
+    //   -> { replaced_len, absolute_len, original, rip_relative,
+    //        relative_branch }
+    module.set(
+        "hook_probe",
+        lua.create_function(
+            |lua, (pid, target): (u64, Address)| -> mlua::Result<mlua::Table> {
+                let probe =
+                    crate::sync_ipc::hook_probe(pid, target.get()).map_err(mlua::Error::runtime)?;
+                let report = lua.create_table()?;
+                report.set("replaced_len", probe.replaced_len)?;
+                report.set("absolute_len", probe.absolute_len)?;
+                report.set("original", probe.original)?;
+                report.set("rip_relative", probe.rip_relative)?;
+                report.set("relative_branch", probe.relative_branch)?;
+                Ok(report)
+            },
+        )?,
+    )?;
+    // memory.hook_create(pid, target, trampoline)
+    //   -> { id, replaced_len, original }
+    module.set(
+        "hook_create",
+        lua.create_function(
+            |lua,
+             (pid, target, trampoline): (u64, Address, Address)|
+             -> mlua::Result<mlua::Table> {
+                let hook = crate::sync_ipc::hook_create(pid, target.get(), trampoline.get())
+                    .map_err(mlua::Error::runtime)?;
+                let entry = lua.create_table()?;
+                entry.set("id", hook.id)?;
+                entry.set("replaced_len", hook.replaced_len)?;
+                entry.set("original", hook.original)?;
+                Ok(entry)
+            },
+        )?,
+    )?;
+    // memory.hook_shellcode(pid, target, code)
+    //   -> { id, replaced_len, original, code_address }
+    module.set(
+        "hook_shellcode",
+        lua.create_function(
+            |lua, (pid, target, code): (u64, Address, Vec<u8>)| -> mlua::Result<mlua::Table> {
+                let hook = crate::sync_ipc::hook_shellcode(pid, target.get(), &code)
+                    .map_err(mlua::Error::runtime)?;
+                let entry = lua.create_table()?;
+                entry.set("id", hook.id)?;
+                entry.set("replaced_len", hook.replaced_len)?;
+                entry.set("original", hook.original)?;
+                entry.set("code_address", format!("0x{:X}", hook.code_address))?;
+                Ok(entry)
+            },
+        )?,
+    )?;
+    // memory.hook_detour(pid, target, code)
+    //   -> { id, replaced_len, original, code_address, trampoline_address }
+    module.set(
+        "hook_detour",
+        lua.create_function(
+            |lua, (pid, target, code): (u64, Address, Vec<u8>)| -> mlua::Result<mlua::Table> {
+                let hook = crate::sync_ipc::hook_detour(pid, target.get(), &code)
+                    .map_err(mlua::Error::runtime)?;
+                let entry = lua.create_table()?;
+                entry.set("id", hook.id)?;
+                entry.set("replaced_len", hook.replaced_len)?;
+                entry.set("original", hook.original)?;
+                entry.set("code_address", format!("0x{:X}", hook.code_address))?;
+                entry.set(
+                    "trampoline_address",
+                    format!("0x{:X}", hook.trampoline_address),
+                )?;
+                Ok(entry)
+            },
+        )?,
+    )?;
+    module.set(
+        "hook_enable",
+        lua.create_function(|_, (pid, id): (u64, u64)| {
+            crate::sync_ipc::hook_enable(pid, id).map_err(mlua::Error::runtime)
+        })?,
+    )?;
+    module.set(
+        "hook_disable",
+        lua.create_function(|_, (pid, id): (u64, u64)| {
+            crate::sync_ipc::hook_disable(pid, id).map_err(mlua::Error::runtime)
+        })?,
+    )?;
+    module.set(
+        "hook_remove",
+        lua.create_function(|_, (pid, id): (u64, u64)| {
+            crate::sync_ipc::hook_remove(pid, id).map_err(mlua::Error::runtime)
+        })?,
+    )?;
+    module.set(
+        "hook_enable_all",
+        lua.create_function(|_, ()| {
+            crate::sync_ipc::hook_enable_all().map_err(mlua::Error::runtime)
+        })?,
+    )?;
+    module.set(
+        "hook_disable_all",
+        lua.create_function(|_, ()| {
+            crate::sync_ipc::hook_disable_all().map_err(mlua::Error::runtime)
+        })?,
+    )?;
+    module.set(
+        "hook_remove_all",
+        lua.create_function(|_, ()| {
+            crate::sync_ipc::hook_remove_all().map_err(mlua::Error::runtime)
         })?,
     )?;
 
@@ -349,4 +485,61 @@ pub fn register_memory_api(lua: &Lua) -> mlua::Result<()> {
     )?;
 
     lua.globals().set("memory", module)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::register_memory_api;
+
+    /// The whole Lua-facing surface must exist on the `memory` table; the
+    /// functions themselves need a live driver and are exercised by
+    /// `ks-test`/`ks-hook-test` instead.
+    #[test]
+    fn registers_driver_round_trip_surface() {
+        let lua = mlua::Lua::new();
+        register_memory_api(&lua).unwrap();
+        let memory: mlua::Table = lua.globals().get("memory").unwrap();
+        for name in [
+            "get_pid",
+            "get_process_base",
+            "read_i32",
+            "read_bytes",
+            "write_i32",
+            "write_bytes",
+            "read_rva",
+            "write_rva",
+            "read_mdl",
+            "write_mdl",
+            "read_mdl_rva",
+            "write_mdl_rva",
+            "batch_read",
+            "batch_write",
+            "batch_offset",
+            "traverse_pointer_chain",
+            "alloc",
+            "free",
+            "lock",
+            "unlock",
+            "unlock_all",
+            "lock_rva",
+            "unlock_rva",
+            "lock_list",
+            "suspend",
+            "resume",
+            "hook_probe",
+            "hook_create",
+            "hook_shellcode",
+            "hook_detour",
+            "hook_enable",
+            "hook_disable",
+            "hook_remove",
+            "hook_enable_all",
+            "hook_disable_all",
+            "hook_remove_all",
+            "get_window_rect",
+        ] {
+            let value: mlua::Value = memory.get(name).expect(name);
+            assert!(value.is_function(), "{name} must be a function");
+        }
+    }
 }

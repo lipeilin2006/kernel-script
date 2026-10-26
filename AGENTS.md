@@ -229,8 +229,19 @@ memory.unlock(id)
 memory.unlock_all(pid)
 memory.lock_rva(id, pid, relative_address, data)
 memory.unlock_rva(id)
+memory.lock_list()
 memory.suspend(pid)
 memory.resume(pid)
+memory.hook_probe(pid, target)
+memory.hook_create(pid, target, trampoline)
+memory.hook_shellcode(pid, target, code)
+memory.hook_detour(pid, target, code)
+memory.hook_enable(pid, id)
+memory.hook_disable(pid, id)
+memory.hook_remove(pid, id)
+memory.hook_enable_all()
+memory.hook_disable_all()
+memory.hook_remove_all()
 keyboard.is_key_down(key)
 keyboard.is_key_up(key)
 keyboard.is_key_press(key)
@@ -424,7 +435,11 @@ down LIFO. The caller supplies an already-executable detour/trampoline.
   non-zero `pid` selects that process's user half — the driver reads the
   prologue with `MmCopyVirtualMemory` and writes the patch through an MDL
   attach that bypasses user write-protection, exactly like
-  `memory::write_process_memory_mdl`. Rust only — not exposed to Lua.
+  `memory::write_process_memory_mdl`. The Lua surface mirrors the SDK as
+  `memory.hook_probe`/`hook_create`/`hook_shellcode`/`hook_detour`/
+  `hook_enable`/`hook_disable`/`hook_remove` plus the three `*_all`
+  variants (address fields in Lua results are hex strings so kernel
+  addresses survive f64); the driver's own self tests stay Rust-only.
 - Shellcode variant: `hook_shellcode(target, code) -> ShellcodeHook` and
   `hook_shellcode_self_test()`. The driver allocates executable non-paged
   pool (`ExAllocatePool2` with `POOL_FLAG_NON_PAGED_EXECUTE`), copies `code`
@@ -497,8 +512,8 @@ using the `ntoskrnl` exports `PsSuspendProcess` / `PsResumeProcess` (both
 present and confirmed via `dumpbin /exports`; `KeSuspendThread` /
 `PsGetNextProcessThread` are *not* exported on this build, so no thread
 enumeration is attempted). SDK surface: `ks_sdk::suspend(pid)` /
-`ks_sdk::resume(pid)` (`Request::Suspend` / `Request::Resume`; Rust only —
-not exposed to Lua).
+`ks_sdk::resume(pid)` (`Request::Suspend` / `Request::Resume`; also
+exposed to Lua as `memory.suspend` / `memory.resume`).
 
 Rules and caveats:
 

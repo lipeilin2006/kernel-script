@@ -165,3 +165,67 @@ pub fn unlock_rva(id: u64) -> Result<(), String> {
     gate()?;
     ks_sdk::unlock_rva(id).map_err(reason)
 }
+
+/// Records a MinHook-style inline hook whose trampoline the caller owns;
+/// leaves it disabled. `pid = 0` selects the kernel half.
+pub fn hook_create(pid: u64, target: u64, trampoline: u64) -> Result<ks_sdk::KernelHook, String> {
+    gate()?;
+    ks_sdk::hook_create(pid, target, trampoline).map_err(reason)
+}
+
+/// Applies a recorded hook's jump.
+pub fn hook_enable(pid: u64, id: u64) -> Result<(), String> {
+    gate()?;
+    ks_sdk::hook_enable(pid, id).map_err(reason)
+}
+
+/// Restores a hook's original prologue, keeping the entry.
+pub fn hook_disable(pid: u64, id: u64) -> Result<(), String> {
+    gate()?;
+    ks_sdk::hook_disable(pid, id).map_err(reason)
+}
+
+/// Disables (if needed) and drops a hook; frees driver-owned detour
+/// buffers after restoring the original bytes.
+pub fn hook_remove(pid: u64, id: u64) -> Result<(), String> {
+    gate()?;
+    ks_sdk::hook_remove(pid, id).map_err(reason)
+}
+
+/// Enables every recorded hook; returns how many were touched.
+pub fn hook_enable_all() -> Result<u64, String> {
+    gate()?;
+    ks_sdk::hook_enable_all().map_err(reason)
+}
+
+/// Restores every patched hook; returns how many were touched.
+pub fn hook_disable_all() -> Result<u64, String> {
+    gate()?;
+    ks_sdk::hook_disable_all().map_err(reason)
+}
+
+/// Removes every hook in reverse creation order; returns how many were
+/// touched.
+pub fn hook_remove_all() -> Result<u64, String> {
+    gate()?;
+    ks_sdk::hook_remove_all().map_err(reason)
+}
+
+/// Read-only prologue report (planning step before a detour).
+pub fn hook_probe(pid: u64, target: u64) -> Result<ks_sdk::HookProbe, String> {
+    gate()?;
+    ks_sdk::hook_probe(pid, target).map_err(reason)
+}
+
+/// Installs a hook whose detour is the supplied machine code; the driver
+/// owns the executable copy.
+pub fn hook_shellcode(pid: u64, target: u64, code: &[u8]) -> Result<ks_sdk::ShellcodeHook, String> {
+    gate()?;
+    ks_sdk::hook_shellcode(pid, target, code).map_err(reason)
+}
+
+/// Installs a detour and lets the driver build the trampoline.
+pub fn hook_detour(pid: u64, target: u64, code: &[u8]) -> Result<ks_sdk::DetourHook, String> {
+    gate()?;
+    ks_sdk::hook_detour(pid, target, code).map_err(reason)
+}
