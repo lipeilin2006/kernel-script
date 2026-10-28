@@ -109,6 +109,12 @@ impl LuaRuntimeManager {
         })
     }
 
+    /// The manager-owned config store (`config.json`), shared with the GUI
+    /// chrome so the language choice persists beside script state.
+    pub fn config_store(&self) -> SharedConfigStore {
+        Arc::clone(&self.config)
+    }
+
     pub fn frame(&mut self, ctx: &egui::Context, now: Instant, ui_visible: bool) {
         // Every rendered frame runs OnUpdate (immediate-mode egui requires it)
         // and regenerates the draw command snapshot.

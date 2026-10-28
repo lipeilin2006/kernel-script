@@ -68,6 +68,8 @@ impl KernelScriptApp {
         // The manager runs every script's OnStart before this, so no Lua
         // round trip can overlap the probe the control spawns in `new`.
         let runtime = LuaRuntimeManager::new(script_dir)?;
+        // Restore the UI language before the first frame renders.
+        crate::lang::restore(&runtime.config_store());
         Ok(Self {
             driver: crate::driver::DriverControl::new(),
             runtime,
@@ -169,7 +171,7 @@ impl KernelScriptApp {
                 self.ce_auto_open_done = true;
                 self.open_memory_tool(glfw_backend);
             } else {
-                egui::Window::new("内存工具")
+                egui::Window::new(crate::lang::s().overlay_title)
                     .default_pos(egui::pos2(16.0, 220.0))
                     .resizable(false)
                     .show(ctx, |ui| {
@@ -180,12 +182,15 @@ impl KernelScriptApp {
                             ui.label(text);
                         }
                         ui.horizontal(|ui| {
-                            if ui.button("重新打开内存工具").clicked() {
+                            if ui.button(crate::lang::s().reopen_tool).clicked() {
                                 self.open_memory_tool(glfw_backend);
                             }
-                            if ui.button("退出程序").clicked() {
+                            if ui.button(crate::lang::s().quit).clicked() {
                                 glfw_backend.window.set_should_close(true);
                             }
+                        });
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            crate::lang::toggle_widget(ui, &self.runtime.config_store());
                         });
                     });
             }
@@ -193,7 +198,7 @@ impl KernelScriptApp {
     }
 
     fn open_memory_tool(&mut self, glfw_backend: &mut GlfwBackend) {
-        match crate::ce_window::CeWindow::new(&mut glfw_backend.glfw) {
+        match crate::ce_window::CeWindow::new(&mut glfw_backend.glfw, self.runtime.config_store()) {
             Ok(window) => {
                 tracing::info!("memory tool window opened");
                 self.ce = Some(window);

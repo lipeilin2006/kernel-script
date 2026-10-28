@@ -3,6 +3,7 @@ mod app;
 mod ce_window;
 mod config_store;
 mod driver;
+mod lang;
 mod overlay;
 
 mod lua_runtime;

@@ -28,6 +28,8 @@ use egui_overlay::egui_window_glfw_passthrough::glfw::{
 };
 use egui_overlay::egui_window_glfw_passthrough::GlfwBackend;
 
+use crate::config_store::SharedConfigStore;
+use crate::lang::{self, s};
 use crate::sync_ipc;
 
 /// Bytes shown by one hex page. The driver caps a single read at 4096.
@@ -62,14 +64,15 @@ impl ValueType {
     ];
 
     fn label(self) -> &'static str {
+        let strings = s();
         match self {
-            Self::I8 => "1 字节",
-            Self::I16 => "2 字节",
-            Self::I32 => "4 字节",
-            Self::I64 => "8 字节",
-            Self::U32 => "4 字节 (无符号)",
-            Self::F32 => "浮点",
-            Self::F64 => "双精度",
+            Self::I8 => strings.type_i8,
+            Self::I16 => strings.type_i16,
+            Self::I32 => strings.type_i32,
+            Self::I64 => strings.type_i64,
+            Self::U32 => strings.type_u32,
+            Self::F32 => strings.type_f32,
+            Self::F64 => strings.type_f64,
         }
     }
 
@@ -260,7 +263,8 @@ fn worker(rx: Receiver<Command>, tx: Sender<Event>) {
             } => Event::Row {
                 row,
                 value: None,
-                result: sync_ipc::write_bytes(pid, address, &data).map(|()| String::from("已写入")),
+                result: sync_ipc::write_bytes(pid, address, &data)
+                    .map(|()| String::from(s().written)),
             },
             Command::Freeze {
                 row,
@@ -272,15 +276,15 @@ fn worker(rx: Receiver<Command>, tx: Sender<Event>) {
                 row,
                 value: None,
                 result: sync_ipc::lock(lock_id, pid, address, &data)
-                    .map(|()| String::from("冻结中")),
+                    .map(|()| String::from(s().freezing)),
             },
             Command::Unfreeze { row, lock_id } => Event::Row {
                 row,
                 value: None,
-                result: sync_ipc::unlock(lock_id).map(|()| String::from("已解冻")),
+                result: sync_ipc::unlock(lock_id).map(|()| String::from(s().unfrozen)),
             },
             Command::UnlockAll { pid } => Event::Message(match sync_ipc::unlock_all(pid) {
-                Ok(()) => String::from("已解除全部冻结"),
+                Ok(()) => String::from(s().all_unfrozen),
                 Err(error) => error,
             }),
             Command::ListLocks => Event::LockList(sync_ipc::lock_list()),
@@ -363,7 +367,7 @@ impl LuaEditor {
                 self.open(first.clone());
             }
         }
-        self.status = format!("{} 个脚本 · {}", self.files.len(), self.dir.display());
+        self.status = lang::fill(s().scanned_fmt, &[&self.files.len(), &self.dir.display()]);
     }
 
     fn open(&mut self, path: PathBuf) {
@@ -375,7 +379,7 @@ impl LuaEditor {
         self.buffer = match self.drafts.remove(&path) {
             Some(draft) => draft,
             None => std::fs::read_to_string(&path).unwrap_or_else(|error| {
-                self.status = format!("读取失败: {error}");
+                self.status = lang::fill(s().read_failed_fmt, &[&error]);
                 String::new()
             }),
         };
@@ -391,19 +395,19 @@ impl LuaEditor {
             Ok(()) => {
                 self.saved = self.buffer.clone();
                 self.drafts.remove(&path);
-                self.status = format!(
-                    "已保存 {}（覆盖层会自动热重载）",
-                    path.file_name().unwrap_or_default().to_string_lossy()
+                self.status = lang::fill(
+                    s().saved_fmt,
+                    &[&path.file_name().unwrap_or_default().to_string_lossy()],
                 );
             }
-            Err(error) => self.status = format!("保存失败: {error}"),
+            Err(error) => self.status = lang::fill(s().save_failed_fmt, &[&error]),
         }
     }
 
     fn create(&mut self) {
         let name = self.new_name.trim();
         if name.is_empty() || name.contains(['/', '\\']) {
-            self.status = "文件名无效".to_owned();
+            self.status = s().invalid_name.to_owned();
             return;
         }
         let name = if name.ends_with(".lua") {
@@ -413,7 +417,7 @@ impl LuaEditor {
         };
         let path = self.dir.join(&name);
         if path.exists() {
-            self.status = "文件已存在".to_owned();
+            self.status = s().file_exists.to_owned();
             return;
         }
         match std::fs::write(
@@ -424,9 +428,9 @@ impl LuaEditor {
                 self.new_name.clear();
                 self.scan();
                 self.open(path);
-                self.status = format!("已创建 {name}");
+                self.status = lang::fill(s().created_fmt, &[&name]);
             }
-            Err(error) => self.status = format!("创建失败: {error}"),
+            Err(error) => self.status = lang::fill(s().create_failed_fmt, &[&error]),
         }
     }
 }
@@ -460,10 +464,13 @@ struct ToolState {
     /// Lua editor tab.
     editor: LuaEditor,
     status: String,
+    /// Config store shared with the Lua runtimes: the language toggle
+    /// persists through it.
+    config: SharedConfigStore,
 }
 
 impl ToolState {
-    fn new() -> Self {
+    fn new(config: SharedConfigStore) -> Self {
         let scripts = std::env::current_exe()
             .ok()
             .and_then(|exe| exe.parent().map(|dir| dir.join("scripts")))
@@ -488,7 +495,8 @@ impl ToolState {
             locks_pending: false,
             last_lock_refresh: Instant::now() - LOCK_REFRESH_INTERVAL,
             editor: LuaEditor::new(scripts),
-            status: "选择左侧进程，查看它的模块内存".to_owned(),
+            status: s().status_initial.to_owned(),
+            config,
         }
     }
 
@@ -546,18 +554,20 @@ pub(crate) struct CeWindow {
     cursor: egui::Pos2,
     modifiers: egui::Modifiers,
     framebuffer: [u32; 2],
+    /// Language the OS window title was last rendered in.
+    title_lang: lang::Lang,
 }
 
 impl CeWindow {
     /// Creates the window and its renderer. The caller leaves the overlay's
     /// GL context current afterwards; [`CeWindow::frame`] guarantees the
     /// same on every return path.
-    pub(crate) fn new(glfw: &mut glfw::Glfw) -> Result<Self, String> {
+    pub(crate) fn new(glfw: &mut glfw::Glfw, config: SharedConfigStore) -> Result<Self, String> {
         glfw.window_hint(WindowHint::TransparentFramebuffer(false));
         glfw.window_hint(WindowHint::ScaleToMonitor(true));
         glfw.window_hint(WindowHint::Visible(true));
         let (mut window, events) = glfw
-            .create_window(1180, 760, "KernelScript - 内存工具", WindowMode::Windowed)
+            .create_window(1180, 760, s().app_title, WindowMode::Windowed)
             .ok_or_else(|| "create_window failed".to_string())?;
         window.set_all_polling(true);
         window.set_floating(true);
@@ -620,12 +630,13 @@ impl CeWindow {
             ctx,
             fonts_installed: false,
             opened: Instant::now(),
-            state: ToolState::new(),
+            state: ToolState::new(config),
             commands,
             results,
             cursor: egui::Pos2::ZERO,
             modifiers: egui::Modifiers::default(),
             framebuffer,
+            title_lang: lang::lang(),
         };
         let _ = ce.commands.send(Command::ListProcesses);
         Ok(ce)
@@ -639,6 +650,13 @@ impl CeWindow {
         overlay: &mut GlfwBackend,
         driver: &crate::driver::DriverControl,
     ) -> CeOutcome {
+        // The OS window title follows the language toggle, so it only
+        // changes when the language actually did.
+        let active_lang = lang::lang();
+        if self.title_lang != active_lang {
+            self.title_lang = active_lang;
+            overlay.window.set_title(s().app_title);
+        }
         self.drain_results();
         self.pump_hex();
         self.pump_lock_list();
@@ -822,7 +840,8 @@ impl CeWindow {
             match self.results.try_recv() {
                 Ok(Event::Processes(Ok(processes))) => {
                     self.state.processes = processes;
-                    self.state.status = format!("进程列表: {} 项", self.state.processes.len());
+                    self.state.status =
+                        lang::fill(s().process_list_fmt, &[&self.state.processes.len()]);
                 }
                 Ok(Event::Processes(Err(error))) => self.state.status = error,
                 Ok(Event::Base(Ok(base))) => {
@@ -833,7 +852,7 @@ impl CeWindow {
                 Ok(Event::Base(Err(error))) => {
                     self.state.base = None;
                     self.state.hex = None;
-                    self.state.status = format!("模块基址读取失败: {error}");
+                    self.state.status = lang::fill(s().base_failed_fmt, &[&error]);
                 }
                 Ok(Event::Row { row, value, result }) => {
                     let error = result.as_ref().err().cloned();
@@ -895,7 +914,8 @@ impl CeWindow {
                     self.state.locks_pending = false;
                     match result {
                         Ok(entries) => {
-                            self.state.lock_list_status = format!("{} 项", entries.len());
+                            self.state.lock_list_status =
+                                lang::fill(s().entries_fmt, &[&entries.len()]);
                             self.state.driver_locks = entries;
                         }
                         Err(error) => self.state.lock_list_status = error,
@@ -903,7 +923,7 @@ impl CeWindow {
                 }
                 Ok(Event::Unlocked(result)) => {
                     self.state.status = match result {
-                        Ok(()) => String::from("已解锁"),
+                        Ok(()) => String::from(s().unlocked),
                         Err(error) => error,
                     };
                 }
@@ -1058,7 +1078,7 @@ fn draw_ui(
         .default_height(150.0)
         .show(ctx, |ui| {
             ui.horizontal(|ui| {
-                ui.label(egui::RichText::new("日志").strong());
+                ui.label(egui::RichText::new(s().log).strong());
                 ui.separator();
                 ui.label(egui::RichText::new(&state.status).monospace());
             });
@@ -1079,17 +1099,17 @@ fn draw_ui(
         .resizable(true)
         .show(ctx, |ui| {
             ui.horizontal(|ui| {
-                ui.label("进程");
+                ui.label(s().process);
                 ui.add(
                     egui::TextEdit::singleline(&mut state.filter)
                         .desired_width(90.0)
-                        .hint_text("过滤"),
+                        .hint_text(s().filter_hint),
                 );
-                if ui.small_button("刷新").clicked() {
+                if ui.small_button(s().refresh).clicked() {
                     let _ = commands.send(Command::ListProcesses);
                 }
                 if ui
-                    .add_enabled(state.selected_pid.is_some(), egui::Button::new("关闭"))
+                    .add_enabled(state.selected_pid.is_some(), egui::Button::new(s().close))
                     .clicked()
                 {
                     state.forget_process(commands);
@@ -1138,9 +1158,13 @@ fn draw_ui(
 
     egui::CentralPanel::default().show(ctx, |ui| {
         ui.horizontal(|ui| {
-            ui.selectable_value(&mut state.tab, Tab::Hex, "内存查看 (Ctrl+1)");
-            ui.selectable_value(&mut state.tab, Tab::Editor, "Lua 脚本 (Ctrl+2)");
-            ui.selectable_value(&mut state.tab, Tab::Modify, "修改 (Ctrl+3)");
+            ui.selectable_value(&mut state.tab, Tab::Hex, s().tab_hex);
+            ui.selectable_value(&mut state.tab, Tab::Editor, s().tab_editor);
+            ui.selectable_value(&mut state.tab, Tab::Modify, s().tab_modify);
+            // Language toggle, top-right of the content area.
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                lang::toggle_widget(ui, &state.config);
+            });
         });
         ui.separator();
         match state.tab {
@@ -1154,23 +1178,27 @@ fn draw_ui(
 /// Hex viewer tab.
 fn draw_hex(ui: &mut egui::Ui, state: &mut ToolState, commands: &Sender<Command>) {
     ui.horizontal_wrapped(|ui| {
-        ui.label("起始");
+        ui.label(s().hex_start);
         match (state.base, state.hex_start()) {
             (Some(base), Some(start)) => {
                 ui.monospace(format!("0x{base:X}  →  0x{start:X}"));
             }
             _ => {
-                ui.monospace("进程基址（未选择进程）");
+                ui.monospace(s().hex_no_base);
             }
         }
         ui.separator();
-        ui.label("长度");
+        ui.label(s().length);
         let previous_len = state.hex_len;
         egui::ComboBox::from_id_salt("ce_hex_len")
-            .selected_text(format!("{} 字节", state.hex_len))
+            .selected_text(lang::fill(s().bytes_fmt, &[&state.hex_len]))
             .show_ui(ui, |ui| {
                 for len in HEX_LENGTHS {
-                    ui.selectable_value(&mut state.hex_len, len, format!("{len} 字节"));
+                    ui.selectable_value(
+                        &mut state.hex_len,
+                        len,
+                        lang::fill(s().bytes_fmt, &[&len]),
+                    );
                 }
             });
         if state.hex_len != previous_len {
@@ -1178,19 +1206,19 @@ fn draw_hex(ui: &mut egui::Ui, state: &mut ToolState, commands: &Sender<Command>
         }
         ui.separator();
         if ui
-            .add_enabled(state.hex_page > 0, egui::Button::new("◀ 上一页"))
+            .add_enabled(state.hex_page > 0, egui::Button::new(s().prev_page))
             .clicked()
         {
             state.hex_page -= 1;
             state.hex = None;
         }
-        ui.label(format!("第 {} 页", state.hex_page + 1));
-        if ui.button("下一页 ▶").clicked() {
+        ui.label(lang::fill(s().page_fmt, &[&(state.hex_page + 1)]));
+        if ui.button(s().next_page).clicked() {
             state.hex_page += 1;
             state.hex = None;
         }
         if ui
-            .add_enabled(state.hex_page > 0, egui::Button::new("回到基址"))
+            .add_enabled(state.hex_page > 0, egui::Button::new(s().reset_base))
             .clicked()
         {
             state.hex_page = 0;
@@ -1212,15 +1240,18 @@ fn draw_hex(ui: &mut egui::Ui, state: &mut ToolState, commands: &Sender<Command>
     ui.separator();
 
     if state.selected_pid.is_none() {
-        ui.label("从左侧选择一个进程，十六进制视图会以它的模块基址为起点。");
+        ui.label(s().hex_pick_process);
         return;
     }
     let Some(page) = &state.hex else {
-        ui.label("读取中...");
+        ui.label(s().reading);
         return;
     };
     if let Some(error) = &page.error {
-        ui.colored_label(egui::Color32::LIGHT_RED, format!("读取失败: {error}"));
+        ui.colored_label(
+            egui::Color32::LIGHT_RED,
+            lang::fill(s().read_failed_fmt, &[error]),
+        );
         return;
     }
     // One monospace label per row keeps every column aligned regardless of
@@ -1324,34 +1355,34 @@ fn draw_editor(ui: &mut egui::Ui, state: &mut ToolState) {
         ui.input(|input| input.modifiers.command && input.key_pressed(egui::Key::S));
 
     ui.horizontal(|ui| {
-        ui.label("脚本目录");
+        ui.label(s().script_dir);
         ui.monospace(state.editor.dir.display().to_string());
-        if ui.button("刷新").clicked() {
+        if ui.button(s().refresh).clicked() {
             state.editor.scan();
         }
-        if ui.button("重新加载").clicked() {
+        if ui.button(s().reload).clicked() {
             if let Some(path) = state.editor.selected.clone() {
                 state.editor.open(path);
-                state.editor.status = "已从磁盘重新加载".to_owned();
+                state.editor.status = s().reloaded.to_owned();
             }
         }
         ui.add(
             egui::TextEdit::singleline(&mut state.editor.new_name)
                 .desired_width(120.0)
-                .hint_text("新文件名"),
+                .hint_text(s().new_file_hint),
         );
-        if ui.button("新建").clicked() {
+        if ui.button(s().new_file).clicked() {
             state.editor.create();
         }
         if ui
-            .add_enabled(state.editor.dirty(), egui::Button::new("保存 (Ctrl+S)"))
+            .add_enabled(state.editor.dirty(), egui::Button::new(s().save))
             .clicked()
             || (save_requested && state.editor.dirty())
         {
             state.editor.save();
         }
         if state.editor.dirty() {
-            ui.colored_label(egui::Color32::YELLOW, "● 未保存");
+            ui.colored_label(egui::Color32::YELLOW, s().unsaved);
         }
     });
     if !state.editor.status.is_empty() {
@@ -1496,34 +1527,30 @@ fn draw_modify(ui: &mut egui::Ui, state: &mut ToolState, commands: &Sender<Comma
     // The driver's whole lock table, including locks created by a Lua
     // script or another client. Refreshes on a timer while this tab is
     // visible (see `pump_lock_list`).
-    egui::CollapsingHeader::new(format!(
-        "驱动锁表（含 Lua）{}",
-        if state.lock_list_status.is_empty() {
+    egui::CollapsingHeader::new(lang::fill(
+        s().lock_table_fmt,
+        &[&if state.lock_list_status.is_empty() {
             String::new()
         } else {
             format!(" · {}", state.lock_list_status)
-        }
+        }],
     ))
     .id_salt("ce_driver_locks")
     .default_open(true)
     .show(ui, |ui| {
         ui.horizontal(|ui| {
-            if ui.small_button("刷新").clicked() {
+            if ui.small_button(s().refresh).clicked() {
                 state.last_lock_refresh = Instant::now() - LOCK_REFRESH_INTERVAL;
             }
-            if ui.small_button("全部解锁").clicked() {
+            if ui.small_button(s().unlock_all).clicked() {
                 for lock in state.driver_locks.iter() {
                     let _ = commands.send(Command::UnlockAny { lock_id: lock.id });
                 }
             }
-            ui.label(
-                egui::RichText::new("本窗口的锁也能在下面的地址列表里编辑")
-                    .small()
-                    .weak(),
-            );
+            ui.label(egui::RichText::new(s().lock_hint).small().weak());
         });
         if state.driver_locks.is_empty() {
-            ui.label(egui::RichText::new("当前没有活动的锁").small().weak());
+            ui.label(egui::RichText::new(s().no_locks).small().weak());
             return;
         }
         let own_ids: Vec<u64> = state.rows.iter().map(|row| row.lock_id).collect();
@@ -1536,21 +1563,21 @@ fn draw_modify(ui: &mut egui::Ui, state: &mut ToolState, commands: &Sender<Comma
                     .striped(true)
                     .num_columns(6)
                     .show(ui, |ui| {
-                        ui.label("锁 ID");
-                        ui.label("进程");
-                        ui.label("地址");
-                        ui.label("长度");
-                        ui.label("来源");
+                        ui.label(s().lock_id);
+                        ui.label(s().pid);
+                        ui.label(s().address);
+                        ui.label(s().length);
+                        ui.label(s().source);
                         ui.label("");
                         ui.end_row();
                         for lock in locks {
                             ui.monospace(lock.id.to_string());
                             ui.monospace(lock.pid.to_string());
                             ui.monospace(format!("0x{:X}", lock.address));
-                            ui.label(format!("{} 字节", lock.len));
+                            ui.label(lang::fill(s().bytes_fmt, &[&lock.len]));
                             let own = own_ids.contains(&lock.id);
-                            ui.label(if own { "本窗口" } else { "Lua/其他" });
-                            if ui.small_button("解锁").clicked() {
+                            ui.label(if own { s().this_window } else { s().lua_other });
+                            if ui.small_button(s().unlock).clicked() {
                                 let _ = commands.send(Command::UnlockAny { lock_id: lock.id });
                             }
                             ui.end_row();
@@ -1561,7 +1588,7 @@ fn draw_modify(ui: &mut egui::Ui, state: &mut ToolState, commands: &Sender<Comma
     ui.separator();
 
     ui.horizontal_wrapped(|ui| {
-        ui.label("地址");
+        ui.label(s().address);
         ui.add(
             egui::TextEdit::singleline(&mut state.new_address)
                 .desired_width(130.0)
@@ -1574,7 +1601,7 @@ fn draw_modify(ui: &mut egui::Ui, state: &mut ToolState, commands: &Sender<Comma
                     ui.selectable_value(&mut state.new_kind, kind, kind.label());
                 }
             });
-        if ui.button("添加").clicked() {
+        if ui.button(s().add).clicked() {
             match parse_address(&state.new_address) {
                 Ok(address) => {
                     let row = next_row_id;
@@ -1601,7 +1628,7 @@ fn draw_modify(ui: &mut egui::Ui, state: &mut ToolState, commands: &Sender<Comma
                 Err(error) => status = Some(error),
             }
         }
-        if ui.button("刷新数值").clicked() {
+        if ui.button(s().refresh_values).clicked() {
             if let Some(pid) = pid {
                 for row in &state.rows {
                     let _ = commands.send(Command::Read {
@@ -1613,7 +1640,7 @@ fn draw_modify(ui: &mut egui::Ui, state: &mut ToolState, commands: &Sender<Comma
                 }
             }
         }
-        if ui.button("写入修改").clicked() {
+        if ui.button(s().write_changes).clicked() {
             if let Some(pid) = pid {
                 for row in &state.rows {
                     match row.kind.parse(&row.value) {
@@ -1632,7 +1659,7 @@ fn draw_modify(ui: &mut egui::Ui, state: &mut ToolState, commands: &Sender<Comma
                 }
             }
         }
-        if ui.button("解除全部冻结").clicked() {
+        if ui.button(s().unfreeze_all).clicked() {
             for row in &mut state.rows {
                 if row.frozen {
                     row.frozen = false;
@@ -1657,10 +1684,10 @@ fn draw_modify(ui: &mut egui::Ui, state: &mut ToolState, commands: &Sender<Comma
                 .striped(true)
                 .num_columns(5)
                 .show(ui, |ui| {
-                    ui.label("冻结");
-                    ui.label("地址");
-                    ui.label("类型");
-                    ui.label("数值");
+                    ui.label(s().col_freeze);
+                    ui.label(s().address);
+                    ui.label(s().col_type);
+                    ui.label(s().col_value);
                     ui.label("");
                     ui.end_row();
 
@@ -1674,7 +1701,7 @@ fn draw_modify(ui: &mut egui::Ui, state: &mut ToolState, commands: &Sender<Comma
                                         next_lock_id += 1;
                                         row.lock_id = lock_id;
                                         row.frozen = true;
-                                        row.status = "冻结中".into();
+                                        row.status = s().freezing.into();
                                         let _ = commands.send(Command::Freeze {
                                             row: row.id,
                                             pid,
@@ -1684,7 +1711,7 @@ fn draw_modify(ui: &mut egui::Ui, state: &mut ToolState, commands: &Sender<Comma
                                         });
                                     }
                                     (Some(_), Err(error)) => row.status = error,
-                                    (None, _) => row.status = "未选择进程".into(),
+                                    (None, _) => row.status = s().no_process.into(),
                                 }
                             } else {
                                 row.frozen = false;
@@ -1746,7 +1773,7 @@ fn draw_modify(ui: &mut egui::Ui, state: &mut ToolState, commands: &Sender<Comma
                                 (Some(_), Err(error)) => {
                                     status = Some(format!("0x{:X}: {error}", row.address));
                                 }
-                                (None, _) => status = Some("未选择进程".into()),
+                                (None, _) => status = Some(s().no_process.into()),
                             }
                         }
 
@@ -1754,7 +1781,7 @@ fn draw_modify(ui: &mut egui::Ui, state: &mut ToolState, commands: &Sender<Comma
                             if !row.status.is_empty() {
                                 ui.label(egui::RichText::new(&row.status).small());
                             }
-                            if ui.small_button("删").clicked() {
+                            if ui.small_button(s().delete).clicked() {
                                 remove_row = Some(row.id);
                             }
                         });

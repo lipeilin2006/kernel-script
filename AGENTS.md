@@ -164,7 +164,12 @@ Rules:
   the process list on the left, a full-width log bar at the bottom (driver
   phase plus lifecycle/startup
   log) and a tabbed centre (`内存查看` / `Lua 脚本` / `修改`, also
-  Ctrl+1/2/3):
+  Ctrl+1/2/3). A `中文 / EN` toggle sits at the top-right of the tab row
+  (and in the overlay's fallback window) and switches the whole UI
+  language; the choice persists in `config.json` under `gui.language` and
+  is restored before the first frame. Both languages are two `Strings`
+  tables in `ks-gui/src/lang.rs`, so a missing translation is a compile
+  error rather than a blank label:
   - `内存查看`: hex view anchored at the target's module base, paged
     forward in a selectable length (256 B - 4 KiB); the current page is
     re-read every frame through the worker and changed bytes are
