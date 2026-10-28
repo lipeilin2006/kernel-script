@@ -35,16 +35,127 @@ pub const LOCK_LIST_ENTRY_SIZE: usize = 28;
 pub const MAX_WRITE_SIZE: usize = MAX_DRIVER_TRANSFER_SIZE;
 /// Largest single target-process allocation accepted by the driver.
 pub const MAX_ALLOC_SIZE: usize = 16 * 1024 * 1024;
-/// `PAGE_READWRITE`: the default protection for [`Request::Alloc`].
-pub const ALLOC_PROTECT_READWRITE: u32 = 0x04;
-/// `PAGE_EXECUTE_READWRITE`, the only executable protection the driver
-/// hands out (kept explicit so a script cannot silently allocate RWX).
-pub const ALLOC_PROTECT_EXECUTE_READWRITE: u32 = 0x40;
+/// Page protections accepted by [`Request::Protect`] and — through
+/// [`valid_alloc_protect`] — by [`Request::Alloc`]: `PAGE_READONLY`,
+/// `PAGE_READWRITE`, `PAGE_EXECUTE_READ` and `PAGE_EXECUTE_READWRITE`.
+/// `PAGE_NOACCESS` and `PAGE_GUARD` are deliberately absent: the target
+/// process would fault on its own memory the moment it touched the
+/// region. `PAGE_NOCACHE`/`PAGE_WRITECOMBINE` are cache hints, not
+/// access rights, and stay out too.
+pub const PROT_READ: u32 = 0x0000_0002;
+/// `PAGE_READWRITE`.
+pub const PROT_RW: u32 = 0x0000_0004;
+/// `PAGE_EXECUTE_READ`.
+pub const PROT_RX: u32 = 0x0000_0020;
+/// `PAGE_EXECUTE_READWRITE`.
+pub const PROT_RWX: u32 = 0x0000_0040;
 
-/// Whether `protect` is one of the two protections [`Request::Alloc`]
+/// Largest single [`Request::Protect`] span, in bytes. Whole images pass
+/// through here (a game `.text` runs to tens of megabytes), so the cap is
+/// generous; the binding limit is the target's contiguous mapping, which
+/// [`Request::QueryRegion`] reports first.
+pub const MAX_PROTECT_SIZE: usize = 256 * 1024 * 1024;
+
+/// `PAGE_READWRITE`: the default protection for [`Request::Alloc`].
+pub const ALLOC_PROTECT_READWRITE: u32 = PROT_RW;
+/// `PAGE_EXECUTE_READWRITE`: the executable option for [`Request::Alloc`]
+/// (kept explicit so a script cannot silently allocate RWX without
+/// naming it).
+pub const ALLOC_PROTECT_EXECUTE_READWRITE: u32 = PROT_RWX;
+
+/// Whether `protect` is one of the four page protections the driver
 /// accepts. Everything else is rejected at every trust boundary.
+pub const fn valid_protect(protect: u32) -> bool {
+    matches!(protect, PROT_READ | PROT_RW | PROT_RX | PROT_RWX)
+}
+
+/// Whether `protect` is valid for [`Request::Alloc`]. Deliberately one
+/// value narrower than [`valid_protect`]: `PROT_READ` is excluded
+/// because a read-only allocation cannot be written through the plain
+/// write path (only through the MDL path), so it buys nothing — allocate
+/// `PROT_RW` and [`Request::Protect`] it down if a read-only span is
+/// really wanted.
 pub const fn valid_alloc_protect(protect: u32) -> bool {
-    protect == ALLOC_PROTECT_READWRITE || protect == ALLOC_PROTECT_EXECUTE_READWRITE
+    matches!(protect, PROT_RW | PROT_RX | PROT_RWX)
+}
+
+/// `MEM_COMMIT`: the region's pages are resident and accessible.
+pub const MEM_COMMIT: u32 = 0x0000_1000;
+/// `MEM_RESERVE`: the address range is taken but not committed.
+pub const MEM_RESERVE: u32 = 0x0000_2000;
+/// `MEM_FREE`: nothing is mapped in the range at all.
+pub const MEM_FREE: u32 = 0x0001_0000;
+/// `MEM_PRIVATE`: a process-private VAD (`VirtualAlloc`, heap, stack).
+pub const MEM_PRIVATE: u32 = 0x0002_0000;
+/// `MEM_MAPPED`: a mapped view (section object, file mapping).
+pub const MEM_MAPPED: u32 = 0x0004_0000;
+/// `MEM_IMAGE`: a mapped PE image.
+pub const MEM_IMAGE: u32 = 0x0100_0000;
+
+/// Wire form of one [`Request::QueryRegion`] answer: a fixed 40-byte
+/// little-endian POD packed in declaration order — the same convention as
+/// [`LOCK_LIST_ENTRY_SIZE`]. The system's `MEMORY_BASIC_INFORMATION` is
+/// **not** used directly: it gained a `PartitionId` field on Windows 10
+/// 2004 and its layout shifts with the OS version, so the driver narrows
+/// it to these stable fields.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RegionInfo {
+    /// Region start, page-aligned.
+    pub base: u64,
+    /// Allocation base (the VAD or image base) this region belongs to.
+    pub allocation_base: u64,
+    /// Size of this region in bytes.
+    pub region_size: u64,
+    /// [`MEM_COMMIT`] / [`MEM_RESERVE`] / [`MEM_FREE`].
+    pub state: u32,
+    /// Current page protection; 0 when the region is free.
+    pub protect: u32,
+    /// Protection the VAD was created with.
+    pub allocation_protect: u32,
+    /// [`MEM_IMAGE`] / [`MEM_MAPPED`] / [`MEM_PRIVATE`].
+    pub typ: u32,
+}
+
+/// Bytes of bulk one [`Request::QueryRegion`] answer carries.
+pub const REGION_INFO_SIZE: usize = 40;
+
+impl RegionInfo {
+    /// Packs the fields little-endian in declaration order. The array
+    /// length *is* [`REGION_INFO_SIZE`], so the wire size cannot drift.
+    pub fn encode(&self) -> [u8; REGION_INFO_SIZE] {
+        let mut out = [0u8; REGION_INFO_SIZE];
+        out[0..8].copy_from_slice(&self.base.to_le_bytes());
+        out[8..16].copy_from_slice(&self.allocation_base.to_le_bytes());
+        out[16..24].copy_from_slice(&self.region_size.to_le_bytes());
+        out[24..28].copy_from_slice(&self.state.to_le_bytes());
+        out[28..32].copy_from_slice(&self.protect.to_le_bytes());
+        out[32..36].copy_from_slice(&self.allocation_protect.to_le_bytes());
+        out[36..40].copy_from_slice(&self.typ.to_le_bytes());
+        out
+    }
+
+    /// Unpacks a [`REGION_INFO_SIZE`]-byte wire record. A short buffer is
+    /// a truncated response and is rejected rather than guessed at.
+    pub fn decode(bytes: &[u8]) -> Option<RegionInfo> {
+        if bytes.len() < REGION_INFO_SIZE {
+            return None;
+        }
+        let u64_at = |at: usize| -> Option<u64> {
+            Some(u64::from_le_bytes(bytes[at..at + 8].try_into().ok()?))
+        };
+        let u32_at = |at: usize| -> Option<u32> {
+            Some(u32::from_le_bytes(bytes[at..at + 4].try_into().ok()?))
+        };
+        Some(RegionInfo {
+            base: u64_at(0)?,
+            allocation_base: u64_at(8)?,
+            region_size: u64_at(16)?,
+            state: u32_at(24)?,
+            protect: u32_at(28)?,
+            allocation_protect: u32_at(32)?,
+            typ: u32_at(36)?,
+        })
+    }
 }
 
 /// Slots in the driver-side kernel hook table.
@@ -262,9 +373,14 @@ pub enum Request<'a> {
         size: u32,
         protect: u32,
     },
-    /// Release a region returned by [`Request::Alloc`]. The whole region is
-    /// freed (`MEM_RELEASE`), so no size is carried; freeing an address
-    /// that was not allocated by [`Request::Alloc`] fails in the driver.
+    /// Release the whole VAD that contains `address`. The whole
+    /// allocation is freed (`MEM_RELEASE`), so no size is carried.
+    ///
+    /// `ZwFreeVirtualMemory` only requires the address to *be* an
+    /// allocation base — it does not check who allocated it, and the
+    /// driver keeps no ownership table. An address belonging to the
+    /// target itself (its heap, a stack, a mapped view's base) is
+    /// therefore freed just as happily, tearing that mapping down.
     Free {
         pid: u64,
         address: u64,
@@ -291,6 +407,41 @@ pub enum Request<'a> {
     /// region; the `*All` variants return the number of affected hooks.
     Hook {
         op: HookOp<'a>,
+    },
+    /// Change the page protection of an already mapped region in the
+    /// target process — image pages, the target's own allocations and
+    /// [`Request::Alloc`] pages alike. The whole span must sit inside
+    /// existing mappings: probe with [`Request::QueryRegion`] first,
+    /// because a range crossing a free hole fails. `protect` must satisfy
+    /// [`valid_protect`].
+    ///
+    /// Response: `value` = the first page's previous protection, `count` =
+    /// the bytes the kernel actually protected (`size` rounded up to
+    /// pages by `ZwProtectVirtualMemory`).
+    Protect {
+        pid: u64,
+        /// Need not be page aligned; the kernel rounds it down.
+        address: u64,
+        /// Bytes, 1..=[`MAX_PROTECT_SIZE`].
+        size: u32,
+        /// One of [`PROT_READ`] / [`PROT_RW`] / [`PROT_RX`] / [`PROT_RWX`].
+        protect: u32,
+        /// Attach `PAGE_TARGETS_NO_UPDATE` so the region's existing CFG
+        /// bitmap entries are left as they are instead of being re-marked
+        /// valid indirect-call targets.
+        cfg_no_update: bool,
+    },
+    /// Describe the region containing `address`
+    /// (`ZwQueryVirtualMemory(MemoryBasicInformation)`): probe the range
+    /// before [`Request::Protect`], and classify the pages
+    /// ([`RegionInfo::typ`], [`RegionInfo::state`]) to decide whether
+    /// they may change at all.
+    ///
+    /// Response: `value` = region base, `count` = region size, bulk =
+    /// [`REGION_INFO_SIZE`] bytes of packed [`RegionInfo`].
+    QueryRegion {
+        pid: u64,
+        address: u64,
     },
 }
 
@@ -535,6 +686,33 @@ impl<'a> Request<'a> {
                 HookOp::EnableAll | HookOp::DisableAll | HookOp::RemoveAll => Ok(()),
                 HookOp::SelfTest | HookOp::ShellcodeSelfTest | HookOp::DetourSelfTest => Ok(()),
             },
+            Self::Protect {
+                pid,
+                address,
+                size,
+                protect,
+                cfg_no_update: _,
+            } => {
+                check_pid(*pid)?;
+                if *address == 0 || *size == 0 {
+                    return Err(ProtocolError::InvalidPayload);
+                }
+                if *size as usize > MAX_PROTECT_SIZE {
+                    return Err(ProtocolError::TooLarge);
+                }
+                if !valid_protect(*protect) {
+                    return Err(ProtocolError::InvalidPayload);
+                }
+                Ok(())
+            }
+            Self::QueryRegion { pid, address } => {
+                check_pid(*pid)?;
+                if *address == 0 {
+                    Err(ProtocolError::InvalidPayload)
+                } else {
+                    Ok(())
+                }
+            }
         }
     }
 }

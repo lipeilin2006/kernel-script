@@ -29,8 +29,10 @@ fn attached<T>(
 }
 
 /// Reserves, commits and zeroes `size` bytes in `process_id` with
-/// `protect` (`PAGE_READWRITE` or `PAGE_EXECUTE_READWRITE`). Returns the
-/// base address the kernel picked; the size is rounded up to whole pages.
+/// `protect` — `PAGE_READWRITE`, `PAGE_EXECUTE_READ` or
+/// `PAGE_EXECUTE_READWRITE` (`PAGE_READONLY` is refused: the plain write
+/// path cannot touch it). Returns the base address the kernel picked; the
+/// size is rounded up to whole pages.
 pub fn allocate(process_id: u64, size: usize, protect: u32) -> Result<u64, NTSTATUS> {
     if process_id == 0 || size == 0 || size > MAX_ALLOC_SIZE || !valid_alloc_protect(protect) {
         return Err(STATUS_INVALID_PARAMETER);
@@ -58,7 +60,14 @@ pub fn allocate(process_id: u64, size: usize, protect: u32) -> Result<u64, NTSTA
     })
 }
 
-/// Releases a whole region returned by [`allocate`] (`MEM_RELEASE`).
+/// Releases the whole VAD that contains `address` (`MEM_RELEASE`).
+///
+/// `ZwFreeVirtualMemory` only requires the address to *be* an allocation
+/// base — it does not check who allocated it, and this driver keeps no
+/// ownership table, so an address belonging to the target itself (its
+/// heap, a stack, a mapped view's base) is freed just as happily and that
+/// mapping comes down. Treat `free` as a dangerous operation, not a
+/// guarded one.
 pub fn free(process_id: u64, address: u64) -> Result<(), NTSTATUS> {
     if process_id == 0 || address == 0 {
         return Err(STATUS_INVALID_PARAMETER);

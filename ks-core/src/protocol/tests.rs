@@ -101,6 +101,100 @@ fn every_variant_round_trips() {
     round_trip(&Request::Hook {
         op: HookOp::SelfTest,
     });
+    round_trip(&Request::Protect {
+        pid: 9,
+        address: 0x0000_7FF6_1234_5000,
+        size: 0x2000,
+        protect: PROT_RX,
+        cfg_no_update: false,
+    });
+    round_trip(&Request::Protect {
+        pid: 9,
+        address: 0x0000_7FF6_1234_5000,
+        size: MAX_PROTECT_SIZE as u32,
+        protect: PROT_RWX,
+        cfg_no_update: true,
+    });
+    round_trip(&Request::QueryRegion {
+        pid: 9,
+        address: 0x0000_7FF6_1234_5000,
+    });
+}
+
+#[test]
+fn protect_and_query_region_validation() {
+    let mut buffer = [0u8; 4096];
+    let mut protect = |pid, address, size, protect| {
+        encode_request(
+            &Request::Protect {
+                pid,
+                address,
+                size,
+                protect,
+                cfg_no_update: false,
+            },
+            &mut buffer,
+        )
+    };
+    // The happy path: every whitelisted protection, any non-zero span.
+    for protection in [PROT_READ, PROT_RW, PROT_RX, PROT_RWX] {
+        assert!(protect(7, 0x1000, 0x1000, protection).is_ok());
+    }
+    // Guard pages and PAGE_NOACCESS are never handed out: the target
+    // would fault on its own memory.
+    for protection in [0x01u32, 0x100, 0x08 | 0x200, 0x80] {
+        assert_eq!(
+            protect(7, 0x1000, 0x1000, protection),
+            Err(ProtocolError::InvalidPayload),
+            "protection {protection:#x} must be refused"
+        );
+    }
+    assert_eq!(
+        protect(7, 0x1000, 0, PROT_RW),
+        Err(ProtocolError::InvalidPayload)
+    );
+    assert_eq!(
+        protect(7, 0, 0x1000, PROT_RW),
+        Err(ProtocolError::InvalidPayload)
+    );
+    assert_eq!(
+        protect(0, 0x1000, 0x1000, PROT_RW),
+        Err(ProtocolError::InvalidPayload)
+    );
+    assert_eq!(
+        protect(7, 0x1000, MAX_PROTECT_SIZE as u32 + 1, PROT_RW),
+        Err(ProtocolError::TooLarge)
+    );
+    // The exact cap still fits.
+    assert!(protect(7, 0x1000, MAX_PROTECT_SIZE as u32, PROT_RW).is_ok());
+
+    let mut query =
+        |pid, address| encode_request(&Request::QueryRegion { pid, address }, &mut buffer);
+    assert!(query(7, 0x1000).is_ok());
+    assert_eq!(query(7, 0), Err(ProtocolError::InvalidPayload));
+    assert_eq!(query(0, 0x1000), Err(ProtocolError::InvalidPayload));
+}
+
+#[test]
+fn region_info_round_trips() {
+    let info = RegionInfo {
+        base: 0x0000_7FF6_1234_5000,
+        allocation_base: 0x0000_7FF6_1200_0000,
+        region_size: 0x2_0000,
+        state: MEM_COMMIT,
+        protect: PROT_RX,
+        allocation_protect: PROT_READ,
+        typ: MEM_IMAGE,
+    };
+    let encoded = info.encode();
+    assert_eq!(encoded.len(), REGION_INFO_SIZE);
+    assert_eq!(RegionInfo::decode(&encoded), Some(info));
+    // The wire order is fixed: base, allocation base, size, then the four
+    // u32 fields.
+    assert_eq!(&encoded[0..8], &info.base.to_le_bytes());
+    assert_eq!(&encoded[36..40], &info.typ.to_le_bytes());
+    // A truncated answer must not be decoded by guessing the tail.
+    assert_eq!(RegionInfo::decode(&encoded[..REGION_INFO_SIZE - 1]), None);
 }
 
 #[test]
@@ -497,7 +591,20 @@ fn alloc_and_free_validation() {
     );
     assert!(valid_alloc_protect(ALLOC_PROTECT_READWRITE));
     assert!(valid_alloc_protect(ALLOC_PROTECT_EXECUTE_READWRITE));
-    assert!(!valid_alloc_protect(0x02));
+    // The alloc whitelist is three of the four protect values: PROT_READ
+    // stays valid for `protect` but is refused here (a read-only
+    // allocation cannot be written through the plain write path), while
+    // PROT_RX saves a later protect round trip.
+    for protection in [PROT_RW, PROT_RX, PROT_RWX] {
+        assert!(
+            valid_alloc_protect(protection),
+            "{protection:#x} must be allocable"
+        );
+    }
+    assert!(!valid_alloc_protect(PROT_READ));
+    assert!(valid_protect(PROT_READ));
+    assert!(!valid_alloc_protect(0x01)); // PAGE_NOACCESS
+    assert!(!valid_alloc_protect(0x100)); // PAGE_GUARD
 }
 
 #[test]

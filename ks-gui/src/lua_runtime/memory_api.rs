@@ -332,6 +332,84 @@ pub fn register_memory_api(lua: &Lua) -> mlua::Result<()> {
             Ok(list)
         })?,
     )?;
+    // memory.protect(pid, address, size, protect [, cfg_no_update]) -> old
+    // Changes the page protection of a mapped span; `protect` is one of
+    // 0x02/0x04/0x20/0x40. With `cfg_no_update` the region's existing CFG
+    // bitmap entries stay as they are. Returns the first page's previous
+    // protection.
+    module.set(
+        "protect",
+        lua.create_function(
+            |_,
+             (pid, address, size, protect, cfg_no_update): (
+                u64,
+                Address,
+                u64,
+                u32,
+                Option<bool>,
+            )| {
+                let address = address.get();
+                let result = match cfg_no_update {
+                    None => crate::sync_ipc::protect(pid, address, size as usize, protect),
+                    Some(flag) => {
+                        crate::sync_ipc::protect_ex(pid, address, size as usize, protect, flag)
+                    }
+                };
+                result.map_err(mlua::Error::runtime)
+            },
+        )?,
+    )?;
+    // memory.protect_span(pid, address, size, protect [, cfg_no_update])
+    //   -> old_protect, bytes_protected
+    // Same as `protect` but also returns the page-rounded length the
+    // kernel covered (`protect(pid, addr, 1, …)` changes a whole page).
+    module.set(
+        "protect_span",
+        lua.create_function(
+            |_,
+             (pid, address, size, protect, cfg_no_update): (
+                u64,
+                Address,
+                u64,
+                u32,
+                Option<bool>,
+            )| {
+                let (old, len) = crate::sync_ipc::protect_span(
+                    pid,
+                    address.get(),
+                    size as usize,
+                    protect,
+                    cfg_no_update.unwrap_or(false),
+                )
+                .map_err(mlua::Error::runtime)?;
+                Ok((old, len as u64))
+            },
+        )?,
+    )?;
+    // memory.query_region(pid, address)
+    //   -> { base, allocation_base, region_size, state, protect,
+    //        allocation_protect, typ }
+    // The probe step before `protect`: the span must sit inside one
+    // region, and `state`/`typ` say whether the pages may change at all
+    // (the numeric fields use the MEM_* / PROT_* constants).
+    module.set(
+        "query_region",
+        lua.create_function(
+            |lua, (pid, address): (u64, Address)| -> mlua::Result<mlua::Table> {
+                let info = crate::sync_ipc::query_region(pid, address.get())
+                    .map_err(mlua::Error::runtime)?;
+                let report = lua.create_table()?;
+                report.set("base", info.base)?;
+                report.set("allocation_base", info.allocation_base)?;
+                report.set("region_size", info.region_size)?;
+                report.set("state", info.state)?;
+                report.set("protect", info.protect)?;
+                report.set("allocation_protect", info.allocation_protect)?;
+                report.set("typ", info.typ)?;
+                Ok(report)
+            },
+        )?,
+    )?;
     module.set(
         "suspend",
         lua.create_function(|_, pid: u64| {
@@ -524,6 +602,9 @@ mod tests {
             "lock_rva",
             "unlock_rva",
             "lock_list",
+            "protect",
+            "protect_span",
+            "query_region",
             "suspend",
             "resume",
             "hook_probe",

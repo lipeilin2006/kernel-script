@@ -210,6 +210,54 @@ pub(super) fn lookup(process_id: u64) -> Result<ProcessRef, NTSTATUS> {
     }
 }
 
+/// RAII owner for a kernel handle opened by [`open_process`]: the handle
+/// closes on every path, including the error ones.
+pub(super) struct ProcessHandle(pub(super) HANDLE);
+impl Drop for ProcessHandle {
+    fn drop(&mut self) {
+        unsafe {
+            ZwClose(self.0);
+        }
+    }
+}
+
+/// Opens a kernel handle to `process_id` with `desired_access` **without**
+/// attaching to the target. `ObOpenObjectByPointer` runs with
+/// `KernelMode`, so the requested access is granted outright — the
+/// target's DACL never gets a say — and `OBJ_KERNEL_HANDLE` keeps the
+/// handle out of (and independent of) any user-mode handle table.
+///
+/// The `ProcessRef` keeps the object alive for the call; the handle is a
+/// second, independent reference closed by [`ProcessHandle`]'s `Drop`.
+pub(super) fn open_process(
+    process_id: u64,
+    desired_access: u32,
+) -> Result<ProcessHandle, NTSTATUS> {
+    let process = lookup(process_id)?;
+    let mut handle: HANDLE = ptr::null_mut();
+    // `ntddk.h` declares `extern POBJECT_TYPE *PsProcessType;` — one
+    // pointer more than the type itself — so the cell is loaded first
+    // and the type pointer it holds is what `ObOpenObjectByPointer`
+    // receives. Passing the cell's *address* would hand the API a
+    // `POBJECT_TYPE **` where a `POBJECT_TYPE` belongs.
+    let object_type = unsafe { *PsProcessType };
+    let status = unsafe {
+        ObOpenObjectByPointer(
+            process.0 as Pvoid,
+            OBJ_KERNEL_HANDLE,
+            ptr::null_mut(),
+            desired_access,
+            object_type,
+            KernelMode,
+            &mut handle,
+        )
+    };
+    if !nt_success(status) {
+        return Err(status);
+    }
+    Ok(ProcessHandle(handle))
+}
+
 pub fn write_process_memory(process_id: u64, address: u64, data: &[u8]) -> Result<(), NTSTATUS> {
     if data.is_empty() || data.len() > MAX_DRIVER_TRANSFER_SIZE || address == 0 {
         return Err(STATUS_INVALID_PARAMETER);

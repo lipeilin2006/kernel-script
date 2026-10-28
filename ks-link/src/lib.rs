@@ -20,6 +20,14 @@ use ks_core::protocol::{
     MAX_HOOK_SHELLCODE, MAX_HOOK_STOLEN_LEN,
 };
 
+/// The region-query and protect surface, re-exported from `ks-core` so
+/// SDK consumers can name the constants and the record without taking a
+/// direct `ks-core` dependency.
+pub use ks_core::protocol::{
+    valid_protect, RegionInfo, MAX_PROTECT_SIZE, MEM_COMMIT, MEM_FREE, MEM_IMAGE, MEM_MAPPED,
+    MEM_PRIVATE, MEM_RESERVE, PROT_READ, PROT_RW, PROT_RWX, PROT_RX, REGION_INFO_SIZE,
+};
+
 pub use error::LinkError;
 pub use lock::{lock, lock_list, lock_rva, unlock, unlock_all, unlock_rva};
 pub use lock::{LockListEntry, MAX_MEMORY_LOCKS, MAX_MEMORY_LOCK_SIZE};
@@ -159,10 +167,11 @@ pub fn traverse_pointer_chain(pid: u64, base: u64, offsets: &[u64]) -> Result<u6
     Ok(meta.value)
 }
 
-/// Allocates `size` bytes in `pid` and returns the base address. `protect`
-/// must be [`ks_core::protocol::ALLOC_PROTECT_READWRITE`] or
-/// [`ks_core::protocol::ALLOC_PROTECT_EXECUTE_READWRITE`]; the driver
-/// rounds the size up to whole pages.
+/// Allocates `size` bytes in `pid` and returns the base address.
+/// `protect` must satisfy [`ks_core::protocol::valid_alloc_protect`] —
+/// `PROT_RW`, `PROT_RX` or `PROT_RWX` (`PROT_READ` is refused: the plain
+/// write path cannot touch a read-only page). The driver rounds the size
+/// up to whole pages.
 pub fn alloc(pid: u64, size: usize, protect: u32) -> Result<u64, LinkError> {
     if size == 0 || size > MAX_ALLOC_SIZE {
         return Err(LinkError::Encode(ProtocolError::TooLarge));
@@ -183,10 +192,119 @@ pub fn alloc(pid: u64, size: usize, protect: u32) -> Result<u64, LinkError> {
     Ok(meta.value)
 }
 
-/// Frees a whole region previously returned by [`alloc`].
+/// Releases the whole VAD that contains `address` (`MEM_RELEASE`).
+///
+/// The kernel only requires the address to be an allocation base and the
+/// driver keeps no ownership table, so this frees **any** VAD at that
+/// address — including the target's own heap, a stack or a mapped view.
+/// It is a dangerous operation, not a guarded one; the only check is that
+/// `address` is non-zero.
 pub fn free(pid: u64, address: u64) -> Result<(), LinkError> {
     let mut buffer = [0u8; SMALL_REQUEST_BUFFER];
     submit(&Request::Free { pid, address }, &mut buffer, &mut []).map(|_| ())
+}
+
+/// Changes the page protection of `[address, address + size)` in `pid`
+/// and returns the **first page's** previous protection.
+///
+/// The whole span must already be mapped — probe with [`query_region`]
+/// first, because a range crossing a free hole fails with the kernel's
+/// own status (which travels back verbatim, never as success). `protect`
+/// must satisfy [`valid_protect`]; the kernel rounds the range down/up to
+/// pages itself, so `address` need not be aligned. Use [`protect_span`]
+/// when the page-rounded length matters (e.g. to restore exactly the
+/// pages that were touched).
+///
+/// Image pages, the target's own allocations and [`alloc`] pages all
+/// qualify. Note that `MEM_IMAGE` pages flipped to `PROT_RW` trigger
+/// copy-on-write and break file sharing for every process mapping that
+/// image; `PROT_RX`/`PROT_RWX` do not.
+pub fn protect(pid: u64, address: u64, size: usize, protect: u32) -> Result<u32, LinkError> {
+    protect_span(pid, address, size, protect, false).map(|(old, _)| old)
+}
+
+/// [`protect`] with the CFG modifier: `cfg_no_update = true` attaches
+/// `PAGE_TARGETS_NO_UPDATE`, leaving the region's existing CFG bitmap
+/// entries untouched instead of re-marking them valid indirect-call
+/// targets (the kernel's default on a protection change).
+///
+/// `PAGE_TARGETS_NO_UPDATE` is defined for executable protections only,
+/// so the flag is refused unless `protect` is `PROT_RX` or `PROT_RWX` —
+/// up front, instead of letting the kernel answer with a confusing
+/// status.
+pub fn protect_ex(
+    pid: u64,
+    address: u64,
+    size: usize,
+    protect: u32,
+    cfg_no_update: bool,
+) -> Result<u32, LinkError> {
+    protect_span(pid, address, size, protect, cfg_no_update).map(|(old, _)| old)
+}
+
+/// [`protect`] that also reports the length the kernel actually covered:
+/// the span is rounded to whole pages, so `protect_span(pid, addr, 1, …)`
+/// answers `(old, 4096)`. Returns `(first page's old protection, bytes
+/// protected)`.
+pub fn protect_span(
+    pid: u64,
+    address: u64,
+    size: usize,
+    protect: u32,
+    cfg_no_update: bool,
+) -> Result<(u32, usize), LinkError> {
+    if address == 0 || size == 0 {
+        return Err(LinkError::Encode(ProtocolError::InvalidPayload));
+    }
+    if size > MAX_PROTECT_SIZE {
+        return Err(LinkError::Encode(ProtocolError::TooLarge));
+    }
+    if !valid_protect(protect) {
+        return Err(LinkError::Encode(ProtocolError::InvalidPayload));
+    }
+    // `PAGE_TARGETS_NO_UPDATE` only pairs with an executable protection;
+    // any other combination is a caller mistake, not a kernel question.
+    if cfg_no_update && protect != PROT_RX && protect != PROT_RWX {
+        return Err(LinkError::Encode(ProtocolError::InvalidPayload));
+    }
+    let mut buffer = [0u8; SMALL_REQUEST_BUFFER];
+    let (meta, _) = submit(
+        &Request::Protect {
+            pid,
+            address,
+            size: size as u32,
+            protect,
+            cfg_no_update,
+        },
+        &mut buffer,
+        &mut [],
+    )?;
+    Ok((meta.value as u32, meta.count as usize))
+}
+
+/// Describes the region containing `address` in `pid`
+/// (`ZwQueryVirtualMemory(MemoryBasicInformation)`): start and size,
+/// state (`MEM_COMMIT` / `MEM_RESERVE` / `MEM_FREE`), current and
+/// original protection, and the mapping type (`MEM_IMAGE` / `MEM_MAPPED`
+/// / `MEM_PRIVATE`).
+///
+/// This is the probe step before [`protect`]: the kernel refuses a span
+/// that leaves the region, and `state`/`typ` say up front whether the
+/// pages may change at all.
+pub fn query_region(pid: u64, address: u64) -> Result<RegionInfo, LinkError> {
+    let mut buffer = [0u8; SMALL_REQUEST_BUFFER];
+    let mut out = [0u8; REGION_INFO_SIZE];
+    let (_, copied) = submit(
+        &Request::QueryRegion { pid, address },
+        &mut buffer,
+        &mut out,
+    )?;
+    // A short answer is a truncated response: reject it instead of
+    // decoding a half-filled struct.
+    if copied != REGION_INFO_SIZE {
+        return Err(LinkError::Decode(ProtocolError::DecodeFailed));
+    }
+    RegionInfo::decode(&out[..copied]).ok_or(LinkError::Decode(ProtocolError::DecodeFailed))
 }
 
 /// Freezes every thread of the process `pid` (kernel `PsSuspendProcess`).

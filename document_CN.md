@@ -576,17 +576,94 @@ memory.write_bytes(pid, buffer, {1, 2, 3, 4})
 ```
 
 - `size` 允许 1 字节到 16 MiB（`MAX_ALLOC_SIZE`），驱动会向上取整到页。
-- `protect` 可选，只接受 `0x04`（`PAGE_READWRITE`，默认）或 `0x40`
-  （`PAGE_EXECUTE_READWRITE`），其它值一律拒绝。
+- `protect` 可选，必须是 `0x04`（`PAGE_READWRITE`，默认）、`0x20`
+  （`PAGE_EXECUTE_READ`）或 `0x40`（`PAGE_EXECUTE_READWRITE`）之一。
+  `0x02`（`PAGE_READONLY`）在这里被拒：只读分配无法通过
+  `memory.write_bytes` / `memory.write_i32` 写入（只有 MDL 路径可以），
+  所以请按 `0x04` 分配，需要只读时再用 `memory.protect` 降下去。
+  `PAGE_NOACCESS`（`0x01`）和 `PAGE_GUARD`（`0x100`）同样被拒——它们会让
+  目标进程一碰自己的内存就异常。
 - 分配属于目标进程：目标退出时随之释放，也可以提前用 `memory.free` 释放。
 
 ### memory.free
 
-释放 `memory.alloc` 返回的整段内存（`MEM_RELEASE`，无需大小）。释放其它
-地址会返回驱动错误，不会改动其它内存。
+释放包含 `address` 的整个 VAD（`MEM_RELEASE`，无需大小）。**这是危险操作，
+不是受保护操作**：内核只要求地址是某个 allocation base，而驱动不维护归属
+表，因此目标进程自己的地址——堆、栈、某个映射视图的基址——同样会被释放，
+那段映射会直接消失。只传你自己分配的地址（或你明确想拆掉的地址）。
 
 ```lua
 memory.free(pid, buffer)
+```
+
+## 改页属性 API
+
+修改**已映射内存**的页属性——映像页、目标自己的分配页、`memory.alloc`
+分配的页都可以——并可在动手前查询区域。每次调用是一次驱动往返。
+
+### memory.query_region
+
+描述 `address` 所在的区域（`ZwQueryVirtualMemory` +
+`MemoryBasicInformation`）。这是 `protect` 的前置探查：整段范围必须落在
+同一个区域内，`state`/`typ` 还能先判断这些页能不能改。
+
+返回一张表：
+
+```lua
+{
+    base = 0x140000000,            -- 区域起点（页对齐）
+    allocation_base = 0x140000000, -- 所属 VAD / 映像基址
+    region_size = 0x10000,
+    state = 0x1000,                -- 0x1000 MEM_COMMIT / 0x2000 MEM_RESERVE / 0x10000 MEM_FREE
+    protect = 0x20,                -- 当前属性；FREE 时为 0
+    allocation_protect = 0x20,     -- VAD 创建时的属性
+    typ = 0x1000000,               -- 0x1000000 MEM_IMAGE / 0x40000 MEM_MAPPED / 0x20000 MEM_PRIVATE
+}
+```
+
+```lua
+local region = memory.query_region(pid, address)
+if region.state ~= 0x1000 then error("地址未提交") end
+-- 走到下一个区域：
+local next_addr = region.base + region.region_size
+```
+
+### memory.protect
+
+把 `[address, address + size)` 的页属性改成 `protect`，返回**首屏**旧属性。
+`address` 无需页对齐，内核会自行取整。
+
+```lua
+local old = memory.protect(pid, address, 0x1000, 0x20)   -- -> PAGE_EXECUTE_READ
+memory.protect(pid, address, 0x1000, 0x04, true)         -- 附带 CFG 不更新
+```
+
+- `protect` 必须是 `0x02`（`PROT_READ`）、`0x04`（`PROT_RW`）、`0x20`
+  （`PROT_RX`）、`0x40`（`PROT_RWX`）之一，其它值在往返之前就被拒绝。
+  单次跨度 1 字节到 256 MiB（`MAX_PROTECT_SIZE`）。
+- 可选第 5 个参数 `cfg_no_update`：附加 `PAGE_TARGETS_NO_UPDATE`，保持该
+  区域现有的 CFG bitmap 条目不被重标为合法间接调用目标（这是内核改属性
+  时的默认行为）。该修饰位只与可执行保护（`0x20`/`0x40`）组合，其它
+  组合在往返之前就被拒绝。
+- **整段范围必须落在已映射的映射内**：跨 FREE 洞会以内核自身的状态码
+  失败，原样回传、不会被吞成成功——先用 `query_region` 拿 `region_size`。
+- 返回的旧属性只覆盖首屏；跨多个区域时各页可能不同，要精确还原就逐
+  region 调用。内核会把跨度取整到整页——需要覆盖长度时用
+  `memory.protect_span`。
+- 动态代码策略（ACG）会拒绝把私有页改成可执行
+  （`STATUS_INVALID_PAGE_PROTECTION`），映像页通常不受限；HVCI/VBS 下
+  属性改得成功，但随后的写入或执行仍会被拒。
+- 把 `MEM_IMAGE` 页改成可写会触发写时复制、破坏文件共享；`0x20`/`0x40`
+  不会。
+
+### memory.protect_span
+
+与 `memory.protect` 相同，但额外返回内核实际覆盖的长度：跨度会被取整到
+整页，所以请求 1 字节也会改掉一整页。返回 `old_protect, bytes_protected`。
+
+```lua
+local old, len = memory.protect_span(pid, address, 1, 0x40)
+-- len == 0x1000：1 字节的请求覆盖了一整页
 ```
 
 ## 窗口查询 API

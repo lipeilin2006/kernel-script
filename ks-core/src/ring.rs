@@ -20,7 +20,7 @@
 use core::sync::atomic::{AtomicI32, AtomicU32, AtomicU64, Ordering};
 
 pub const RING_MAGIC: u32 = 0x4B53_5231;
-pub const RING_VERSION: u32 = 8;
+pub const RING_VERSION: u32 = 9;
 
 /// Bytes reserved for the header. Payload offsets are relative to the start
 /// of the mapping, so the request region starts at [`HEADER_SPACE`].

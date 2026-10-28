@@ -618,19 +618,109 @@ memory.write_bytes(pid, buffer, {1, 2, 3, 4})
 
 - `size` is 1 byte to 16 MiB (`MAX_ALLOC_SIZE`); the driver rounds it up to
   whole pages.
-- `protect` is optional and must be `0x04` (`PAGE_READWRITE`, the default) or
-  `0x40` (`PAGE_EXECUTE_READWRITE`). Any other value is rejected.
+- `protect` is optional and must be one of `0x04` (`PAGE_READWRITE`, the
+  default), `0x20` (`PAGE_EXECUTE_READ`) or `0x40`
+  (`PAGE_EXECUTE_READWRITE`). `0x02` (`PAGE_READONLY`) is refused here: a
+  read-only allocation could not be written through `memory.write_bytes` /
+  `memory.write_i32` (only the MDL path could), so allocate `0x04` and
+  `memory.protect` it down if a read-only span is really wanted.
+  `PAGE_NOACCESS` (`0x01`) and `PAGE_GUARD` (`0x100`) are rejected too —
+  they make the target fault on its own memory.
 - The allocation belongs to the target process: it is freed when that
   process exits, and `memory.free` releases it earlier.
 
 ### memory.free
 
-Releases a whole region previously returned by `memory.alloc`
-(`MEM_RELEASE`, no size needed). Freeing anything else fails with a driver
-error; it never touches other memory.
+Releases the whole VAD that contains `address` (`MEM_RELEASE`, no size
+needed). **This is dangerous, not guarded**: the kernel only requires an
+allocation base, and the driver keeps no ownership table, so an address
+belonging to the target itself — its heap, a stack, the base of a mapped
+view — is freed just as happily and that mapping comes down. Only pass
+addresses you allocated (or knowingly intend to destroy).
 
 ```lua
 memory.free(pid, buffer)
+```
+
+## Page Protection API
+
+Change the page protection of **already mapped** memory — image pages,
+the target's own allocations and `memory.alloc` pages alike — and query
+a region before touching it. Every call is one driver round trip.
+
+### memory.query_region
+
+Describes the region containing `address` (`ZwQueryVirtualMemory` with
+`MemoryBasicInformation`). This is the probe step before `protect`: the
+span must sit inside one region, and `state`/`typ` say whether the pages
+may change at all.
+
+Returns a table:
+
+```lua
+{
+    base = 0x140000000,          -- region start (page aligned)
+    allocation_base = 0x140000000, -- VAD / image base it belongs to
+    region_size = 0x10000,
+    state = 0x1000,              -- 0x1000 MEM_COMMIT / 0x2000 MEM_RESERVE / 0x10000 MEM_FREE
+    protect = 0x20,              -- current protection; 0 when free
+    allocation_protect = 0x20,   -- protection the VAD was created with
+    typ = 0x1000000,             -- 0x1000000 MEM_IMAGE / 0x40000 MEM_MAPPED / 0x20000 MEM_PRIVATE
+}
+```
+
+```lua
+local region = memory.query_region(pid, address)
+if region.state ~= 0x1000 then error("address is not committed") end
+-- walk to the next region:
+local next_addr = region.base + region.region_size
+```
+
+### memory.protect
+
+Changes the protection of `[address, address + size)` to `protect` and
+returns the **first page's** previous protection. `address` need not be
+page aligned — the kernel rounds the range itself.
+
+```lua
+local old = memory.protect(pid, address, 0x1000, 0x20)   -- -> PAGE_EXECUTE_READ
+memory.protect(pid, address, 0x1000, 0x04, true)         -- with CFG no-update
+```
+
+- `protect` is one of `0x02` (`PROT_READ`), `0x04` (`PROT_RW`), `0x20`
+  (`PROT_RX`), `0x40` (`PROT_RWX`); everything else is rejected before
+  the round trip. Single span: 1 byte to 256 MiB (`MAX_PROTECT_SIZE`).
+- Optional 5th argument `cfg_no_update`: attaches
+  `PAGE_TARGETS_NO_UPDATE` so the region's existing CFG bitmap entries
+  are left untouched instead of being re-marked valid indirect-call
+  targets (the kernel's default on a protection change). The flag only
+  pairs with an executable protection (`0x20`/`0x40`); any other
+  combination is refused before the round trip.
+- **The span must lie entirely inside existing mappings.** A range
+  crossing a free hole fails with the kernel's own status, which comes
+  back verbatim — probe with `query_region` first and use its
+  `region_size`.
+- The returned old value covers the first page only; across several
+  regions the pages may differ, so exact restoration means one call per
+  region. The kernel rounds the span to whole pages — use
+  `memory.protect_span` when the covered length matters.
+- Dynamic Code Policy / ACG refuses to make private pages executable
+  (`STATUS_INVALID_PAGE_PROTECTION`); image pages are usually exempt.
+  HVCI/VBS accepts the change but still refuses the write or execution
+  that follows.
+- Changing `MEM_IMAGE` pages to read-write triggers copy-on-write and
+  breaks file sharing for every process mapping that image;
+  `0x20`/`0x40` do not.
+
+### memory.protect_span
+
+Same as `memory.protect`, but also returns the length the kernel actually
+covered: the span is rounded to whole pages, so a one-byte request still
+changes a whole page. Returns `old_protect, bytes_protected`.
+
+```lua
+local old, len = memory.protect_span(pid, address, 1, 0x40)
+-- len == 0x1000: one byte of request covered a whole page
 ```
 
 ## Window Rect API

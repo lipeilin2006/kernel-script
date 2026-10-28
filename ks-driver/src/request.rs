@@ -12,7 +12,7 @@ use crate::wdm::*;
 use ks_core::ring::{RingHeader, RESPONSE_META_SIZE, RING_VERSION, STATE_RESPONSE};
 use ks_core::{
     decode_request, encode_response_meta, HookOp, Request, ResponseMeta, LOCK_LIST_ENTRY_SIZE,
-    MAX_BATCH_WRITE_ENTRIES, MAX_CHAIN_OFFSETS, MAX_DRIVER_TRANSFER_SIZE,
+    MAX_BATCH_WRITE_ENTRIES, MAX_CHAIN_OFFSETS, MAX_DRIVER_TRANSFER_SIZE, REGION_INFO_SIZE,
 };
 
 /// Answer the request the client published as `STATE_REQUEST`.
@@ -373,6 +373,57 @@ fn execute(
             match crate::suspend::resume(*pid, client_pid as u64) {
                 Ok(value) => (STATUS_SUCCESS, scalar(value)),
                 Err(status) => (status, failure()),
+            }
+        }
+        Request::Protect {
+            pid,
+            address,
+            size,
+            protect,
+            cfg_no_update,
+        } => {
+            crate::trace!(
+                "protect pid=%llu a=%p s=%lu p=0x%lx cfg=%u",
+                *pid,
+                *address as *mut c_void,
+                *size,
+                *protect,
+                *cfg_no_update as u32
+            );
+            match memory::protect(*pid, *address, *size as usize, *protect, *cfg_no_update) {
+                Ok((old, len)) => (
+                    STATUS_SUCCESS,
+                    ResponseMeta {
+                        bulk_len: 0,
+                        // The kernel wrote the page-rounded length back;
+                        // the caller sees how far the change actually
+                        // reached.
+                        count: len as u32,
+                        value: old as u64,
+                    },
+                ),
+                Err(status) => (status, failure()),
+            }
+        }
+        Request::QueryRegion { pid, address } => {
+            crate::trace!("queryregion pid=%llu a=%p", *pid, *address as *mut c_void);
+            if bulk.len() < REGION_INFO_SIZE {
+                (STATUS_BUFFER_TOO_SMALL, failure())
+            } else {
+                match memory::query_region(*pid, *address) {
+                    Ok(info) => {
+                        bulk[..REGION_INFO_SIZE].copy_from_slice(&info.encode());
+                        (
+                            STATUS_SUCCESS,
+                            ResponseMeta {
+                                bulk_len: REGION_INFO_SIZE as u32,
+                                count: REGION_INFO_SIZE as u32,
+                                value: info.base,
+                            },
+                        )
+                    }
+                    Err(status) => (status, failure()),
+                }
             }
         }
     }

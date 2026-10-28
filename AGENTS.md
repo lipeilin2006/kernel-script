@@ -224,6 +224,9 @@ memory.batch_write(pid, writes)
 memory.traverse_pointer_chain(pid, base, offsets)
 memory.alloc(pid, size, protect)
 memory.free(pid, address)
+memory.protect(pid, address, size, protect [, cfg_no_update])
+memory.protect_span(pid, address, size, protect [, cfg_no_update])
+memory.query_region(pid, address)
 memory.lock(id, pid, address, data)
 memory.unlock(id)
 memory.unlock_all(pid)
@@ -895,11 +898,33 @@ Before considering a change complete:
   at `PASSIVE_LEVEL` with no driver lock held (attach forbids both), the
   process reference is held for the whole call, the code is panic-free
   (`panic = "abort"`), sizes are capped at `MAX_ALLOC_SIZE` (16 MiB) and
-  rounded up by the kernel, and `protect` is whitelisted to
-  `PAGE_READWRITE`/`PAGE_EXECUTE_READWRITE` in ks-core, ks-link and the
-  driver. Both imports (`ZwAllocateVirtualMemory`, `ZwFreeVirtualMemory`)
-  are ntoskrnl exports; after any change here re-verify `dumpbin /imports`
-  lists `ntoskrnl.exe` only.
+  rounded up by the kernel, and `protect` is limited to the three-value
+  `valid_alloc_protect` set (`PROT_RW`/`PROT_RX`/`PROT_RWX`; `PROT_READ`
+  is refused because the plain write path cannot touch a read-only page)
+  in ks-core, ks-link and the driver. Both imports
+  (`ZwAllocateVirtualMemory`, `ZwFreeVirtualMemory`) are ntoskrnl
+  exports; after any change here re-verify `dumpbin /imports` lists
+  `ntoskrnl.exe` only. `free` is deliberately unguarded: `MEM_RELEASE`
+  only needs an allocation base, so any VAD can be torn down — the doc
+  comments say so instead of pretending otherwise.
+- Page protection and region queries (`Request::Protect` /
+  `Request::QueryRegion`, `ks-driver/src/memory/protect.rs`) open a
+  kernel handle to the target with `ObOpenObjectByPointer` +
+  `OBJ_KERNEL_HANDLE` — `KernelMode` grants the requested access
+  outright, so no DACL check and no `KeStackAttachProcess` — and close
+  it through an RAII `ProcessHandle`. `PsProcessType` is an ntoskrnl
+  **data** export declared `extern POBJECT_TYPE *PsProcessType;` in
+  `ntddk.h` — one pointer *more* than the type — so the value passed as
+  `ObjectType` is `*PsProcessType` (a load of the cell), never the
+  address of the cell; getting that level wrong hands the API a
+  `POBJECT_TYPE **`. A `Protect` span must lie entirely inside one
+  existing VAD (probe with `QueryRegion` first); the kernel rounds the
+  range itself and its NTSTATUS travels back verbatim, and
+  `ZwProtectVirtualMemory`'s `old_protection` covers the first page
+  only (`ks_link::protect_span` returns the page-rounded length the
+  driver reports in `ResponseMeta::count`). `cfg_no_update`
+  (`PAGE_TARGETS_NO_UPDATE`) only pairs with an executable protection
+  and the client refuses every other combination up front.
 - A first kernel-side lock worker was removed after repeated bugchecks in
   the field; locks moved client side, then returned to the driver with the
   invariants listed in the lock rules above (fast mutex around copies only,

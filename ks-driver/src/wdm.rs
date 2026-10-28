@@ -82,6 +82,18 @@ pub const MEM_COMMIT: u32 = 0x1000;
 pub const MEM_RESERVE: u32 = 0x2000;
 /// Release a whole allocation; `ZwFreeVirtualMemory` then requires size 0.
 pub const MEM_RELEASE: u32 = 0x8000;
+/// `PAGE_TARGETS_NO_UPDATE`: a `ZwProtectVirtualMemory` *modifier* that
+/// keeps the region's CFG bitmap entries as they are (a plain protection
+/// change re-marks them valid indirect-call targets). Not a protection —
+/// which is why it lives here instead of beside the protocol's `PROT_*`.
+pub const PAGE_TARGETS_NO_UPDATE: u32 = 0x4000_0000;
+/// Handle access `ZwProtectVirtualMemory` needs on the target process.
+pub const PROCESS_VM_OPERATION: u32 = 0x0000_0008;
+/// Handle access `ZwQueryVirtualMemory` needs on the target process.
+pub const PROCESS_QUERY_INFORMATION: u32 = 0x0000_0400;
+/// `MemoryBasicInformation`: the `ZwQueryVirtualMemory` information
+/// class that fills a `MEMORY_BASIC_INFORMATION`.
+pub const MEMORY_BASIC_INFORMATION: u32 = 0;
 
 /// `SECTION_BASIC_INFORMATION` as consumed by `ZwQuerySection` with
 /// `SectionBasicInformation`.
@@ -246,6 +258,48 @@ extern "system" {
         region_size: *mut usize,
         free_type: u32,
     ) -> NTSTATUS;
+    /// Changes the protection of a committed region in the given process.
+    /// The kernel rounds `base_address` down and `region_size` up to page
+    /// boundaries and writes both back; `old_protection` receives the
+    /// first page's previous protection only.
+    pub fn ZwProtectVirtualMemory(
+        process_handle: HANDLE,
+        base_address: *mut Pvoid,
+        region_size: *mut usize,
+        new_protection: u32,
+        old_protection: *mut u32,
+    ) -> NTSTATUS;
+    /// Fills `memory_information` for `base_address` according to
+    /// `memory_information_class` (0 = `MemoryBasicInformation`).
+    pub fn ZwQueryVirtualMemory(
+        process_handle: HANDLE,
+        base_address: Pvoid,
+        memory_information_class: u32,
+        memory_information: Pvoid,
+        memory_information_length: usize,
+        return_length: *mut usize,
+    ) -> NTSTATUS;
+    /// Opens a handle to an existing object. With `access_mode =
+    /// KernelMode` and a null `passed_access_state` the requested access
+    /// is granted outright — the object's DACL is never consulted — which
+    /// is how the driver obtains a `PROCESS_VM_OPERATION` handle to a
+    /// target it does not own.
+    pub fn ObOpenObjectByPointer(
+        object: Pvoid,
+        handle_attributes: u32,
+        passed_access_state: *mut c_void,
+        desired_access: u32,
+        object_type: *mut c_void,
+        access_mode: i32,
+        handle: *mut HANDLE,
+    ) -> NTSTATUS;
+
+    /// The `Process` object type, exported as **data**. `ntddk.h`
+    /// declares it `extern POBJECT_TYPE *PsProcessType;` — one pointer
+    /// *more* than the type itself — so the value handed to
+    /// [`ObOpenObjectByPointer`] is `*PsProcessType` (a load), never the
+    /// address of this cell.
+    pub static mut PsProcessType: *mut *mut c_void;
 
     /// `DbgPrint` from ntoskrnl.exe: varargs printf into the kernel debug
     /// pipe. The format string is a NUL-terminated UTF-8 literal; the

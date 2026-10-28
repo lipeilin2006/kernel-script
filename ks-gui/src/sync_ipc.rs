@@ -119,6 +119,47 @@ pub fn free(pid: u64, address: u64) -> Result<(), String> {
     ks_sdk::free(pid, address).map_err(reason)
 }
 
+/// Changes page protection over `[address, address + size)`; returns the
+/// first page's previous protection. The span must already be mapped —
+/// probe with [`query_region`] first.
+pub fn protect(pid: u64, address: u64, size: usize, protect: u32) -> Result<u32, String> {
+    gate()?;
+    ks_sdk::protect(pid, address, size, protect).map_err(reason)
+}
+
+/// [`protect`] with `PAGE_TARGETS_NO_UPDATE`: the region's existing CFG
+/// bitmap entries stay untouched instead of being re-marked valid.
+pub fn protect_ex(
+    pid: u64,
+    address: u64,
+    size: usize,
+    protect: u32,
+    cfg_no_update: bool,
+) -> Result<u32, String> {
+    gate()?;
+    ks_sdk::protect_ex(pid, address, size, protect, cfg_no_update).map_err(reason)
+}
+
+/// Describes the region containing `address`: start, size, state, current
+/// and original protection, mapping type.
+pub fn query_region(pid: u64, address: u64) -> Result<ks_sdk::RegionInfo, String> {
+    gate()?;
+    ks_sdk::query_region(pid, address).map_err(reason)
+}
+
+/// [`protect`]/[`protect_ex`] with the page-rounded length the kernel
+/// actually covered.
+pub fn protect_span(
+    pid: u64,
+    address: u64,
+    size: usize,
+    protect: u32,
+    cfg_no_update: bool,
+) -> Result<(u32, usize), String> {
+    gate()?;
+    ks_sdk::protect_span(pid, address, size, protect, cfg_no_update).map_err(reason)
+}
+
 /// Freezes every thread of the process `pid` (kernel `PsSuspendProcess`).
 /// Refuses `pid = 0`/`pid = 4` and this GUI's own pid; idempotent. Suspends
 /// survive a driver shutdown, so a matching [`resume`] is still required.

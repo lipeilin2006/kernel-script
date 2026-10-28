@@ -26,6 +26,7 @@ pub(crate) fn run_checks(target: &Arc<Target>, failures: &mut Vec<(String, Strin
     check_locks(t, failures);
     check_lock_list(t, failures);
     check_alloc(t, failures);
+    check_protect(t, failures);
     check_process_suspend(failures);
 
     check(failures, "concurrent ring access", || {
@@ -586,8 +587,14 @@ fn check_alloc(t: &Target, failures: &mut Vec<(String, String)>) {
         if ks_sdk::alloc(t.pid, 0x1000, 0x80).is_ok() {
             return Err("unsupported protection accepted".into());
         }
-        // A second free of the same region must fail instead of releasing
-        // someone else's memory.
+        // Read-only allocations are refused: the plain write path could
+        // never touch the page (only the MDL path could).
+        if ks_sdk::alloc(t.pid, 0x1000, ks_core::protocol::PROT_READ).is_ok() {
+            return Err("read-only allocation accepted".into());
+        }
+        // A second free must fail because the VAD is gone. `free` itself
+        // checks no ownership (see the SDK guide): the first call released
+        // the region, so the address no longer exists.
         let address = ks_sdk::alloc(t.pid, 0x1000, ks_core::protocol::ALLOC_PROTECT_READWRITE)
             .map_err(|e| format!("alloc for double free: {e}"))?;
         ks_sdk::free(t.pid, address).map_err(|e| format!("first free: {e}"))?;
@@ -625,6 +632,162 @@ fn check_alloc(t: &Target, failures: &mut Vec<(String, String)>) {
                 return Err("disable_all touched an empty table".into());
             }
             Ok(())
+        },
+    );
+}
+
+/// Page protection and region queries: probe the harness's own mappings,
+/// walk an allocation through RW -> RX -> RWX -> free, exercise the CFG
+/// modifier, and verify a stale span fails with the driver's own NTSTATUS
+/// instead of being swallowed.
+fn check_protect(t: &Target, failures: &mut Vec<(String, String)>) {
+    use ks_core::protocol::{
+        MAX_PROTECT_SIZE, MEM_COMMIT, MEM_IMAGE, MEM_PRIVATE, PROT_RW, PROT_RWX, PROT_RX,
+    };
+
+    check(failures, "query_region reports committed regions", || {
+        let heap =
+            ks_sdk::query_region(t.pid, t.buffer_addr).map_err(|e| format!("heap query: {e}"))?;
+        if heap.state != MEM_COMMIT {
+            return Err(format!("heap state {:#x}, want MEM_COMMIT", heap.state));
+        }
+        if heap.typ != MEM_PRIVATE {
+            return Err(format!("heap type {:#x}, want MEM_PRIVATE", heap.typ));
+        }
+        if t.buffer_addr < heap.base || t.buffer_addr >= heap.base + heap.region_size {
+            return Err(format!(
+                "buffer {:#x} outside its region {:#x} + {:#x}",
+                t.buffer_addr, heap.base, heap.region_size
+            ));
+        }
+        // Walk the image from its base until an executable region: the
+        // header page is read-only and `.text` starts its own RX region.
+        let mut address = t.image_base;
+        let mut found_exec = false;
+        for _ in 0..16 {
+            let region =
+                ks_sdk::query_region(t.pid, address).map_err(|e| format!("image query: {e}"))?;
+            if region.region_size == 0 {
+                break;
+            }
+            if region.typ == MEM_IMAGE && (region.protect == PROT_RX || region.protect == PROT_RWX)
+            {
+                found_exec = true;
+                break;
+            }
+            address = region.base + region.region_size;
+        }
+        if !found_exec {
+            return Err("no executable MEM_IMAGE region above the image base".into());
+        }
+        Ok(())
+    });
+
+    check(failures, "alloc/protect/free roundtrip", || {
+        let address = ks_sdk::alloc(t.pid, 0x1000, PROT_RW).map_err(|e| format!("alloc: {e}"))?;
+        let probe = ks_sdk::query_region(t.pid, address).map_err(|e| format!("query: {e}"))?;
+        if probe.state != MEM_COMMIT || probe.typ != MEM_PRIVATE || probe.protect != PROT_RW {
+            return Err(format!(
+                "fresh alloc reports state {:#x} type {:#x} protect {:#x}",
+                probe.state, probe.typ, probe.protect
+            ));
+        }
+        // RW -> RX: the old protection comes back, reads keep working, and
+        // a one-byte request still reports the page the kernel covered.
+        let (old, covered) = ks_sdk::protect_span(t.pid, address, 1, PROT_RX, false)
+            .map_err(|e| format!("protect RX: {e}"))?;
+        if covered != 0x1000 {
+            return Err(format!(
+                "protect_span covered {covered} bytes, want one page"
+            ));
+        }
+        if old != PROT_RW {
+            return Err(format!("old protect {old:#x}, want PROT_RW"));
+        }
+        let probe = ks_sdk::query_region(t.pid, address).map_err(|e| format!("query: {e}"))?;
+        if probe.protect != PROT_RX {
+            return Err(format!("region protect {:#x}, want PROT_RX", probe.protect));
+        }
+        let data = ks_sdk::read_bytes(t.pid, address, 4, false, false)
+            .map_err(|e| format!("read on RX page: {e}"))?;
+        if data.len() != 4 {
+            return Err(format!("read returned {} bytes", data.len()));
+        }
+        // RX -> RWX: writes now work, which is the point of the feature.
+        let old = ks_sdk::protect(t.pid, address, 0x1000, PROT_RWX)
+            .map_err(|e| format!("protect RWX: {e}"))?;
+        if old != PROT_RX {
+            return Err(format!("old protect {old:#x}, want PROT_RX"));
+        }
+        let payload = [0xDEu8, 0xAD, 0xBE, 0xEF];
+        ks_sdk::write_bytes(t.pid, address, &payload, false, false)
+            .map_err(|e| format!("write on RWX page: {e}"))?;
+        let readback = ks_sdk::read_bytes(t.pid, address, 4, false, false)
+            .map_err(|e| format!("read back: {e}"))?;
+        if readback != payload {
+            return Err(format!("read back {readback:02X?}, want {payload:02X?}"));
+        }
+        // Back to plain read/write, then release.
+        let old = ks_sdk::protect(t.pid, address, 0x1000, PROT_RW)
+            .map_err(|e| format!("restore RW: {e}"))?;
+        if old != PROT_RWX {
+            return Err(format!("old protect {old:#x}, want PROT_RWX"));
+        }
+        ks_sdk::free(t.pid, address).map_err(|e| format!("free: {e}"))
+    });
+
+    check(
+        failures,
+        "protect rejects bad spans and stale addresses",
+        || {
+            // Client-side guard rails: rejected before any round trip.
+            if ks_sdk::protect(t.pid, 0, 0x1000, PROT_RW).is_ok() {
+                return Err("null address accepted".into());
+            }
+            if ks_sdk::protect(t.pid, t.buffer_addr, 0, PROT_RW).is_ok() {
+                return Err("zero size accepted".into());
+            }
+            if ks_sdk::protect(t.pid, t.buffer_addr, 0x1000, 0x100).is_ok() {
+                return Err("PAGE_GUARD accepted".into());
+            }
+            if ks_sdk::protect(t.pid, t.buffer_addr, 0x1000, 0x01).is_ok() {
+                return Err("PAGE_NOACCESS accepted".into());
+            }
+            if ks_sdk::protect(t.pid, t.buffer_addr, MAX_PROTECT_SIZE + 1, PROT_RW).is_ok() {
+                return Err("oversize span accepted".into());
+            }
+            if ks_sdk::protect(0, t.buffer_addr, 0x1000, PROT_RW).is_ok() {
+                return Err("pid 0 accepted".into());
+            }
+            // PAGE_TARGETS_NO_UPDATE only pairs with an executable
+            // protection; the client refuses the rest up front.
+            if ks_sdk::protect_ex(t.pid, t.buffer_addr, 0x1000, PROT_RW, true).is_ok() {
+                return Err("cfg_no_update accepted with PROT_RW".into());
+            }
+            // Driver-side: a span that no longer exists must come back as the
+            // kernel's own failure status — never as success, and never
+            // flattened into a generic client-side error.
+            let address =
+                ks_sdk::alloc(t.pid, 0x1000, PROT_RW).map_err(|e| format!("alloc: {e}"))?;
+            ks_sdk::free(t.pid, address).map_err(|e| format!("free: {e}"))?;
+            match ks_sdk::protect(t.pid, address, 0x1000, PROT_RW) {
+                Err(ks_sdk::LinkError::NtStatus(status)) if status < 0 => {}
+                Err(other) => {
+                    return Err(format!(
+                        "stale span failed as {other}, want a driver NTSTATUS"
+                    ));
+                }
+                Ok(old) => return Err(format!("stale span accepted (old {old:#x})")),
+            }
+            // The CFG modifier travels the same path.
+            let address =
+                ks_sdk::alloc(t.pid, 0x1000, PROT_RW).map_err(|e| format!("alloc: {e}"))?;
+            let old = ks_sdk::protect_ex(t.pid, address, 0x1000, PROT_RX, true)
+                .map_err(|e| format!("protect_ex: {e}"))?;
+            if old != PROT_RW {
+                return Err(format!("cfg-modifier old protect {old:#x}, want PROT_RW"));
+            }
+            ks_sdk::free(t.pid, address).map_err(|e| format!("free: {e}"))
         },
     );
 }

@@ -190,15 +190,58 @@ let final_addr =
 // 在目标进程分配（ZwAllocateVirtualMemory）
 let buf = ks_sdk::alloc(pid, 0x1000, ks_sdk::ALLOC_PROTECT_READWRITE)?;
 
-// PAGE_EXECUTE_READWRITE 是唯一允许的可执行保护
+// PAGE_EXECUTE_READWRITE 是可执行分配的一种（需要显式命名）
 let rx = ks_sdk::alloc(pid, 0x1000, ks_sdk::ALLOC_PROTECT_EXECUTE_READWRITE)?;
 
 ks_sdk::free(pid, buf)?;
 ```
 
-- `protect` 只接受 `ALLOC_PROTECT_READWRITE`（0x04）与 `ALLOC_PROTECT_EXECUTE_READWRITE`（0x40），其它值在客户端就被拒绝。
+- `protect` 接受 `valid_alloc_protect` 的三个值：`ALLOC_PROTECT_READWRITE`
+  （0x04）、`ALLOC_PROTECT_EXECUTE_READWRITE`（0x40）与 `PROT_RX`（0x20）
+  ——直接分配 RX 省掉一次改属性往返。`PROT_READ`（0x02）被拒：只读页无法
+  通过普通写路径写入（只有 MDL 路径可以）；`PAGE_NOACCESS` / `PAGE_GUARD`
+  同样在客户端就被拒绝。
 - 上限 `MAX_ALLOC_SIZE = 16 MiB`，大小会被内核向上取整到页。
 - 分配属于目标进程：目标退出时自动消失，也可用 `free` 提前释放。
+- **`free` 是危险操作，不做归属校验**：
+  `ZwFreeVirtualMemory(MEM_RELEASE)` 只要求地址是某个 VAD 的 allocation
+  base，驱动也不维护分配表，因此传入目标自己的堆 / 栈 / 映射视图基址同样
+  会成功并拆掉那段映射。
+
+### 改页属性与区域查询（Protect / QueryRegion）
+
+```rust
+// 查询 address 所在区域（ZwQueryVirtualMemory + MemoryBasicInformation）
+let region = ks_sdk::query_region(pid, addr)?;
+// region.base / allocation_base / region_size / state / protect /
+// allocation_protect / typ —— 固定 40 字节 POD，little-endian 打包
+
+// 改属性，返回首屏旧属性；address 无需页对齐
+let old = ks_sdk::protect(pid, addr, 0x1000, ks_sdk::PROT_RX)?;
+// 需要知道内核实际覆盖多少页时：
+let (old, covered) = ks_sdk::protect_span(pid, addr, 1, ks_sdk::PROT_RX, false)?;
+//    covered == 4096 —— 请求 1 字节也覆盖整页
+// 带 CFG 修饰位（只与 PROT_RX / PROT_RWX 组合）：保持现有 CFG 条目不被重标
+ks_sdk::protect_ex(pid, addr, 0x1000, ks_sdk::PROT_RX, true)?;
+```
+
+- 白名单 `valid_protect`：`PROT_READ`（0x02）/ `PROT_RW`（0x04）/
+  `PROT_RX`（0x20）/ `PROT_RWX`（0x40）；`PAGE_NOACCESS`、`PAGE_GUARD`
+  被拒——目标进程一碰自己的内存就 AV。单次跨度上限
+  `MAX_PROTECT_SIZE = 256 MiB`。
+- **整段范围必须落在已映射的 VAD 内**：跨 FREE 洞直接失败。先
+  `query_region` 拿 `region_size` 再改。内核的 NTSTATUS 原样回传，
+  不会被吞成成功。
+- `old` 只是首屏属性；跨多个 VAD 时逐 region 处理才能精确还原。内核会把
+  跨度取整到整页，精确覆盖范围用 `protect_span` 的第二个返回值。
+- ACG / 动态代码策略会拒绝把私有页改成可执行
+  （`STATUS_INVALID_PAGE_PROTECTION`）；HVCI 下属性改得成功，但写入 /
+  执行仍被拒。
+- 映像页改成可写（`PROT_RW`）会触发 COW、破坏文件共享；
+  `PROT_RX` / `PROT_RWX` 不会。
+- `cfg_no_update` 附加 `PAGE_TARGETS_NO_UPDATE`，保持该区域现有 CFG
+  bitmap 条目（内核默认会在改属性时把它们重新标成合法间接调用目标）；
+  该修饰位只与可执行保护组合，其它组合在客户端即被拒绝。
 
 ## 10. 内存锁（持续写入）
 
