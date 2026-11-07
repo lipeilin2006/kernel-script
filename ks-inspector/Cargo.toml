@@ -1,0 +1,13 @@
+[package]
+name = "ks-inspector"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+ks-sdk.workspace = true
+ks-ui-common.workspace = true
+egui_overlay.workspace = true
+egui.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

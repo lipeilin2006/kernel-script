@@ -14,28 +14,31 @@
 
 ## Usage
 
-1. Place `ks-gui.exe` in a directory with its `scripts` folder (the driver
-   image is embedded in the executable; nothing is installed and no target
-   image ever reaches the disk).
+1. Place `ks-gui.exe` and `ks-inspector.exe` in a directory with the
+   overlay's `scripts` folder (the driver image is embedded in both
+   executables; nothing is installed and no target image ever reaches the
+   disk).
 2. Run `ks-gui.exe` as administrator. The driver starts silently at
    launch: the embedded image is mapped in-process through the in-process
    KDU mapper — no service, no signing. A live instance left by a
    previous run is reused if it answers; otherwise the stale publication is
    cleaned up and a fresh instance is mapped.
-3. Click `Stop` to close the GUI; it shuts the driver down silently on
-   the way out.
+3. Run `ks-inspector.exe` (also elevated) for the Cheat Engine-style
+   memory tool. It reuses the driver `ks-gui` already started; the two
+   apps can run side by side and the last one to close shuts the driver
+   down.
 
-There is no user-mode service: the GUI talks to the driver directly through
+There is no user-mode service: both apps talk to the driver directly through
 a shared-memory ring. For standalone driver diagnostics run `ks-test.exe`
-(full-suite mode) from an elevated terminal. The GUI requires an interactive
-desktop session because it uses OpenGL.
+(full-suite mode) from an elevated terminal. Both apps require an
+interactive desktop session because they use OpenGL.
 
 Kernel Script is a Windows-only Rust workspace for running Luau scripts over
 a shared-memory ring transport and a WDM driver. The intended data flow is:
 
 ```text
-Lua (synchronous call)
-    -> ks-gui sync_ipc (blocking)
+ks-gui Lua (synchronous call)      ks-inspector worker (synchronous call)
+    -> ks-gui sync_ipc (blocking)      -> ks-ui-common sync_ipc (blocking)
     -> ks-sdk re-export -> ks-link ring round trip (mutex + section + events)
     -> ks-driver worker system thread
         -> request execution (target-process memory access, lock table
@@ -57,21 +60,29 @@ Lua (synchronous call)
   (polls the request event while locks are held so requests win, blocks on
   it when the table is empty so an idle driver burns no CPU).
 - EgUI transparent overlay with cached draw commands.
+- Standalone `ks-inspector` memory tool: process list, paged hex viewer
+  anchored at the module base, Lua script editor, value editor and the
+  driver's whole lock table, with a `中文 / EN` switch that persists in
+  `config.json`. It reuses the same driver as `ks-gui` (the single-instance
+  guard makes the second app adopt the live instance).
 - User-mode process enumeration and process-name-to-PID lookup in `ks-link`
   (Toolhelp), re-exported by `ks-sdk`.
 - `ks-sdk` facade: re-exports the whole link API at its crate root and owns
   the driver lifecycle: `ks_sdk::start()` maps the embedded `ks-driver.sys`
   through the in-process KDU mapper (no service, no signature, no file on
-  disk for the target image) and `ks_sdk::stop()` shuts it down again
-  (building it requires MSVC).
+  disk for the target image) and `ks_sdk::stop()` shuts it down again.
 - Kernel section/events protected by a hand-built DACL that grants SYSTEM and
   Administrators; the ring state machine plus per-layer validation guards
   every request.
 - Postcard wire format (LEB128 varints + little-endian fixed fields) shared
   through `ks-core`, versioned by `RING_VERSION`.
-- The GUI owns the driver lifecycle: a startup probe starts the driver
+- Shared `ks-ui-common` crate: driver lifecycle and `sync_ipc` gate,
+  blocking round-trip facade, config store, bilingual string tables and
+  the Chinese-font installer, linked by both desktop apps so they cannot
+  drift apart.
+- The apps own the driver lifecycle: a startup probe starts the driver
   silently at launch and `driver::finish_on_exit` stops it again when the
-  window closes, through `ks_sdk::start()`/`ks_sdk::stop()` on a
+  last app closes, through `ks_sdk::start()`/`ks_sdk::stop()` on a
   background worker, and `sync_ipc` refuses memory calls while such a job
   is in flight.
 - `ks-test.exe` runs through `ks_sdk::start()`/`stop()` with the embedded
@@ -108,27 +119,33 @@ kernel-script/
 │       ├── lock.rs              # lock API (one round trip per mutation)
 │       └── process.rs           # Toolhelp process enumeration
 ├── ks-sdk/
-│   ├── build.rs                 # in-process KDU mapper build (MSVC)
-│   ├── kdu/                     # ks_bridge.cpp + printf hook header
-│   ├── assets/                  # provider database + embedded driver image
-│   └── src/                     # start/stop loader + ks-link API re-export
+│   ├── assets/                  # embedded driver image (built from ks-driver)
+│   └── src/                     # start/stop lifecycle + ks-link API re-export
+├── ks-ui-common/
+│   └── src/
+│       ├── driver.rs            # driver lifecycle + sync_ipc gate + coexistence
+│       ├── sync_ipc.rs          # synchronous facade over ks-sdk
+│       ├── config_store.rs      # config.json persistence
+│       ├── lang.rs              # bilingual UI strings
+│       └── font.rs              # Chinese font installer
 ├── ks-gui/
 │   └── src/
-│       ├── app.rs               # overlay application and frame rendering
+│       ├── app.rs               # overlay application + control window
 │       ├── lua_runtime.rs       # Lua VM lifecycle and API registration
 │       ├── lua_runtime/         # engine API, execution, keyboard, and runtime types
-│       ├── config_store.rs      # Lua config persistence (config.json)
-│       ├── driver.rs            # driver status window + sync_ipc gate
-│       ├── overlay.rs            # generic draw-command painter bridge
-│       ├── sync_ipc.rs          # synchronous facade over ks-sdk
+│       ├── overlay.rs           # generic draw-command painter bridge
 │       └── window_util.rs       # target-window geometry lookup
+├── ks-inspector/
+│   └── src/
+│       ├── main.rs              # standalone decorated window + event loop
+│       └── inspector.rs         # process list, hex view, Lua editor, locks
 └── ks-test/
     └── src/main.rs              # embedded-driver correctness + benchmark harness
 ```
 
 ## Lua Lifecycle
 
-Each `.lua` file loaded by the GUI runs in its own Luau VM:
+Each `.lua` file loaded by `ks-gui` runs in its own Luau VM:
 
 ```lua
 function OnStart() end
@@ -156,11 +173,15 @@ pointer chain, locks), `keyboard.*` (`is_key_down`, `is_key_up`,
 and `engine.*` (timing and pause control). See `document.md` or
 `document_CN.md` for the complete API reference.
 
+`ks-inspector` is not a script host: its process list, hex viewer, value
+editor and lock table call the same synchronous SDK through a single worker
+thread (never the render thread), so they never stall a Lua VM.
+
 ## Build And Test
 
 The normal workspace build checks user-mode crates and the driver framework
-(it requires MSVC: `ks-sdk` compiles the in-process KDU mapper with `cc`, and
-`ks-gui`/`ks-test` depend on it):
+(the mapper is the pure-Rust `dt-loader` sibling crate reached through a
+path dependency; no C++ toolchain is involved in the workspace build):
 
 ```powershell
 cargo fmt --all
@@ -173,6 +194,13 @@ Build the GUI with unwind support when runtime panic recovery is required:
 
 ```powershell
 cargo build --profile gui-release -p ks-gui
+```
+
+`ks-inspector` has no `catch_unwind`, so the normal release profile is
+correct for it:
+
+```powershell
+cargo build --release -p ks-inspector
 ```
 
 Build the native driver separately from a Visual Studio Developer Command
@@ -197,29 +225,38 @@ only.
 ## Running
 
 The driver's section and event objects are created by the kernel driver
-itself and protected by a DACL that grants SYSTEM and Administrators, so the
-GUI (which embeds a `requireAdministrator` manifest) runs elevated.
+itself and protected by a DACL that grants SYSTEM and Administrators, so
+both `ks-gui` and `ks-inspector` (each embeds a `requireAdministrator`
+manifest) run elevated.
 
-Run the GUI from an interactive desktop session because OpenGL requires a
+Run them from an interactive desktop session because OpenGL requires a
 window station. Lua scripts are loaded from the `scripts` directory beside
-the GUI executable. Files whose stem begins with `_` are kept available for
-manual testing but are not loaded by default.
+the `ks-gui` executable. Files whose stem begins with `_` are kept available
+for manual testing but are not loaded by default.
 
 Press `Insert` at any time to show or hide the egui script windows. The
 `draw.*` overlay layer and all script calculations keep running while the UI
 is hidden.
 
-The `KernelScript` window shows the current driver state (`probing...`,
-`starting...`, `running`, or the start error in red) above a scrollable
-startup log (the lifecycle narrative plus the provider attempts while the
-in-process mapper walks its fallback chain) and the GUI's only
-control, the `Stop` button: it closes the overlay, and once the render
-loop returns `ks-gui` shuts the driver down silently (`ks_sdk::stop()`)
-and drops the process-wide session. At launch a startup probe reuses a
-live driver or starts the embedded image in-process on a background
-worker — all lifecycle detail goes to `ks-gui.log`, and Lua memory calls
-fail immediately with "the driver is starting" while such an operation
-is in flight.
+The `KernelScript` control window is the overlay's only chrome: it shows the
+current driver state (`probing...`, `starting...`, `running`, or the start
+error in red), the `中文 / EN` switch and the `退出程序` / `Quit` button. The
+button closes the overlay; once the render loop returns `ks-gui` joins the
+shared shutdown path (`driver::finish_on_exit`) and drops the process-wide
+session. At launch a startup probe reuses a live driver or starts the
+embedded image in-process on a background worker — the lifecycle narrative
+goes to `ks-gui.log`, and Lua memory calls fail immediately with "the driver
+is starting" while such an operation is in flight.
+
+`ks-inspector` is the standalone memory tool: process list on the left, a
+full-width driver log bar at the bottom (the driver phase plus the startup
+log, including the mapper's `trying provider <id>` attempts; the lifecycle
+narrative is also written to `ks-inspector.log`) and tabs for the paged hex
+viewer, the
+`scripts/*.lua` editor and the lock/value table. Closing it leaves `ks-gui`
+(and the driver) running. The last of the two apps to close stops the driver;
+a crashed run's leftover instance is reused and cleaned up by the next start
+or the next final exit.
 
 ## Security Boundaries
 
@@ -231,7 +268,9 @@ is in flight.
   Administrators; there is no device object and no IOCTL entry point.
 - Every boundary validates lengths, counts, addresses, PIDs, and sizes
   (`Request::validate` in ks-core, again in the driver, again in ks-link).
-- GUI Lua objects never cross worker-thread boundaries.
+- Lua VM objects never cross worker-thread boundaries in `ks-gui`;
+  `ks-inspector` exchanges only owned `Command`/`Event` values with its
+  worker and never calls the driver on the render thread.
 
 ## License
 

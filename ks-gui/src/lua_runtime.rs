@@ -76,8 +76,9 @@ impl LuaRuntimeManager {
                 .unwrap_or(script_directory.as_path()),
         );
         // A missing or empty `scripts` directory is not an error: the
-        // overlay, the driver window and the memory-tool window all run
-        // without Lua, so the GUI must start regardless. `.lua` files whose
+        // overlay and its control window run without Lua, and the separate
+        // `ks-inspector` process is unaffected, so the GUI must start
+        // regardless. `.lua` files whose
         // stem starts with `_` are treated as disabled.
         let mut paths = fs::read_dir(&script_directory)
             .into_iter()

@@ -1,20 +1,27 @@
-//! Silent driver lifecycle: the startup probe reuses a live driver or
-//! starts the embedded one through `ks_sdk::start(None)` (in-process KDU map)
-//! on a background worker, [`DriverControl::poll`] chains that start once
-//! the probe reports a stopped driver, and [`finish_on_exit`] shuts a live
-//! driver down again after the render loop has returned. The module also
-//! owns the gate that keeps `sync_ipc` round trips away from the
-//! process-wide session while such a job can close or replace it.
+//! Silent driver lifecycle shared by `ks-gui` and `ks-inspector`: the
+//! startup probe reuses a live driver or starts the embedded one through
+//! `ks_sdk::start(None)` (in-process KDU map) on a background worker,
+//! [`DriverControl::poll`] chains that start once the probe reports a
+//! stopped driver, and [`finish_on_exit`] shuts a live driver down again
+//! after the render loop has returned. The module also owns the gate that
+//! keeps `sync_ipc` round trips away from the process-wide session while
+//! such a job can close or replace it.
 //!
-//! The GUI shows this in the memory-tool window's bottom log bar: the
-//! current phase (`probing...`, `starting...`, `running`, or the start
-//! error in red) above the startup log — the lifecycle narrative plus the
-//! `trying provider <id>` lines the ks_sdk log sink receives while
-//! `ks_sdk::start` walks its provider chain. The overlay itself only shows
-//! the Lua script windows.
+//! The apps show this in their status line and startup log: the current
+//! phase (`probing...`, `starting...`, `running`, or the start error in
+//! red) above the lifecycle narrative plus the `trying provider <id>`
+//! lines the ks_sdk log sink receives while `ks_sdk::start` walks its
+//! provider chain. `ks-gui` shows it in its small control window,
+//! `ks-inspector` in the memory tool's bottom log bar.
+//!
+//! Two apps may run at the same time: the driver's single-instance guard
+//! makes the second one reuse the live instance instead of mapping a
+//! second copy. [`finish_on_exit`] therefore only stops the driver when no
+//! other Kernel Script app is still running — the last app to close cleans
+//! up (and that also cleans up an instance left behind by a crashed run).
 //!
 //! Threading rules:
-//! - The GUI thread owns [`DriverControl`]; a worker only sends an
+//! - The UI thread owns [`DriverControl`]; a worker only sends an
 //!   [`Outcome`] (job kind + owned plain data) over the channel and never
 //!   touches Lua or egui.
 //! - The startup log buffer is an `Arc<Mutex<VecDeque<String>>>` shared
@@ -44,7 +51,7 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-/// Cap for the startup log the memory-tool log bar shows; the oldest
+/// Cap for the startup log the apps show; the oldest
 /// line is dropped beyond it.
 const MAX_LOG_LINES: usize = 200;
 
@@ -57,7 +64,7 @@ pub fn lifecycle_busy() -> bool {
     LIFECYCLE_BUSY.load(Ordering::Acquire)
 }
 
-/// What the memory-tool log bar displays for the current lifecycle state.
+/// What the app displays for the current lifecycle state.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Phase {
     Probing,
@@ -93,14 +100,14 @@ enum Outcome {
 }
 
 pub struct DriverControl {
-    /// The state the memory-tool log bar shows; updated by [`Self::poll`]
-    /// when a job outcome arrives, never by the worker itself.
+    /// The state the app displays; updated by [`Self::poll`] when a job
+    /// outcome arrives, never by the worker itself.
     phase: Phase,
     tx: Sender<Outcome>,
     rx: Receiver<Outcome>,
     /// Startup log lines shared with the ks_sdk log sink: the sink
     /// appends `trying provider <id>` lines from the worker thread
-    /// inside `ks_sdk::start`, the GUI thread appends the lifecycle
+    /// inside `ks_sdk::start`, the UI thread appends the lifecycle
     /// narrative, and [`Self::logs_snapshot`] reads the buffer for display.
     logs: Arc<Mutex<VecDeque<String>>>,
 }
@@ -118,9 +125,10 @@ fn push_line(logs: &Mutex<VecDeque<String>>, line: &str) {
 
 impl DriverControl {
     /// Creates the controller and spawns the startup probe: a driver
-    /// instance already live (leftover from a previous run) is reused, a
-    /// stopped one is started silently on the worker. Also installs the
-    /// ks_sdk log sink that feeds the window's startup log.
+    /// instance already live (started by another Kernel Script app or left
+    /// over from a previous run) is reused, a stopped one is started
+    /// silently on the worker. Also installs the ks_sdk log sink that
+    /// feeds the app's startup log.
     pub fn new() -> Self {
         let (tx, rx) = mpsc::channel();
         let logs = Arc::new(Mutex::new(VecDeque::new()));
@@ -183,7 +191,7 @@ impl DriverControl {
         }
     }
 
-    /// `(is_error, text)` for the memory-tool log bar's status line.
+    /// `(is_error, text)` for the app's status line.
     pub fn status_text(&self) -> (bool, String) {
         match &self.phase {
             Phase::Failed(error) => (true, format!("driver: {error}")),
@@ -191,15 +199,15 @@ impl DriverControl {
         }
     }
 
-    /// Snapshot of the startup log for the memory-tool log bar. Copies
-    /// owned strings so the bar renders without holding the lock.
+    /// Snapshot of the startup log for the app's log bar. Copies owned
+    /// strings so the bar renders without holding the lock.
     pub fn logs_snapshot(&self) -> Vec<String> {
         let logs = self.logs.lock().unwrap_or_else(|error| error.into_inner());
         logs.iter().cloned().collect()
     }
 
     /// Marks the gate closed, publishes the matching phase, and runs the
-    /// job on a detached thread. Must only be called on the GUI thread
+    /// job on a detached thread. Must only be called on the UI thread
     /// while no job is in flight.
     fn spawn(&mut self, job: Job) {
         LIFECYCLE_BUSY.store(true, Ordering::Release);
@@ -235,6 +243,14 @@ impl Default for DriverControl {
 /// silently shuts a live driver down and drops the process-wide session.
 /// Lua and rendering are gone at this point, so the round trip runs on
 /// the main thread without violating the render-thread rule.
+///
+/// `ks-gui` and `ks-inspector` may run side by side and share one driver
+/// (the single-instance guard makes the second app reuse it), so the stop
+/// only runs when no other Kernel Script app is still alive. The last app
+/// to close therefore cleans up — including an instance left behind by a
+/// crashed earlier run — while closing one of two apps leaves the driver
+/// serving the other. The check happens after the job wait, so a launch
+/// that was still mapping cannot race it.
 pub fn finish_on_exit() {
     let deadline = Instant::now() + Duration::from_secs(60);
     while lifecycle_busy() {
@@ -245,12 +261,44 @@ pub fn finish_on_exit() {
         std::thread::sleep(Duration::from_millis(50));
     }
     if probe() {
-        if let Err(error) = stop() {
+        if other_app_running() {
+            tracing::info!(
+                "driver lifecycle: another Kernel Script app is still running; leaving the driver up"
+            );
+        } else if let Err(error) = stop() {
             tracing::warn!(%error, "driver lifecycle: stop on exit failed");
         }
     }
     ks_sdk::close_session();
     tracing::info!("driver lifecycle: exit cleanup finished");
+}
+
+/// Executable names that host a driver session. A process with one of
+/// these names (other than this process) keeps the driver alive when this
+/// app exits.
+const APP_EXECUTABLES: [&str; 2] = ["ks-gui.exe", "ks-inspector.exe"];
+
+/// Whether another Kernel Script desktop app is running right now.
+///
+/// Uses the same Toolhelp enumeration `ks-link` exposes for the process
+/// pickers; it needs no driver session, so it works during teardown. A
+/// failed enumeration is treated as "alone" (the usual stop path) and
+/// only logged: leaving every driver up because Toolhelp hiccuped once
+/// would leak an instance until reboot.
+fn other_app_running() -> bool {
+    let own_pid = std::process::id();
+    match ks_sdk::list() {
+        Ok(processes) => processes.iter().any(|process| {
+            process.pid != own_pid
+                && APP_EXECUTABLES
+                    .iter()
+                    .any(|name| process.name.eq_ignore_ascii_case(name))
+        }),
+        Err(error) => {
+            tracing::warn!(%error, "driver lifecycle: process enumeration failed on exit");
+            false
+        }
+    }
 }
 
 /// True when the published names exist *and* the ring answers — a live

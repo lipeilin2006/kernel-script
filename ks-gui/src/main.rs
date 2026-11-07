@@ -1,16 +1,12 @@
 #![windows_subsystem = "windows"]
+
+pub(crate) use ks_ui_common::{config_store, driver, lang, sync_ipc};
+
 mod app;
-mod ce_window;
-mod config_store;
-mod driver;
-mod lang;
-mod overlay;
-
 mod lua_runtime;
-
-mod sync_ipc;
-
+mod overlay;
 mod window_util;
+
 fn main() {
     if let Err(error) = app::run() {
         eprintln!("Failed to run GUI: {error}");

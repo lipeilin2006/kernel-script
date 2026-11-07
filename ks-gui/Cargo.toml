@@ -6,14 +6,12 @@ rust-version.workspace = true
 
 [dependencies]
 ks-core.workspace = true
-ks-sdk.workspace = true
+ks-ui-common.workspace = true
 egui_overlay.workspace = true
 egui.workspace = true
 glow = "0.13"
 mlua.workspace = true
 notify.workspace = true
-serde.workspace = true
-serde_json.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 windows-sys = { workspace = true, features = [

@@ -1,17 +1,15 @@
 use std::cell::Cell;
 use std::error::Error;
-use std::fs;
-use std::path::Path;
 use std::rc::Rc;
 use std::time::Instant;
 
-use egui::FontFamily;
 use egui_overlay::egui_render_three_d::{ThreeDBackend, ThreeDConfig};
-use egui_overlay::egui_window_glfw_passthrough::glfw::Context as _;
 use egui_overlay::egui_window_glfw_passthrough::{
     self as glfw_passthrough, GlfwBackend, GlfwConfig,
 };
 use egui_overlay::EguiOverlay;
+
+use ks_ui_common::install_chinese_font;
 
 use crate::lua_runtime::LuaRuntimeManager;
 
@@ -51,11 +49,6 @@ struct KernelScriptApp {
     fonts_installed: bool,
     ui_visible: bool,
     insert_was_down: bool,
-    /// The independent Cheat Engine-style window, created lazily on the
-    /// GUI thread (glfw windows belong to the thread that created them).
-    ce: Option<crate::ce_window::CeWindow>,
-    /// Whether the one-shot automatic open of the memory tool already ran.
-    ce_auto_open_done: bool,
 }
 
 impl KernelScriptApp {
@@ -76,8 +69,6 @@ impl KernelScriptApp {
             fonts_installed: false,
             ui_visible: true,
             insert_was_down: false,
-            ce: None,
-            ce_auto_open_done: false,
         })
     }
 }
@@ -93,10 +84,8 @@ impl EguiOverlay for KernelScriptApp {
         // Cap the whole overlay (render + OnUpdate) at 60 FPS so egui windows
         // stay stable and slow Lua callbacks simply lower the frame rate.
         ctx.request_repaint_after(crate::lua_runtime::FRAME_INTERVAL);
-        // Insert toggles the Lua script UI only (the memory-tool window is
-        // an independent OS window and is unaffected); Lua keeps running
-        // and the draw.* overlay layer stays visible while the UI is
-        // hidden.
+        // Insert toggles the whole script UI (Lua windows and the small
+        // control window) while the draw.* overlay layer keeps rendering.
         // GetAsyncKeyState reads the physical key state of the whole desktop,
         // so the toggle works while another window (the game) owns input
         // focus and the unfocused overlay never receives key events.
@@ -129,10 +118,11 @@ impl EguiOverlay for KernelScriptApp {
             }
         }
         // Driver lifecycle first: apply finished worker jobs (this flips
-        // the sync_ipc gate) before this frame's Lua runs. The phase and
-        // startup log are shown in the memory-tool window's bottom log bar.
+        // the sync_ipc gate) before this frame's Lua runs.
         self.driver.poll();
-        self.memory_tool_window(ctx, glfw_backend);
+        if self.ui_visible {
+            self.control_window(ctx, glfw_backend);
+        }
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             self.runtime.frame(ctx, Instant::now(), self.ui_visible);
         }));
@@ -145,68 +135,33 @@ impl EguiOverlay for KernelScriptApp {
         glfw_backend.set_passthrough(!wants_input);
 
         crate::overlay::paint_commands(ctx, self.runtime.take_draw_commands());
-
-        // Drawn last: the memory tool renders into its own window and hands
-        // the GL context back to the overlay before this frame's overlay
-        // pass renders.
-        if let Some(window) = self.ce.as_mut() {
-            match window.frame(glfw_backend, &self.driver) {
-                crate::ce_window::CeOutcome::Running => {}
-                crate::ce_window::CeOutcome::Closed => {
-                    // Closing the independent CE window is the application's
-                    // close action, not a request to keep the overlay alive.
-                    glfw_backend.window.set_should_close(true);
-                }
-            }
-        }
     }
 }
 
 impl KernelScriptApp {
-    /// Opens the independent memory-tool window once at startup. The small
-    /// fallback window remains useful only if creation itself fails.
-    fn memory_tool_window(&mut self, ctx: &egui::Context, glfw_backend: &mut GlfwBackend) {
-        if self.ce.is_none() {
-            if !self.ce_auto_open_done {
-                self.ce_auto_open_done = true;
-                self.open_memory_tool(glfw_backend);
-            } else {
-                egui::Window::new(crate::lang::s().overlay_title)
-                    .default_pos(egui::pos2(16.0, 220.0))
-                    .resizable(false)
-                    .show(ctx, |ui| {
-                        let (is_error, text) = self.driver.status_text();
-                        if is_error {
-                            ui.colored_label(egui::Color32::LIGHT_RED, text);
-                        } else {
-                            ui.label(text);
-                        }
-                        ui.horizontal(|ui| {
-                            if ui.button(crate::lang::s().reopen_tool).clicked() {
-                                self.open_memory_tool(glfw_backend);
-                            }
-                            if ui.button(crate::lang::s().quit).clicked() {
-                                glfw_backend.window.set_should_close(true);
-                            }
-                        });
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            crate::lang::toggle_widget(ui, &self.runtime.config_store());
-                        });
-                    });
-            }
-        }
-    }
-
-    fn open_memory_tool(&mut self, glfw_backend: &mut GlfwBackend) {
-        match crate::ce_window::CeWindow::new(&mut glfw_backend.glfw, self.runtime.config_store()) {
-            Ok(window) => {
-                tracing::info!("memory tool window opened");
-                self.ce = Some(window);
-            }
-            Err(error) => tracing::error!(%error, "memory tool window failed to open"),
-        }
-        // `CeWindow::new` leaves its own GL context current.
-        glfw_backend.window.make_current();
+    /// The overlay's only chrome: driver status, the language toggle and
+    /// the quit button. The memory tool is a separate application
+    /// (`ks-inspector`), so the overlay no longer opens or embeds it.
+    fn control_window(&mut self, ctx: &egui::Context, glfw_backend: &mut GlfwBackend) {
+        egui::Window::new(crate::lang::s().overlay_title)
+            .default_pos(egui::pos2(16.0, 16.0))
+            .resizable(false)
+            .show(ctx, |ui| {
+                let (is_error, text) = self.driver.status_text();
+                if is_error {
+                    ui.colored_label(egui::Color32::LIGHT_RED, text);
+                } else {
+                    ui.label(text);
+                }
+                ui.horizontal(|ui| {
+                    if ui.button(crate::lang::s().quit).clicked() {
+                        glfw_backend.window.set_should_close(true);
+                    }
+                });
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    crate::lang::toggle_widget(ui, &self.runtime.config_store());
+                });
+            });
     }
 }
 
@@ -281,42 +236,9 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         glfw_backend,
     };
     overlap_app.enter_event_loop();
-    // The loop only returns once the window is closed (the Stop button or
+    // The loop only returns once the window is closed (the Quit button or
     // a WM_CLOSE): Lua and rendering are gone, so the driver can be shut
     // down synchronously here.
     crate::driver::finish_on_exit();
-    Ok(())
-}
-
-pub(crate) fn install_chinese_font(ctx: &egui::Context) -> Result<(), Box<dyn Error>> {
-    let candidates = [
-        r"C:\Windows\Fonts\simhei.ttf",
-        r"C:\Windows\Fonts\msyh.ttc",
-        r"C:\Windows\Fonts\simsun.ttc",
-    ];
-    let Some(path) = candidates.iter().find(|path| Path::new(path).is_file()) else {
-        tracing::warn!("no Chinese font found under C:\\Windows\\Fonts");
-        return Ok(());
-    };
-    let bytes = fs::read(path)?;
-    let byte_len = bytes.len();
-    let mut fonts = egui::FontDefinitions::default();
-    fonts.font_data.insert(
-        "kernel-script-cjk".to_owned(),
-        egui::FontData::from_owned(bytes),
-    );
-    for family in [FontFamily::Proportional, FontFamily::Monospace] {
-        fonts
-            .families
-            .entry(family)
-            .or_default()
-            .insert(0, "kernel-script-cjk".to_owned());
-    }
-    fonts.families.insert(
-        FontFamily::Name("Button".into()),
-        vec!["kernel-script-cjk".to_owned()],
-    );
-    ctx.set_fonts(fonts);
-    tracing::info!(font = path, bytes = byte_len, "Chinese font loaded");
     Ok(())
 }

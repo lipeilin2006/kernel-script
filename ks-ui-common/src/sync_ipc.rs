@@ -1,4 +1,4 @@
-//! Synchronous memory operations for the GUI Lua thread, backed by the
+//! Synchronous memory operations for the two desktop apps, backed by the
 //! shared-memory link re-exported from [`ks_sdk`].
 //!
 //! Every call performs exactly one ring round trip and blocks the calling
@@ -7,9 +7,10 @@
 //!
 //! [`gate`] additionally refuses every call while a driver lifecycle job
 //! (probe/start) is in flight: that job may close and replace the
-//! process-wide session, and the check runs on the same GUI Lua thread
-//! that issues the round trips — so no round trip can be in flight when
-//! the session goes away (see `ks-gui/src/driver.rs`).
+//! process-wide session, and the check runs on the caller that issues the
+//! round trips — the Lua thread in `ks-gui`, the single worker thread in
+//! `ks-inspector` — so no round trip can be in flight when the session
+//! goes away (see [`crate::driver`]).
 
 fn reason<E: std::fmt::Display>(error: E) -> String {
     error.to_string()

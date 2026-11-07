@@ -524,11 +524,9 @@ dependencies = [
  "egui_overlay",
  "glow",
  "ks-core",
- "ks-sdk",
+ "ks-ui-common",
  "mlua",
  "notify",
- "serde",
- "serde_json",
  "tracing",
  "tracing-subscriber",
  "windows-sys 0.61.2",
@@ -540,6 +538,18 @@ version = "0.1.0"
 dependencies = [
  "ks-core",
  "ks-sdk",
+]
+
+[[package]]
+name = "ks-inspector"
+version = "0.1.0"
+dependencies = [
+ "egui",
+ "egui_overlay",
+ "ks-sdk",
+ "ks-ui-common",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -566,6 +576,17 @@ dependencies = [
  "ks-core",
  "ks-sdk",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "ks-ui-common"
+version = "0.1.0"
+dependencies = [
+ "egui",
+ "ks-sdk",
+ "serde",
+ "serde_json",
+ "tracing",
 ]
 
 [[package]]

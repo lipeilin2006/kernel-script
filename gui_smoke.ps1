@@ -52,8 +52,8 @@ if ($exited) {
         $k.GetValueNames() | ForEach-Object { W "  value: $_ = $($k.GetValue($_))" }
     }
 
-    # Screenshot the top-left corner so the status window can be verified
-    # visually (driver: running above the Stop button).
+    # Screenshot the top-left corner so the control window can be verified
+    # visually (driver: running above the Quit button).
     try {
         Add-Type -AssemblyName System.Drawing
         Add-Type -AssemblyName System.Windows.Forms
@@ -68,7 +68,7 @@ if ($exited) {
         W "screenshot saved=$shot"
     } catch { W "screenshot failed: $_" }
 
-    # Close through the same path the Stop button takes: WM_CLOSE makes
+    # Close through the same path the Quit button takes: WM_CLOSE makes
     # GLFW set should_close, the render loop returns and the GUI stops
     # the driver itself on the way out.
     $proc.Refresh()

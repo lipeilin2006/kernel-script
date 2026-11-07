@@ -4,7 +4,9 @@ members = [
     "ks-driver",
     "ks-link",
     "ks-sdk",
+    "ks-ui-common",
     "ks-gui",
+    "ks-inspector",
     "ks-test",
     "ks-hook-test",
 ]
@@ -19,6 +21,7 @@ rust-version = "1.85"
 ks-core = { path = "ks-core", default-features = false }
 ks-link = { path = "ks-link" }
 ks-sdk = { path = "ks-sdk" }
+ks-ui-common = { path = "ks-ui-common" }
 dt-loader = { path = "../driver-toolkit/dt-loader" }
 
 egui_overlay = { version = "0.9.0", default-features = false, features = ["egui_default", "glfw_default", "three_d"] }

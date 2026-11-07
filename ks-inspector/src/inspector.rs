@@ -1,8 +1,11 @@
-//! Independent Cheat Engine-style memory tool window.
+//! Standalone Kernel Script inspector (the former memory-tool window).
 //!
-//! A second, ordinary decorated glfw window (the overlay keeps the Lua/ESP
-//! side). It owns its own `egui::Context` and `ThreeDBackend`, so its
-//! rendering never mixes with the overlay pass.
+//! `ks-inspector` is a separate executable with its own decorated glfw
+//! window, `egui::Context` and `ThreeDBackend`; the overlay application
+//! (`ks-gui`) no longer embeds or renders it. Both apps talk to the same
+//! driver: the single-instance guard makes the second one reuse the live
+//! instance, and [`ks_ui_common::driver::finish_on_exit`] only stops it
+//! when the last Kernel Script app closes.
 //!
 //! Layout: a menu bar, the process list on the left, a full-width log bar at
 //! the bottom (driver phase plus the lifecycle/startup log) and a tabbed
@@ -23,14 +26,15 @@ use std::time::Instant;
 
 use egui_overlay::egui_render_three_d::{ThreeDBackend, ThreeDConfig};
 use egui_overlay::egui_window_glfw_passthrough::glfw::{
-    self, Action, Context as _, GlfwReceiver, Key, Modifiers as GlfwModifiers, MouseButton,
-    PWindow, WindowEvent, WindowHint, WindowMode,
+    self, Action, ClientApiHint, Context as _, GlfwReceiver, Key, Modifiers as GlfwModifiers,
+    MouseButton, PWindow, WindowEvent, WindowHint, WindowMode,
 };
-use egui_overlay::egui_window_glfw_passthrough::GlfwBackend;
 
-use crate::config_store::SharedConfigStore;
-use crate::lang::{self, s};
-use crate::sync_ipc;
+use ks_ui_common::config_store::SharedConfigStore;
+use ks_ui_common::driver::DriverControl;
+use ks_ui_common::install_chinese_font;
+use ks_ui_common::lang::{self, s};
+use ks_ui_common::sync_ipc;
 
 /// Bytes shown by one hex page. The driver caps a single read at 4096.
 const HEX_LENGTHS: [usize; 5] = [256, 512, 1024, 2048, 4096];
@@ -532,15 +536,16 @@ impl ToolState {
     }
 }
 
-/// What the caller should do with the overlay after a CE-window frame.
-pub(crate) enum CeOutcome {
+/// What the app should do after one inspector frame.
+pub(crate) enum FrameOutcome {
     Running,
-    /// The user closed the memory-tool window; the overlay keeps running.
+    /// The user closed the inspector window; the app exits.
     Closed,
 }
 
-/// The CE-style window: glfw window, own egui context and renderer.
-pub(crate) struct CeWindow {
+/// The standalone inspector window: glfw window, own egui context and
+/// renderer.
+pub(crate) struct Inspector {
     window: PWindow,
     events: GlfwReceiver<(f64, WindowEvent)>,
     backend: Option<ThreeDBackend>,
@@ -558,11 +563,13 @@ pub(crate) struct CeWindow {
     title_lang: lang::Lang,
 }
 
-impl CeWindow {
-    /// Creates the window and its renderer. The caller leaves the overlay's
-    /// GL context current afterwards; [`CeWindow::frame`] guarantees the
-    /// same on every return path.
+impl Inspector {
+    /// Creates the window and its renderer. The new window's GL context is
+    /// left current, so the caller can query GL or set the swap interval
+    /// right after it returns; [`Inspector::frame`] makes it current
+    /// again before every GL call.
     pub(crate) fn new(glfw: &mut glfw::Glfw, config: SharedConfigStore) -> Result<Self, String> {
+        glfw.window_hint(WindowHint::ClientApi(ClientApiHint::OpenGl));
         glfw.window_hint(WindowHint::TransparentFramebuffer(false));
         glfw.window_hint(WindowHint::ScaleToMonitor(true));
         glfw.window_hint(WindowHint::Visible(true));
@@ -619,11 +626,11 @@ impl CeWindow {
         let (commands, command_rx) = channel();
         let (event_tx, results) = channel();
         std::thread::Builder::new()
-            .name("ks-ce-worker".into())
+            .name("ks-inspector-worker".into())
             .spawn(move || worker(command_rx, event_tx))
             .map_err(|error| format!("spawn worker: {error}"))?;
 
-        let ce = Self {
+        let inspector = Self {
             window,
             events,
             backend: Some(backend),
@@ -638,24 +645,19 @@ impl CeWindow {
             framebuffer,
             title_lang: lang::lang(),
         };
-        let _ = ce.commands.send(Command::ListProcesses);
-        Ok(ce)
+        let _ = inspector.commands.send(Command::ListProcesses);
+        Ok(inspector)
     }
 
-    /// One frame: drain worker results, feed input, draw, present. Returns
-    /// what the caller should do with the overlay; the GL objects are
-    /// already torn down when the window itself was closed.
-    pub(crate) fn frame(
-        &mut self,
-        overlay: &mut GlfwBackend,
-        driver: &crate::driver::DriverControl,
-    ) -> CeOutcome {
+    /// One frame: drain worker results, feed input, draw, present. The
+    /// renderer is already torn down when the window itself was closed.
+    pub(crate) fn frame(&mut self, driver: &DriverControl) -> FrameOutcome {
         // The OS window title follows the language toggle, so it only
         // changes when the language actually did.
         let active_lang = lang::lang();
         if self.title_lang != active_lang {
             self.title_lang = active_lang;
-            overlay.window.set_title(s().app_title);
+            self.window.set_title(s().app_title);
         }
         self.drain_results();
         self.pump_hex();
@@ -723,10 +725,18 @@ impl CeWindow {
                     let _ = sync_ipc::unlock_all(pid);
                 });
             }
-            overlay.window.make_current();
-            return CeOutcome::Closed;
+            return FrameOutcome::Closed;
         }
 
+        // Minimized windows have an empty framebuffer, and painting into a
+        // 1x1 surface (or swapping on an iconified window) is pointless.
+        // Leave every GL object alone until the window is restored.
+        if self.window.is_iconified() {
+            return FrameOutcome::Running;
+        }
+
+        // Every GL call below must run on this window's context.
+        self.window.make_current();
         let scale = self.window.get_content_scale().0.max(1.0);
         let (fb_width, fb_height) = self.window.get_framebuffer_size();
         let framebuffer = [fb_width.max(1) as u32, fb_height.max(1) as u32];
@@ -738,9 +748,8 @@ impl CeWindow {
         }
         let logical = [framebuffer[0] as f32 / scale, framebuffer[1] as f32 / scale];
 
-        self.window.make_current();
         if !self.fonts_installed {
-            let _ = crate::app::install_chinese_font(&self.ctx);
+            let _ = install_chinese_font(&self.ctx);
             self.fonts_installed = true;
         }
 
@@ -791,10 +800,7 @@ impl CeWindow {
             backend.render_egui(primitives, full_output.textures_delta, logical);
         }
         self.window.swap_buffers();
-        // The overlay renders right after `gui_run`; hand the GL context
-        // back so its painter sees the context it was created for.
-        overlay.window.make_current();
-        CeOutcome::Running
+        FrameOutcome::Running
     }
 
     /// Queues the current hex page read when none is in flight, so the view
@@ -955,7 +961,7 @@ impl CeWindow {
     }
 }
 
-impl Drop for CeWindow {
+impl Drop for Inspector {
     fn drop(&mut self) {
         // Fields drop in declaration order, so without this the glfw window
         // (and its GL context) would be destroyed before the renderer drops
@@ -1069,7 +1075,7 @@ fn draw_ui(
     ctx: &egui::Context,
     state: &mut ToolState,
     commands: &Sender<Command>,
-    driver: &crate::driver::DriverControl,
+    driver: &DriverControl,
 ) {
     // Full-width log bar: driver phase + lifecycle/startup log. Added before
     // the side panels so it spans the whole window.

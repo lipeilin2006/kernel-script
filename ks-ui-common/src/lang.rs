@@ -2,10 +2,12 @@
 //!
 //! Both tables are `Strings` structs, so a key that exists in one language
 //! must exist in the other — a missing translation is a compile error, not
-//! a blank label. The choice is process-wide (one atomic: the GUI renders
+//! a blank label. The choice is process-wide (one atomic: the UI renders
 //! on a single thread and the worker only reads it), toggled from the
-//! top-right corner of the memory tool, and persisted in the Lua config
-//! store as `gui.language` (`"zh"` / `"en"`).
+//! top-right corner of `ks-inspector`'s tab row (and of the overlay's
+//! control window), and persisted in the Lua config store as
+//! `gui.language` (`"zh"` / `"en"`). Both apps read the same `config.json`
+//! when they live in one directory, so the choice carries over.
 
 use std::sync::atomic::{AtomicU8, Ordering};
 
@@ -117,12 +119,11 @@ pub fn toggle_widget(ui: &mut egui::Ui, config: &SharedConfigStore) {
 
 /// Every UI string in one language.
 pub struct Strings {
-    // Window chrome and the overlay fallback window.
+    // Window chrome and the overlay control window.
     pub app_title: &'static str,
     pub overlay_title: &'static str,
-    pub reopen_tool: &'static str,
     pub quit: &'static str,
-    // Memory-tool chrome.
+    // Inspector chrome.
     pub log: &'static str,
     pub process: &'static str,
     pub pid: &'static str,
@@ -212,9 +213,8 @@ pub struct Strings {
 }
 
 static ZH: Strings = Strings {
-    app_title: "KernelScript - 内存工具",
-    overlay_title: "内存工具",
-    reopen_tool: "重新打开内存工具",
+    app_title: "KernelScript Inspector - 内存工具",
+    overlay_title: "KernelScript",
     quit: "退出程序",
     log: "日志",
     process: "进程",
@@ -288,9 +288,8 @@ static ZH: Strings = Strings {
 };
 
 static EN: Strings = Strings {
-    app_title: "KernelScript - Memory Tool",
-    overlay_title: "Memory Tool",
-    reopen_tool: "Reopen Memory Tool",
+    app_title: "KernelScript Inspector - Memory Tool",
+    overlay_title: "KernelScript",
     quit: "Quit",
     log: "Log",
     process: "Process",
@@ -383,7 +382,6 @@ mod tests {
         let all = [
             en.app_title,
             en.overlay_title,
-            en.reopen_tool,
             en.quit,
             en.log,
             en.process,

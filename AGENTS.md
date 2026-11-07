@@ -4,7 +4,7 @@
 
 ## Project Scope
 
-`kernel-script` is a Windows-only Rust workspace with six crates:
+`kernel-script` is a Windows-only Rust workspace with nine crates:
 
 - `ks-core`: shared `no_std`, allocation-free protocol and ring-layout
   definitions (postcard/serde/heapless only; no Windows API dependencies).
@@ -42,8 +42,8 @@
   whole table in order until one maps the driver. Neither the target
   image nor anything else mapper-related
   is ever compiled: no `build.rs`, no `cc`, no MSVC requirement for the
-  workspace build. `ks-gui`, `ks-test` and `ks-hook-test` depend on
-  `ks-sdk` (not `ks-link` directly).
+  workspace build. `ks-gui`, `ks-inspector`, `ks-ui-common`, `ks-test` and
+  `ks-hook-test` depend on `ks-sdk` (not `ks-link` directly).
 - `ks-hook-test`: minimal end-to-end harness for the kernel hook API. It
   starts (or reuses) the driver, checks the SDK guard rails, runs the
   driver's own hook self tests (`HookOp::SelfTest`: create → enable →
@@ -52,31 +52,40 @@
   against a function in its own process (`pid = own pid`), and stops the
   driver. It never patches foreign code; a `0` result means the platform
   refused the write (HVCI). Release builds embed the elevation manifest.
-- `ks-gui`: user-mode egui GUI and Lua runtime, hosted by the `egui_overlay`
+- `ks-gui`: the overlay application: user-mode egui overlay and Lua
+   runtime, hosted by the `egui_overlay`
    stack (GLFW click-through window via `egui_window_glfw_passthrough`,
    `three_d` OpenGL backend via `egui_render_three_d`, direct `glow` calls
    for viewport management). It owns the
-   Lua VM, the synchronous `sync_ipc` facade over `ks-sdk` (the re-exported
-   link API), the draw command
-   pipeline, and the Lua config store (`config.json`, module
-   `ks-gui/src/config_store.rs`). Runs elevated (embedded
+   Lua VM, the draw command
+   pipeline and the Lua script hot reload. The memory tool is no longer
+   embedded here: its only chrome is a small control window showing the
+   driver phase, the `中文 / EN` toggle and the `退出程序` button (which
+   only closes the overlay; the driver shutdown runs after the render loop
+   returns, in `driver::finish_on_exit`). Runs elevated (embedded
    `requireAdministrator` manifest) because the driver's section DACL only
-    grants SYSTEM and Administrators. It also owns the driver lifecycle
-    (`ks-gui/src/driver.rs`): a startup probe silently reuses a live
-    driver or starts one through `ks_sdk::start()` on a background worker
-    at launch, and the memory-tool window's bottom log bar shows the
-    current driver phase, a scrollable startup log (the lifecycle
-    narrative plus the `trying provider <id>` lines from the ks_sdk log
-    sink) and a `退出程序` button (which only closes the overlay; the
-    `ks_sdk::stop()` shutdown runs after the render loop returns, in
-    `driver::finish_on_exit`), and `sync_ipc` is gated while a job can
-    close or replace the process-wide session (`ks_link::close_session`).
+    grants SYSTEM and Administrators.
+- `ks-inspector`: the standalone Cheat Engine-style memory tool (formerly
+  the second window inside `ks-gui`). It owns a decorated GLFW window, its
+  own `egui::Context`, its own `ThreeDBackend` and its own event loop:
+  process list on the left, a full-width driver log bar at the bottom
+  (phase plus lifecycle/startup log) and a tabbed centre (`内存查看` /
+  `Lua 脚本` / `修改`, Ctrl+1/2/3). Every driver round trip runs on its one
+  worker thread through the shared gated `sync_ipc` facade, never on the
+  render thread. It also writes `ks-inspector.log` and embeds the
+  `requireAdministrator` manifest in release builds.
+- `ks-ui-common`: shared user-mode infrastructure for the two desktop
+  apps: the silent driver lifecycle (`driver`, including the `sync_ipc`
+  gate and the `other_app_running` coexistence check), the blocking
+  `sync_ipc` facade, the persisted config store (`config.json`), the
+  bilingual string tables (`lang`) and the Chinese-font installer. Both
+  apps depend on it so the two binaries cannot drift apart.
 
 The intended data flow is:
 
 ```text
-Lua (synchronous call)
-    -> ks-gui sync_ipc (blocking)
+ks-gui Lua (synchronous call)      ks-inspector worker (synchronous call)
+    -> ks-gui sync_ipc (blocking)      -> ks-ui-common sync_ipc (blocking)
     -> ks-sdk re-export -> ks-link ring round trip (mutex + section + events)
     -> ks-driver worker system thread
         -> request execution (target-process memory access, lock table
@@ -129,12 +138,24 @@ one.
 - Lua VM objects must only be accessed by the GUI Lua thread. Never send
   `Lua`, `Thread`, `Function`, or registry keys to worker threads.
 - Lua scripts have no filesystem access. All persistent script state goes
-  through the `config` API (`ks-gui/src/config_store.rs`): typed scalar
-  entries only, bounded sizes, debounced atomic writes to `config.json`.
+  through the `config` API (`ks-ui-common/src/config_store.rs`): typed
+  scalar entries only, bounded sizes, debounced atomic writes to
+  `config.json`.
 - Background workers may send only task IDs and owned plain data back to
   the GUI thread.
+- Shared UI plumbing (driver lifecycle, `sync_ipc`, config store, string
+  tables, font installer) lives in `ks-ui-common` only. Do not copy it
+  back into `ks-gui` or duplicate it in `ks-inspector`: both binaries must
+  link the same implementation so their driver rules cannot drift apart.
+- `ks-inspector` never calls `sync_ipc` on its render thread: every driver
+  round trip runs on its single worker thread, and the UI only exchanges
+  owned `Command`/`Event` values with it.
 
-## GUI and Lua Lifecycle
+## GUI, Inspector and Lua Lifecycle
+
+Only `ks-gui` hosts Lua; `ks-inspector` is a plain memory tool with no
+script runtime. Both share the driver lifecycle and the `sync_ipc` facade
+through `ks-ui-common`.
 
 The GUI frame lifecycle is:
 
@@ -154,22 +175,22 @@ Rules:
 - Hot reload destroys the old Lua VM.
 - Multiple Lua scripts are loaded from `scripts/*.lua`; they run on the
   GUI Lua thread. A missing or empty `scripts` directory is **not** an
-  error: the overlay loop, the `KernelScript` driver window and the
-  memory-tool window all run without Lua.
-- The independent Cheat Engine-style memory tool
-  (`ks-gui/src/ce_window.rs`) is a second, ordinary decorated glfw window
-  created on the GUI thread with its own `egui::Context` and
-  `ThreeDBackend`. It opens automatically at startup; closing it leaves
-  the overlay running (the overlay's `内存工具` window reopens it). Layout:
+  error: the overlay loop and its `KernelScript` control window run
+  without Lua, and `ks-inspector` is a separate process anyway.
+- The Cheat Engine-style memory tool is the standalone `ks-inspector`
+  executable (it used to be a second window inside `ks-gui`). It owns a
+  decorated GLFW window, its own `egui::Context`, its own `ThreeDBackend`
+  and its own event loop; it shares no egui state and no GL context with
+  the overlay. Layout:
   the process list on the left, a full-width log bar at the bottom (driver
   phase plus lifecycle/startup
   log) and a tabbed centre (`内存查看` / `Lua 脚本` / `修改`, also
   Ctrl+1/2/3). A `中文 / EN` toggle sits at the top-right of the tab row
-  (and in the overlay's fallback window) and switches the whole UI
+  (and in the overlay's control window) and switches the whole UI
   language; the choice persists in `config.json` under `gui.language` and
   is restored before the first frame. Both languages are two `Strings`
-  tables in `ks-gui/src/lang.rs`, so a missing translation is a compile
-  error rather than a blank label:
+  tables in `ks-ui-common/src/lang.rs` (shared by both apps), so a missing
+  translation is a compile error rather than a blank label:
   - `内存查看`: hex view anchored at the target's module base, paged
     forward in a selectable length (256 B - 4 KiB); the current page is
     re-read every frame through the worker and changed bytes are
@@ -185,28 +206,35 @@ Rules:
     through the driver lock table; clicking an address jumps the hex tab
     to its page.
 
-  Each frame the window renders into its own GL context (re-asserting the
-  full-window viewport, because `three_d` resets it) and then makes the
-  overlay window current again before the overlay's own pass, which
-  `gui_run` relies on. Every driver operation the window offers (process
+  Each inspector frame makes its own GL context current **before any GL
+  call** (`resize_framebuffer` issues `glViewport` and `three_d` resets
+  the viewport) and re-asserts its full-window viewport for the presenter.
+  An iconified window skips all GL work (its framebuffer is empty) and
+  returns immediately. Every driver operation the window offers (process
   list, module base, hex reads, value reads/writes/locks) runs on its one
   worker thread through the gated `sync_ipc` facade — never on the render
   thread.
-- Driver start/stop lives in `ks-gui/src/driver.rs` and is silent: the
-  startup probe spawns a background worker running `ks_sdk::start()` when
-  no live instance answers, and `driver::finish_on_exit` runs
-  `ks_sdk::stop()` after the render loop returns. The memory-tool window's
-  bottom log bar shows the current phase (`probing...` / `starting...` /
+- Driver start/stop lives in `ks-ui-common/src/driver.rs` and is silent:
+  the startup probe spawns a background worker running `ks_sdk::start()`
+  when no live instance answers, and `driver::finish_on_exit` runs
+  `ks_sdk::stop()` after the render loop returns. The inspector's bottom
+  log bar shows the current phase (`probing...` / `starting...` /
   `running`, or the start error in red) above a scrollable startup log —
   the lifecycle narrative plus the `trying provider <id>` lines the ks_sdk
-  log sink receives. The overlay itself shows no driver information, only
-  the Lua script windows (plus a small reopen/quit window while the
-  memory tool is closed). While such a job is in flight
+  log sink receives; the overlay's small control window shows the phase
+  and the quit button. While such a job is in flight
   every `sync_ipc` call fails immediately with "the driver is
   starting". The gate is what makes `ks_link::close_session`
   safe: the job may free the process-wide session on its way out, and the
   single-threaded Lua rule plus the flag guarantees no round trip is in
   flight when it does.
+- The two apps may run side by side and share one driver: the driver's
+  single-instance guard makes the second app reuse the live instance
+  instead of mapping a second copy. `driver::finish_on_exit` therefore
+  stops the driver only when no other `ks-gui.exe` / `ks-inspector.exe`
+  process is running (Toolhelp enumeration through `ks_sdk::list`), so the
+  last app to close cleans up — including an instance left behind by a
+  crashed run — while closing one app leaves the driver serving the other.
 
 Supported synchronous Luau operations include:
 
@@ -588,6 +616,13 @@ is required:
 cargo build --profile gui-release -p ks-gui
 ```
 
+`ks-inspector` has no `catch_unwind`, so the normal release profile is
+correct for it:
+
+```powershell
+cargo build --release -p ks-inspector
+```
+
 The normal release profile intentionally uses `panic = "abort"` for
 fail-fast components such as the driver and must not be used when GUI
 `catch_unwind` recovery is required.
@@ -731,7 +766,8 @@ needs a `binPath`):
 - Progress/log lines go through the internal `emit` (default: stdout
   with the historic `kdu: ` prefix; ks-test installs a sink into its
   step log). The line format `trying provider <id>` is load-bearing —
-  ks-gui's startup log and the tests grep it.
+  `ks-inspector`'s startup log shows it (the overlay's control window
+  shows only the phase) and the tests grep it.
 - The shellcode V3 machine code (`shellcode.rs`, `SHELLCODE_V3`) is
   position-independent machine code extracted once from the verified
   MSVC build of KDU's `shellcode.cpp` by
@@ -857,14 +893,20 @@ Before considering a change complete:
 4. For driver changes, build `ks-driver --release --bin ks-driver
    --features wdk` using WDK 26100, verify the import table lists
    `ntoskrnl.exe` only, copy the image to `ks-sdk/assets/ks-driver.sys`
-   and rebuild `ks-test` (the image is embedded with `include_bytes`).
-   For mapper changes, also run `cargo fmt`/`clippy` inside the
+   and rebuild every embedded consumer: `ks-test`, `ks-gui` and
+   `ks-inspector` (the image is embedded with `include_bytes` through
+   `ks-sdk`). For mapper changes, also run `cargo fmt`/`clippy` inside the
    dt-loader checkout and run `drvtest7.ps1` elevated (the default KDU
    mode exercises the Rust mapper end to end).
 5. Check `cargo tree -e features` when changing dependencies.
 6. Search for stale synchronous Lua calls after changing the Lua API.
-7. If artifacts are deployed to the VM, verify SHA256 hashes.
-8. Do not load an unverified native driver image in a test environment.
+7. For UI changes, run both apps side by side (elevated): `ks-gui` must
+   keep its overlay/control window working while `ks-inspector` reads the
+   same driver, closing either one must leave the other's session alive,
+   and only the last app to close may remove the driver (registry
+   publication gone, `ks-test shutdown` reports nothing live).
+8. If artifacts are deployed to the VM, verify SHA256 hashes.
+9. Do not load an unverified native driver image in a test environment.
 
 ## Known Warnings and Limitations
 
@@ -873,18 +915,23 @@ Before considering a change complete:
 - Process names and process metadata are collected in user mode by
   Toolhelp in `ks-link`; a PID is not a permanent process identity because
   Windows can reuse PIDs.
-- The GUI's OpenGL host is the native GLFW window from the `egui_overlay`
+- `ks-gui`'s OpenGL host is the native GLFW window from the `egui_overlay`
   stack (`egui_window_glfw_passthrough` + `egui_render_three_d`); direct GL
-  calls (viewport, clear) go through `glow`. The window currently uses the
-  default opaque window configuration. `egui` is pinned at 0.29 by
+  calls (viewport, clear) go through `glow`. `ks-inspector` also renders
+  through `egui_render_three_d`/`glow`, but on its own decorated GLFW
+  window, `egui::Context` and event loop. `egui` is pinned at 0.29 by
   `egui_overlay` 0.9.0, whose upstream has been dormant since early 2025 —
   a newer egui would require forking/vendoring the whole overlay stack
   (egui_overlay is 0.9's `egui ^0.29` lockstep family), not a version bump.
-- The GUI loads the first available `msyh.ttc`, `simsun.ttc`, or
-  `simhei.ttf` from `C:\Windows\Fonts` so Chinese Lua/UI text renders on
-  Windows. The GUI and release `ks-test` binaries embed a
+- Both apps load the first available `msyh.ttc`, `simsun.ttc`, or
+  `simhei.ttf` from `C:\Windows\Fonts` (shared installer in
+  `ks-ui-common/src/font.rs`) so Chinese Lua/UI text renders on Windows.
+  `ks-gui`, `ks-inspector` and release `ks-test` binaries embed a
   `requireAdministrator` manifest (debug/test builds skip it so
-  `cargo test` can run unelevated).
+  `cargo test` can run unelevated). `ks-gui` builds with the
+  `gui-release` profile when runtime panic recovery is required;
+  `ks-inspector` has no `catch_unwind` and builds with the normal
+  `release` profile.
 - The driver internally exposes normal memory I/O (`Read`/`Write` without
   `mdl`) alongside separate MDL-remap I/O (`mdl = true`); the `rva` flag
   is orthogonal and resolves the address against the target module base.
