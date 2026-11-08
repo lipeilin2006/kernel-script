@@ -105,8 +105,9 @@ pub fn fill(template: &str, args: &[&dyn std::fmt::Display]) -> String {
     out
 }
 
-/// Draws the 中文 / EN toggle. Add it inside a `right_to_left` layout to
-/// pin the pair to the top-right corner; `EN` ends up rightmost.
+/// Draws the 中文 / EN toggle (`中文` left of `EN`, rightmost is `EN`).
+/// `ks-inspector` right-aligns it in its tab row; the overlay's compact
+/// control window keeps it in a plain horizontal row.
 pub fn toggle_widget(ui: &mut egui::Ui, config: &SharedConfigStore) {
     let current = lang();
     if ui.selectable_label(current == Lang::En, "EN").clicked() && current != Lang::En {

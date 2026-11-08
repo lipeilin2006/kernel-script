@@ -153,13 +153,16 @@ impl KernelScriptApp {
                 } else {
                     ui.label(text);
                 }
+                // One compact row for the two controls. Do not wrap this in
+                // a `right_to_left` layout: that child ui starts at the far
+                // right of the available rect and its centered cross-axis
+                // alignment stretches the auto-sized window to most of the
+                // screen height.
                 ui.horizontal(|ui| {
+                    crate::lang::toggle_widget(ui, &self.runtime.config_store());
                     if ui.button(crate::lang::s().quit).clicked() {
                         glfw_backend.window.set_should_close(true);
                     }
-                });
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    crate::lang::toggle_widget(ui, &self.runtime.config_store());
                 });
             });
     }
