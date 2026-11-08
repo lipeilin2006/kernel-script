@@ -52,9 +52,20 @@ if ($exited) {
         $k.GetValueNames() | ForEach-Object { W "  value: $_ = $($k.GetValue($_))" }
     }
 
-    # Screenshot the top-left corner so the control window can be verified
-    # visually (driver: running above the Quit button).
+    # Screenshot the top of the screen so the control window and the
+    # top-right FPS readout can be verified visually. PowerShell starts
+    # DPI-unaware, which makes Screen.Bounds return the 125%-scaled logical
+    # size and would crop the FPS readout out of the capture; lock
+    # Per-Monitor V2 first so the bitmap covers the full physical screen.
     try {
+        Add-Type @'
+using System;
+using System.Runtime.InteropServices;
+public static class GuiDpi {
+    [DllImport("user32.dll")] public static extern bool SetProcessDpiAwarenessContext(IntPtr value);
+}
+'@
+        [GuiDpi]::SetProcessDpiAwarenessContext([IntPtr](-4)) | Out-Null
         Add-Type -AssemblyName System.Drawing
         Add-Type -AssemblyName System.Windows.Forms
         $bounds = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
@@ -65,7 +76,7 @@ if ($exited) {
         Remove-Item $shot -ErrorAction SilentlyContinue
         $bmp.Save($shot, [System.Drawing.Imaging.ImageFormat]::Png)
         $g.Dispose(); $bmp.Dispose()
-        W "screenshot saved=$shot"
+        W "screenshot saved=$shot size=$($bounds.Width)x$([Math]::Min(400, $bounds.Height))"
     } catch { W "screenshot failed: $_" }
 
     # Close through the same path the Quit button takes: WM_CLOSE makes
@@ -97,6 +108,16 @@ if ($exited) {
 W "ks-gui.log exists=$(Test-Path $guiLog)"
 if (Test-Path $guiLog) {
     Get-Content $guiLog | ForEach-Object { W "  log: $_" }
+    $logText = Get-Content $guiLog -Raw
+    # D3D11 overlay invariants: the renderer must have been created and the
+    # 100 Hz display loop entered (a GL/three_d regression or a silent
+    # fallback would miss these).
+    foreach ($needle in @(
+        'overlay: d3d11 + DWM blur-behind backend',
+        'entering overlay display loop'
+    )) {
+        W "log contains '$needle'=$($logText.Contains($needle))"
+    }
 }
 if (Test-Path $errPath) {
     Get-Content $errPath | ForEach-Object { W "  stderr: $_" }

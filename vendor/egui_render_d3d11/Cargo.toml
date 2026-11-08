@@ -1,0 +1,26 @@
+[package]
+name = "egui_render_d3d11"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+description = "egui rendering backend using D3D11 + DWM transparency (ks-td2 vendor)"
+
+[lib]
+name = "egui_render_d3d11"
+path = "src/lib.rs"
+
+[dependencies]
+bytemuck = { version = "1", default-features = false }
+egui = { version = "0.36.2", default-features = false, features = ["bytemuck"] }
+tracing = { version = "0.1", default-features = false }
+windows = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_Graphics_Dwm",
+    "Win32_Graphics_Gdi",
+    "Win32_UI_WindowsAndMessaging",
+] }

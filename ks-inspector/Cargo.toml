@@ -7,7 +7,9 @@ rust-version.workspace = true
 [dependencies]
 ks-sdk.workspace = true
 ks-ui-common.workspace = true
-egui_overlay.workspace = true
+egui_window_glfw_passthrough.workspace = true
+egui_render_d3d11.workspace = true
 egui.workspace = true
+windows-sys = { workspace = true, features = ["Win32_UI_HiDpi", "Win32_Media"] }
 tracing.workspace = true
 tracing-subscriber.workspace = true

@@ -8,15 +8,18 @@ use std::sync::{Arc, Mutex};
 
 use mlua::{Function, Lua, Table};
 
+use super::UiRectHandle;
+
 pub fn create_ui_module<'scope>(
     lua: &Lua,
     scope: &'scope mlua::Scope<'scope, '_>,
     ctx: &'scope egui::Context,
     ui_visible: bool,
+    ui_rect: &'scope UiRectHandle,
 ) -> mlua::Result<Table> {
     let module = lua.create_table()?;
     let bridge = Arc::new(Mutex::new(0usize));
-    add_window(&module, scope, ctx, ui_visible, &bridge)?;
+    add_window(&module, scope, ctx, ui_visible, &bridge, ui_rect)?;
     add_basic_widgets(&module, scope, &bridge)?;
     add_sliders(&module, scope, &bridge)?;
     add_choices(&module, scope, &bridge)?;
@@ -33,6 +36,7 @@ fn add_window<'scope>(
     ctx: &'scope egui::Context,
     ui_visible: bool,
     bridge: &Arc<Mutex<usize>>,
+    ui_rect: &'scope UiRectHandle,
 ) -> mlua::Result<()> {
     let bridge = Arc::clone(bridge);
     let bridge_for_window = Arc::clone(&bridge);
@@ -46,13 +50,16 @@ fn add_window<'scope>(
                 return Ok(());
             }
             let callback_error = std::cell::RefCell::new(None);
-            egui::Window::new(title).show(ctx, |ui| {
+            let response = egui::Window::new(title).show(ctx, |ui| {
                 *bridge_for_window.lock().unwrap() = ui as *mut egui::Ui as usize;
                 if let Err(error) = body.call::<()>(()) {
                     *callback_error.borrow_mut() = Some(error);
                 }
                 *bridge_for_window.lock().unwrap() = 0;
             });
+            if let Some(response) = response {
+                record_ui_rect(ui_rect, response.response.rect);
+            }
             match callback_error.into_inner() {
                 Some(error) => Err(error),
                 None => Ok(()),
@@ -348,7 +355,8 @@ fn add_containers<'scope>(
     }
 
     // Row container: widgets drawn inside the body share one horizontal row
-    // (egui 0.29 has no `Ui::same_line`; `horizontal` is the row primitive).
+    // (`horizontal` is the row primitive; `same_line` only joins the current
+    // row, it does not start one).
     {
         let bridge = Arc::clone(&bridge);
         module.set(
@@ -509,6 +517,17 @@ fn add_text_widgets<'scope>(
     }
 
     Ok(())
+}
+
+/// Grows the per-frame window union. Every egui window that accepts input
+/// (Lua `ui.window`, the host control window, the Lua error window) records
+/// its outer rect here; the overlay host turns that union into the
+/// click-through region for the next frame.
+pub(crate) fn record_ui_rect(handle: &UiRectHandle, rect: egui::Rect) {
+    handle.set(Some(match handle.get() {
+        Some(existing) => existing.union(rect),
+        None => rect,
+    }));
 }
 
 fn with_egui_ui<R>(

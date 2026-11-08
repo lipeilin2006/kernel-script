@@ -8,8 +8,8 @@ rust-version.workspace = true
 ks-core.workspace = true
 ks-ui-common.workspace = true
 egui_overlay.workspace = true
+egui_render_d3d11.workspace = true
 egui.workspace = true
-glow = "0.13"
 mlua.workspace = true
 notify.workspace = true
 tracing.workspace = true
@@ -18,8 +18,10 @@ windows-sys = { workspace = true, features = [
     "Win32_Foundation",
     "Win32_UI_WindowsAndMessaging",
     "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_HiDpi",
     "Win32_Graphics_Dwm",
     "Win32_Graphics_Gdi",
     "Win32_Storage_FileSystem",
     "Win32_System_IO",
+    "Win32_Media",
 ] }

@@ -25,7 +25,8 @@ Notes:
 - `OnStart` is called once after the script is loaded.
 - `OnUpdate(delta_time)` is the only per-frame callback. `delta_time` is the
   elapsed time since the previous frame in seconds; it is `0` while the engine
-  is paused. The overlay frame rate is capped at 60 Hz.
+  is paused. The overlay runs at a 100 Hz display cadence and shows the
+  achieved rate in the top-right FPS readout.
 - UI and draw APIs are available during `OnUpdate`.
 - Keyboard state is snapshotted once per frame before `OnUpdate`; queries and
   press latches are consistent within a frame.
@@ -209,7 +210,7 @@ Constraints:
 Keyboard queries read the physical key state of the whole desktop
 (`GetAsyncKeyState`), so they work while another window owns input focus.
 The engine snapshots all keys once per frame; `is_key_press` reports a
-down-edge since the previous frame (60 Hz detection granularity).
+down-edge since the previous frame (100 Hz detection granularity).
 
 `key` accepts a name or a raw virtual-key code (integer 0–255). Recognized
 names: `"a"`–`"z"`, `"0"`–`"9"`, `"f1"`–`"f24"`, `"space"`, `"tab"`,
@@ -736,8 +737,9 @@ Each window rect contains:
 { x = 100, y = 50, width = 800, height = 600 }
 ```
 
-Coordinates are in egui logical points (physical pixels divided by
-`content_scale`). Use this for overlay rendering with `draw.*`.
+Coordinates are in egui logical points: physical pixels divided by the target
+window's own monitor DPI scale (the same logical space the overlay draws in).
+Use this for overlay rendering with `draw.*`.
 
 ```lua
 local rects = memory.get_window_rect(pid)
@@ -805,7 +807,10 @@ print("took", engine.time_us() - t0, "us")
 
 Draw commands render on the transparent fullscreen overlay window. All draw
 calls must be made inside `OnUpdate`. Coordinates are in egui logical points
-(physical pixels divided by `content_scale`).
+(physical pixels divided by the target window's monitor DPI scale); the
+overlay subtracts its own window origin and applies the fixed whole-UI scale
+automatically, so rects from `memory.get_window_rect` can be passed straight
+through.
 
 Colors are RGBA bytes (`0..255`).
 
@@ -859,8 +864,9 @@ draw.text(x, y, "Hello", r, g, b, a, size)
 
 ## egui UI API
 
-UI APIs are called inside `OnUpdate`. The GUI uses `egui_overlay` with GLFW
-window and `glow` OpenGL backend for transparent fullscreen overlay rendering.
+UI APIs are called inside `OnUpdate`. The GUI uses the vendored `egui_overlay`
+stack: a GLFW NoApi fullscreen window with a D3D11 swap chain (egui 0.36) and
+DWM blur-behind transparency for transparent overlay rendering.
 
 ### ui.window
 
@@ -1127,8 +1133,9 @@ can comfortably fit 500+ synchronous memory reads per frame.
 - Memory read/write and RVA computation are performed by the driver.
 - Window rect enumeration runs in the GUI process (user session).
 - Draw commands must be called inside `OnUpdate`.
-- Coordinates are in egui logical points; divide physical pixels by
-  `content_scale` for correct overlay alignment.
+- Coordinates are in egui logical points (physical pixels divided by the
+  target window's monitor DPI scale); the overlay applies its own window
+  origin and fixed UI scale for correct alignment.
 - Transport is one named section plus two named events (plus a
   client-side mutex), all created by the driver.
 - Kernel objects are protected by a hand-built DACL granting SYSTEM and

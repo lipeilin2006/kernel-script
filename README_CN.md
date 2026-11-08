@@ -20,8 +20,8 @@
    关闭的那个负责静默关闭驱动。
 
 现在没有用户态 service：两个程序都通过共享内存 ring 直接与驱动通信。独立诊断
-请在提升权限的终端中运行 `ks-test.exe`（full 模式）。两个程序都使用 OpenGL，
-必须从交互式桌面会话运行。
+请在提升权限的终端中运行 `ks-test.exe`（full 模式）。两个程序都通过 D3D11
+交换链呈现，必须从交互式桌面会话运行。
 
 Kernel Script 是一个仅面向 Windows 的 Rust 工作区，用于通过共享内存 ring
 传输和 WDM driver 执行 Luau 脚本。数据流如下：
@@ -45,7 +45,8 @@ ks-gui Lua（同步调用）              ks-inspector worker（同步调用）
   输入焦点时同样有效。
 - 持续内存锁：每次 lock 调用以一次往返修改 driver 内部锁表；worker 线程在请求
   间隙逐条重放（持锁期间轮询请求事件、请求优先，锁表为空时阻塞等待不耗 CPU）。
-- EgUI 透明覆盖层和缓存绘制命令。
+- EgUI 0.36 透明覆盖层，经 D3D11 交换链渲染；绘制命令每帧重新生成，显示循环
+  100Hz，右上角显示 FPS。
 - 独立的 `ks-inspector` 内存工具：进程列表、以模块基址为锚点分页的十六进制
   视图、Lua 脚本编辑器、数值修改器和驱动完整锁表，并带一个把选择持久化到
   `config.json` 的 `中文 / EN` 开关。它与 `ks-gui` 共用同一个驱动（单实例
@@ -110,10 +111,10 @@ function OnDestroy() end
 ```
 
 - `OnStart` 在加载后执行一次。
-- `OnUpdate` 是唯一的每帧回调。整个覆盖层（渲染 + OnUpdate）帧率封顶 60Hz；
-  回调变慢只会降低帧率。参数 `delta_time` 是距离上一帧的秒数，引擎暂停时为
-  `0`。它在一次调用中完成计算、同步内存操作、UI 和绘制。
-  预算超时仅记录告警，不会报错。
+- `OnUpdate` 是唯一的每帧回调。整个覆盖层（渲染 + OnUpdate）按 100Hz 显示
+  节奏运行；回调变慢只会降低帧率，右上角显示实际帧率。参数 `delta_time` 是距离
+  上一帧的秒数，引擎暂停时为 `0`。它在一次调用中完成计算、同步内存操作、UI 和
+  绘制。预算超时仅记录告警，不会报错。
 - 回调运行在 GUI Lua 线程；每次内存 API 调用阻塞一次 ring 往返
   （约 10-15 us），因此脚本应限制单次工作量。
 - `OnDestroy` 在热重载和退出时执行。
@@ -176,7 +177,7 @@ Native subsystem、`DriverEntry` 入口点，并确认导入表只有 `ntoskrnl.
 Administrators，因此 `ks-gui` 和 `ks-inspector`（都内嵌
 `requireAdministrator` 清单）需要以提升权限运行。
 
-两者都必须从交互式桌面运行，因为 OpenGL 需要窗口站。Lua 脚本从 `ks-gui`
+两者都必须从交互式桌面运行，因为 D3D11 需要窗口站。Lua 脚本从 `ks-gui`
 可执行文件旁的 `scripts` 目录加载。文件名 stem 以下划线开头的脚本保留用于
 手动测试，但默认不会加载。
 

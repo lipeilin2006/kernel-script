@@ -11,6 +11,7 @@ Cargo.lock.old
 
 # Test artifacts
 gui_status.png
+coexist_status.png
 dumps/
 kdu-drivers/
 

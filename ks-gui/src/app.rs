@@ -1,17 +1,11 @@
-use std::cell::Cell;
 use std::error::Error;
-use std::rc::Rc;
 use std::time::Instant;
-
-use egui_overlay::egui_render_three_d::{ThreeDBackend, ThreeDConfig};
-use egui_overlay::egui_window_glfw_passthrough::{
-    self as glfw_passthrough, GlfwBackend, GlfwConfig,
-};
-use egui_overlay::EguiOverlay;
 
 use ks_ui_common::install_chinese_font;
 
-use crate::lua_runtime::LuaRuntimeManager;
+use crate::lua_runtime::{LuaRuntimeManager, UiRectHandle};
+
+mod runtime;
 
 #[cfg(target_os = "windows")]
 mod win32 {
@@ -43,12 +37,25 @@ mod win32 {
     }
 }
 
-struct KernelScriptApp {
+/// Whole-UI scale, matching the ks-td2 overlay. `Ctrl +/-/0` zoom is
+/// disabled: while another window (the game) owns input, egui's keyboard
+/// zoom would rescale the overlay in the middle of aiming.
+pub(crate) const UI_SCALE: f32 = 0.8;
+
+/// Overlay presentation cadence: 100 Hz. Lua `OnUpdate` runs once per
+/// presented frame, i.e. at this rate.
+pub(crate) const FRAME_INTERVAL: std::time::Duration = std::time::Duration::from_micros(10_000);
+
+pub(crate) struct KernelScriptApp {
     runtime: LuaRuntimeManager,
     driver: crate::driver::DriverControl,
     fonts_installed: bool,
     ui_visible: bool,
     insert_was_down: bool,
+    pub(crate) quit_requested: bool,
+    /// Smoothed actual presentation rate, shown top-right.
+    pub(crate) fps_ema: f32,
+    last_frame_at: Instant,
 }
 
 impl KernelScriptApp {
@@ -69,26 +76,22 @@ impl KernelScriptApp {
             fonts_installed: false,
             ui_visible: true,
             insert_was_down: false,
+            quit_requested: false,
+            fps_ema: 0.0,
+            last_frame_at: Instant::now(),
         })
     }
-}
 
-impl EguiOverlay for KernelScriptApp {
-    fn gui_run(
-        &mut self,
-        ctx: &egui::Context,
-        default_gfx_backend: &mut ThreeDBackend,
-        glfw_backend: &mut GlfwBackend,
-    ) {
-        // The overlay has no ordinary widget invalidation to drive repainting.
-        // Cap the whole overlay (render + OnUpdate) at 60 FPS so egui windows
-        // stay stable and slow Lua callbacks simply lower the frame rate.
-        ctx.request_repaint_after(crate::lua_runtime::FRAME_INTERVAL);
-        // Insert toggles the whole script UI (Lua windows and the small
-        // control window) while the draw.* overlay layer keeps rendering.
-        // GetAsyncKeyState reads the physical key state of the whole desktop,
-        // so the toggle works while another window (the game) owns input
-        // focus and the unfocused overlay never receives key events.
+    pub(crate) fn ui_rect_handle(&self) -> UiRectHandle {
+        self.runtime.ui_rect_handle()
+    }
+
+    /// Insert toggles the whole script UI (Lua windows and the compact
+    /// control window) while the `draw.*` overlay layer keeps rendering.
+    /// `GetAsyncKeyState` reads the physical key state of the whole desktop,
+    /// so the toggle works while the game owns input focus and the
+    /// click-through overlay never receives key events itself.
+    pub(crate) fn poll_input(&mut self) {
         let insert_down = unsafe {
             windows_sys::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState(
                 windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_INSERT as i32,
@@ -96,54 +99,46 @@ impl EguiOverlay for KernelScriptApp {
                 & 0x8000
                 != 0
         };
-        let toggle_requested = insert_down && !self.insert_was_down;
-        self.insert_was_down = insert_down;
-        if toggle_requested {
+        if insert_down && !self.insert_was_down {
             self.ui_visible = !self.ui_visible;
             tracing::info!(ui_visible = self.ui_visible, "script UI toggled");
         }
-        if !self.fonts_installed {
-            let _ = install_chinese_font(ctx);
-            let mut style = (*ctx.style()).clone();
-            style.visuals.window_fill = egui::Color32::from_rgba_premultiplied(20, 20, 20, 200);
-            style.visuals.panel_fill = egui::Color32::from_rgba_premultiplied(20, 20, 20, 200);
-            ctx.set_style(style);
-            self.fonts_installed = true;
-            unsafe {
-                use glow::HasContext;
-                default_gfx_backend
-                    .glow_backend
-                    .glow_context
-                    .clear_color(0.0, 0.0, 0.0, 0.0);
-            }
-        }
-        // Driver lifecycle first: apply finished worker jobs (this flips
-        // the sync_ipc gate) before this frame's Lua runs.
-        self.driver.poll();
-        if self.ui_visible {
-            self.control_window(ctx, glfw_backend);
-        }
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            self.runtime.frame(ctx, Instant::now(), self.ui_visible);
-        }));
-        if result.is_err() {
-            tracing::error!("panic recovered at GUI frame boundary");
-            self.runtime
-                .set_error("GUI frame callback panicked".to_owned());
-        }
-        let wants_input = ctx.is_pointer_over_area();
-        glfw_backend.set_passthrough(!wants_input);
-
-        crate::overlay::paint_commands(ctx, self.runtime.take_draw_commands());
+        self.insert_was_down = insert_down;
     }
-}
 
-impl KernelScriptApp {
+    pub(crate) fn ui_visible(&self) -> bool {
+        self.ui_visible
+    }
+
+    pub(crate) fn driver(&mut self) -> &mut crate::driver::DriverControl {
+        &mut self.driver
+    }
+
+    /// Installs the Chinese font and the translucent window theme once. The
+    /// font must be set before the first egui pass so the first frame already
+    /// lays out CJK labels with the right metrics.
+    pub(crate) fn ensure_chrome(&mut self, ctx: &egui::Context) {
+        if self.fonts_installed {
+            return;
+        }
+        let _ = install_chinese_font(ctx);
+        ctx.all_styles_mut(|style| {
+            let fill = egui::Color32::from_rgba_premultiplied(20, 20, 20, 200);
+            style.visuals.window_fill = fill;
+            style.visuals.panel_fill = fill;
+            style.visuals.extreme_bg_color =
+                egui::Color32::from_rgba_premultiplied(20, 20, 20, 240);
+        });
+        self.fonts_installed = true;
+    }
+
     /// The overlay's only chrome: driver status, the language toggle and
     /// the quit button. The memory tool is a separate application
     /// (`ks-inspector`), so the overlay no longer opens or embeds it.
-    fn control_window(&mut self, ctx: &egui::Context, glfw_backend: &mut GlfwBackend) {
-        egui::Window::new(crate::lang::s().overlay_title)
+    pub(crate) fn control_window(&mut self, ctx: &egui::Context, ui_rect: &UiRectHandle) {
+        let strings = crate::lang::s();
+        let mut quit = false;
+        let response = egui::Window::new(strings.overlay_title)
             .default_pos(egui::pos2(16.0, 16.0))
             .resizable(false)
             .show(ctx, |ui| {
@@ -160,11 +155,54 @@ impl KernelScriptApp {
                 // screen height.
                 ui.horizontal(|ui| {
                     crate::lang::toggle_widget(ui, &self.runtime.config_store());
-                    if ui.button(crate::lang::s().quit).clicked() {
-                        glfw_backend.window.set_should_close(true);
+                    if ui.button(strings.quit).clicked() {
+                        quit = true;
                     }
                 });
             });
+        if let Some(response) = response {
+            crate::lua_runtime::ui_api::record_ui_rect(ui_rect, response.response.rect);
+        }
+        if quit {
+            self.quit_requested = true;
+        }
+    }
+
+    /// Runs one Lua frame inside the active egui pass and paints the queued
+    /// `draw.*` commands on the background layer, below all windows.
+    pub(crate) fn run_lua_frame(
+        &mut self,
+        ctx: &egui::Context,
+        now: Instant,
+        ui_visible: bool,
+        origin: (f32, f32),
+        fps: f32,
+    ) {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.runtime.frame(ctx, now, ui_visible);
+        }));
+        if result.is_err() {
+            tracing::error!("panic recovered at GUI frame boundary");
+            self.runtime
+                .set_error("GUI frame callback panicked".to_owned());
+        }
+        let commands = self.runtime.take_draw_commands();
+        crate::overlay::paint_commands(ctx, &commands, origin);
+        crate::overlay::paint_fps(ctx, fps);
+    }
+
+    /// EMA-smoothed presentation rate, sampled once per displayed tick.
+    pub(crate) fn sample_fps(&mut self) {
+        let dt = self.last_frame_at.elapsed().as_secs_f32();
+        self.last_frame_at = Instant::now();
+        if dt > 0.0 {
+            let instantaneous = 1.0 / dt;
+            self.fps_ema = if self.fps_ema <= 0.0 {
+                instantaneous
+            } else {
+                self.fps_ema * 0.9 + instantaneous * 0.1
+            };
+        }
     }
 }
 
@@ -180,65 +218,9 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         }))
         .try_init();
 
-    let monitor_size: Rc<Cell<[u32; 2]>> = Rc::new(Cell::new([1920, 1080]));
-    let monitor_size_clone = monitor_size.clone();
-
-    let mut glfw_backend = GlfwBackend::new(GlfwConfig {
-        transparent_window: Some(true),
-        opengl_window: Some(true),
-        glfw_callback: Box::new(move |gtx| {
-            (glfw_passthrough::GlfwConfig::default().glfw_callback)(gtx);
-            gtx.window_hint(glfw_passthrough::glfw::WindowHint::ScaleToMonitor(true));
-            gtx.with_primary_monitor(|_, monitor| {
-                if let Some(monitor) = monitor {
-                    if let Some(video_mode) = monitor.get_video_mode() {
-                        monitor_size_clone.set([video_mode.width, video_mode.height]);
-                    }
-                }
-            });
-        }),
-        window_callback: Box::new(|window: &mut glfw_passthrough::glfw::Window| {
-            window.set_floating(true);
-            window.set_decorated(false);
-        }),
-        ..Default::default()
-    });
-
-    let [w, h] = monitor_size.get();
-    let h = h - 10;
-    glfw_backend.window.set_size(w as i32, h as i32);
-    glfw_backend.window.set_pos(0, 0);
-
-    {
-        let (sx, _sy) = glfw_backend.window.get_content_scale();
-        crate::lua_runtime::set_content_scale(sx);
-        tracing::info!(content_scale = sx, "content scale set");
-    }
-
-    #[cfg(target_os = "windows")]
-    unsafe {
-        use glfw_passthrough::glfw::ffi::glfwGetWin32Window;
-        let hwnd = glfwGetWin32Window(&mut glfw_backend.window as *mut _ as *mut _);
-        win32::enable_dwm_transparency(hwnd as *mut _);
-    }
-
-    let fb_size = glfw_backend.window.get_framebuffer_size();
-    let latest_size = [fb_size.0 as _, fb_size.1 as _];
-
-    let default_gfx_backend = ThreeDBackend::new(
-        ThreeDConfig::default(),
-        |s| glfw_backend.get_proc_address(s),
-        latest_size,
-    );
-
+    let (overlay, gfx) = runtime::create_overlay_window();
     let app = KernelScriptApp::new()?;
-    let overlap_app = egui_overlay::OverlayApp {
-        user_data: app,
-        egui_context: Default::default(),
-        default_gfx_backend,
-        glfw_backend,
-    };
-    overlap_app.enter_event_loop();
+    runtime::DisplayLoop { overlay, gfx, app }.run();
     // The loop only returns once the window is closed (the Quit button or
     // a WM_CLOSE): Lua and rendering are gone, so the driver can be shut
     // down synchronously here.

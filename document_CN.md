@@ -24,7 +24,7 @@ end
 
 - `OnStart` 在脚本加载后调用一次。
 - `OnUpdate(delta_time)` 是唯一的每帧回调。`delta_time` 是距离上一帧的秒数；
-  engine 暂停时为 `0`。覆盖层帧率封顶 60Hz。
+  engine 暂停时为 `0`。覆盖层按 100Hz 显示节奏运行，右上角显示实际帧率。
 - UI 和 draw API 都在 `OnUpdate` 中使用。
 - 键盘状态在每帧 `OnUpdate` 之前快照一次；同帧内查询与按下沿锁存保持一致。
 - `OnDestroy` 在热重载或 GUI 退出时调用。
@@ -199,7 +199,7 @@ config.save()
 
 键盘查询读取整个桌面的物理按键状态（`GetAsyncKeyState`），即使其他窗口
 （游戏）持有输入焦点也有效。引擎每帧对所有按键做一次快照；`is_key_press`
-报告自上一帧以来的按下沿（检测粒度为一帧，60Hz）。
+报告自上一帧以来的按下沿（检测粒度为一帧，100Hz）。
 
 `key` 接受按键名或原始虚拟键码（整数 0–255）。支持的名称：`"a"`–`"z"`、
 `"0"`–`"9"`、`"f1"`–`"f24"`、`"space"`、`"tab"`、`"enter"`/`"return"`、
@@ -679,8 +679,8 @@ local old, len = memory.protect_span(pid, address, 1, 0x40)
 { x = 100, y = 50, width = 800, height = 600 }
 ```
 
-坐标单位为 egui 逻辑点（物理像素除以 `content_scale`）。用于 `draw.*`
-覆盖层渲染。
+坐标单位为 egui 逻辑点：物理像素除以目标窗口所在显示器的 DPI 缩放，与
+覆盖层使用的逻辑空间一致。用于 `draw.*` 覆盖层渲染。
 
 ```lua
 local rects = memory.get_window_rect(pid)
@@ -743,7 +743,9 @@ print("耗时", engine.time_us() - t0, "us")
 ## Draw API
 
 Draw 命令在透明全屏覆盖窗口上渲染。所有 draw 调用必须在 `OnUpdate` 中
-执行。坐标单位为 egui 逻辑点（物理像素除以 `content_scale`）。
+执行。坐标单位为 egui 逻辑点（物理像素除以目标窗口所在显示器的 DPI
+缩放）；覆盖层会自动减去自身窗口原点并应用固定的整体 UI 缩放，因此
+`memory.get_window_rect` 返回的矩形可以直接传入。
 
 颜色为 RGBA 字节（`0..255`）。
 
@@ -797,8 +799,9 @@ draw.text(x, y, "你好", r, g, b, a, size)
 
 ## egui UI API
 
-Lua UI API 在 `OnUpdate` 中使用。GUI 当前使用 `egui_overlay` + GLFW 窗口 +
-`glow` OpenGL backend 实现透明全屏覆盖层渲染。
+Lua UI API 在 `OnUpdate` 中使用。GUI 当前使用 vendored `egui_overlay` 栈：
+GLFW NoApi 全屏窗口 + D3D11 交换链（egui 0.36）+ DWM blur-behind 透明，
+实现透明全屏覆盖层渲染。
 
 ### ui.window
 
@@ -1063,7 +1066,8 @@ GUI 到驱动的传输是同步共享内存 ring：
 - 内存读写和 RVA 计算由 driver 执行。
 - 窗口枚举在 GUI 进程（用户会话）中执行。
 - Draw 命令必须在 `OnUpdate` 中调用。
-- 坐标单位为 egui 逻辑点；物理像素需除以 `content_scale` 才能正确对齐。
+- 坐标单位为 egui 逻辑点（物理像素除以目标窗口所在显示器的 DPI 缩放）；
+  覆盖层自行处理窗口原点与固定 UI 缩放以保证对齐。
 - 传输使用一个命名 section 加两个命名事件（外加客户端互斥体），全部由
   driver 创建。
 - 内核对象由手工构建的 DACL 保护，仅授予 SYSTEM 和 Administrators；

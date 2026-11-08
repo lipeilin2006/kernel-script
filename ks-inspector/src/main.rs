@@ -11,13 +11,25 @@ mod inspector;
 
 use std::error::Error;
 
-use egui_overlay::egui_window_glfw_passthrough::glfw::{self, SwapInterval};
+use egui_window_glfw_passthrough::glfw;
 
 use ks_ui_common::config_store::ConfigStore;
 use ks_ui_common::driver::{self, DriverControl};
 
 fn main() {
-    if let Err(error) = run() {
+    // Lock Per-Monitor V2 before GLFW creates its first window; otherwise the
+    // process silently stays DPI-unaware and content scale reads 1.0.
+    unsafe {
+        windows_sys::Win32::UI::HiDpi::SetProcessDpiAwarenessContext(
+            windows_sys::Win32::UI::HiDpi::DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+        );
+        windows_sys::Win32::Media::timeBeginPeriod(1);
+    }
+    let result = run();
+    unsafe {
+        windows_sys::Win32::Media::timeEndPeriod(1);
+    }
+    if let Err(error) = result {
         eprintln!("Failed to run inspector: {error}");
     }
 }
@@ -52,9 +64,6 @@ fn run() -> Result<(), Box<dyn Error>> {
 
     let mut inspector = inspector::Inspector::new(&mut glfw, config)
         .map_err(|error| format!("create inspector window: {error}"))?;
-    // The window's context is current: cap the loop at the monitor refresh
-    // rate (the inspector always repaints, so without vsync it would spin).
-    glfw.set_swap_interval(SwapInterval::Sync(1));
 
     loop {
         glfw.poll_events();
@@ -64,9 +73,9 @@ fn run() -> Result<(), Box<dyn Error>> {
         }
     }
 
-    // Release the renderer while its GL context is still alive, then run the
-    // shared exit path (waits for an in-flight start, stops the driver when
-    // no other Kernel Script app is running, drops the session).
+    // Release the renderer, then run the shared exit path (waits for an
+    // in-flight start, stops the driver when no other Kernel Script app is
+    // running, drops the session).
     drop(inspector);
     driver::finish_on_exit();
     Ok(())

@@ -4,7 +4,7 @@
 //! state of the whole desktop — queries work while another window (the
 //! game) owns input focus. The engine snapshots all 256 virtual keys once
 //! per frame (`begin_frame`); queries within a frame read that snapshot, so
-//! detection granularity is one GUI frame (60 Hz). `is_key_press` latches a
+//! detection granularity is one GUI frame (100 Hz). `is_key_press` latches a
 //! full press-then-release cycle and is consumed when read.
 
 use std::sync::{Arc, Mutex};

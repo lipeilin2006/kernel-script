@@ -1,7 +1,7 @@
 //! Standalone Kernel Script inspector (the former memory-tool window).
 //!
 //! `ks-inspector` is a separate executable with its own decorated glfw
-//! window, `egui::Context` and `ThreeDBackend`; the overlay application
+//! window, `egui::Context` and D3D11 renderer; the overlay application
 //! (`ks-gui`) no longer embeds or renders it. Both apps talk to the same
 //! driver: the single-instance guard makes the second one reuse the live
 //! instance, and [`ks_ui_common::driver::finish_on_exit`] only stops it
@@ -24,10 +24,10 @@ use std::sync::mpsc::{channel, Receiver, Sender, TryRecvError};
 use std::sync::Arc;
 use std::time::Instant;
 
-use egui_overlay::egui_render_three_d::{ThreeDBackend, ThreeDConfig};
-use egui_overlay::egui_window_glfw_passthrough::glfw::{
-    self, Action, ClientApiHint, Context as _, GlfwReceiver, Key, Modifiers as GlfwModifiers,
-    MouseButton, PWindow, WindowEvent, WindowHint, WindowMode,
+use egui_render_d3d11::D3D11Backend;
+use egui_window_glfw_passthrough::glfw::{
+    self, Action, ClientApiHint, GlfwReceiver, Key, Modifiers as GlfwModifiers, MouseButton,
+    PWindow, WindowEvent, WindowHint, WindowMode,
 };
 
 use ks_ui_common::config_store::SharedConfigStore;
@@ -548,7 +548,7 @@ pub(crate) enum FrameOutcome {
 pub(crate) struct Inspector {
     window: PWindow,
     events: GlfwReceiver<(f64, WindowEvent)>,
-    backend: Option<ThreeDBackend>,
+    backend: Option<D3D11Backend>,
     ctx: egui::Context,
     fonts_installed: bool,
     opened: Instant,
@@ -564,12 +564,11 @@ pub(crate) struct Inspector {
 }
 
 impl Inspector {
-    /// Creates the window and its renderer. The new window's GL context is
-    /// left current, so the caller can query GL or set the swap interval
-    /// right after it returns; [`Inspector::frame`] makes it current
-    /// again before every GL call.
+    /// Creates the window and its D3D11 renderer. The window is a plain
+    /// NoApi GLFW surface: GLFW only pumps events and input, while the
+    /// renderer owns a normal HWND swap chain.
     pub(crate) fn new(glfw: &mut glfw::Glfw, config: SharedConfigStore) -> Result<Self, String> {
-        glfw.window_hint(WindowHint::ClientApi(ClientApiHint::OpenGl));
+        glfw.window_hint(WindowHint::ClientApi(ClientApiHint::NoApi));
         glfw.window_hint(WindowHint::TransparentFramebuffer(false));
         glfw.window_hint(WindowHint::ScaleToMonitor(true));
         glfw.window_hint(WindowHint::Visible(true));
@@ -596,30 +595,14 @@ impl Inspector {
                 area_y + (area_h - height).max(0) / 2,
             );
         }
-        // The renderer compiles its shaders for the current context, so the
-        // new window must own it while the backend is built.
-        window.make_current();
-
         let (fb_width, fb_height) = window.get_framebuffer_size();
         let framebuffer = [fb_width.max(1) as u32, fb_height.max(1) as u32];
-        let mut backend = ThreeDBackend::new(
-            ThreeDConfig::default(),
-            |symbol| window.get_proc_address(symbol),
-            framebuffer,
-        );
+        let mut backend = D3D11Backend::new(window.get_win32_window(), framebuffer);
         // The painter starts at a zero physical size and only learns it from
         // `resize_framebuffer`, which would otherwise never run because the
         // window has not changed size yet.
         backend.resize_framebuffer(framebuffer);
-        {
-            use egui_overlay::egui_render_three_d::glow::HasContext;
-            unsafe {
-                backend
-                    .glow_backend
-                    .glow_context
-                    .clear_color(0.09, 0.09, 0.11, 1.0);
-            }
-        }
+        backend.set_clear_color([0.09, 0.09, 0.11, 1.0]);
 
         let ctx = egui::Context::default();
         ctx.set_visuals(egui::Visuals::dark());
@@ -692,6 +675,7 @@ impl Inspector {
                         unit: egui::MouseWheelUnit::Point,
                         delta: egui::vec2(x as f32 * 48.0, y as f32 * 48.0),
                         modifiers: self.modifiers,
+                        phase: egui::TouchPhase::Move,
                     });
                 }
                 WindowEvent::Key(key, _, action, modifiers) => {
@@ -728,15 +712,13 @@ impl Inspector {
             return FrameOutcome::Closed;
         }
 
-        // Minimized windows have an empty framebuffer, and painting into a
-        // 1x1 surface (or swapping on an iconified window) is pointless.
-        // Leave every GL object alone until the window is restored.
+        // Minimized windows have an empty framebuffer, and resizing a swap
+        // chain to 0x0 (or presenting on an iconified window) is pointless.
+        // Leave the renderer alone until the window is restored.
         if self.window.is_iconified() {
             return FrameOutcome::Running;
         }
 
-        // Every GL call below must run on this window's context.
-        self.window.make_current();
         let scale = self.window.get_content_scale().0.max(1.0);
         let (fb_width, fb_height) = self.window.get_framebuffer_size();
         let framebuffer = [fb_width.max(1) as u32, fb_height.max(1) as u32];
@@ -759,7 +741,6 @@ impl Inspector {
                 egui::vec2(logical[0], logical[1]),
             )),
             time: Some(self.opened.elapsed().as_secs_f64()),
-            modifiers: self.modifiers,
             events: raw_events,
             focused: true,
             viewports: std::iter::once((
@@ -773,33 +754,24 @@ impl Inspector {
             ..Default::default()
         };
 
+        // The inspector layout is built from panels, which egui 0.36 shows
+        // inside the root `Ui` that `run_ui` provides (the old
+        // `Context::run`/`TopBottomPanel::show(ctx, ..)` split is gone).
         let ctx = self.ctx.clone();
         let commands = self.commands.clone();
         let state = &mut self.state;
-        let full_output = ctx.run(raw_input, |ctx| {
-            draw_ui(ctx, state, &commands, driver);
+        let full_output = ctx.run_ui(raw_input, |ui| {
+            draw_ui(ui, state, &commands, driver);
         });
         let primitives = ctx.tessellate(full_output.shapes, full_output.pixels_per_point);
         let framebuffer = self.framebuffer;
         if let Some(backend) = self.backend.as_mut() {
-            // three_d's context resets the GL viewport every frame, so
-            // re-assert the full window here (otherwise a resized window
-            // keeps drawing the UI in the old-size viewport).
-            {
-                use egui_overlay::egui_render_three_d::glow::HasContext;
-                unsafe {
-                    backend.glow_backend.glow_context.viewport(
-                        0,
-                        0,
-                        framebuffer[0] as i32,
-                        framebuffer[1] as i32,
-                    );
-                }
-            }
-            backend.prepare_frame(|| [framebuffer[0], framebuffer[1]]);
+            backend.prepare_frame(framebuffer);
+            // `logical` is the window size in egui points, so the renderer
+            // derives the same pixels-per-point the pass used.
             backend.render_egui(primitives, full_output.textures_delta, logical);
+            backend.present();
         }
-        self.window.swap_buffers();
         FrameOutcome::Running
     }
 
@@ -941,7 +913,10 @@ impl Inspector {
     }
 
     fn shutdown(&mut self) {
-        self.window.make_current();
+        // The D3D11 backend owns a swap chain on the window's HWND but no GL
+        // context, so it can be dropped in place. Doing it here (rather than
+        // in `Drop`'s field order) guarantees the renderer goes away before
+        // the GLFW window is destroyed.
         self.backend = None;
     }
 
@@ -964,9 +939,8 @@ impl Inspector {
 impl Drop for Inspector {
     fn drop(&mut self) {
         // Fields drop in declaration order, so without this the glfw window
-        // (and its GL context) would be destroyed before the renderer drops
-        // its GL objects. `shutdown` frees the backend while the context is
-        // still alive and current.
+        // would be destroyed before the renderer drops its swap chain.
+        // `shutdown` frees the backend while the window still exists.
         self.shutdown();
     }
 }
@@ -1072,17 +1046,18 @@ fn parse_address(text: &str) -> Result<u64, String> {
 }
 
 fn draw_ui(
-    ctx: &egui::Context,
+    ui: &mut egui::Ui,
     state: &mut ToolState,
     commands: &Sender<Command>,
     driver: &DriverControl,
 ) {
+    let ctx = ui.ctx().clone();
     // Full-width log bar: driver phase + lifecycle/startup log. Added before
     // the side panels so it spans the whole window.
-    egui::TopBottomPanel::bottom("ce_logs")
+    egui::Panel::bottom("ce_logs")
         .resizable(true)
-        .default_height(150.0)
-        .show(ctx, |ui| {
+        .default_size(150.0)
+        .show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.label(egui::RichText::new(s().log).strong());
                 ui.separator();
@@ -1100,10 +1075,10 @@ fn draw_ui(
                 });
         });
 
-    egui::SidePanel::left("ce_processes")
-        .default_width(200.0)
+    egui::Panel::left("ce_processes")
+        .default_size(200.0)
         .resizable(true)
-        .show(ctx, |ui| {
+        .show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.label(s().process);
                 ui.add(
@@ -1162,7 +1137,7 @@ fn draw_ui(
         state.tab = Tab::Modify;
     }
 
-    egui::CentralPanel::default().show(ctx, |ui| {
+    egui::CentralPanel::default().show(ui, |ui| {
         ui.horizontal(|ui| {
             ui.selectable_value(&mut state.tab, Tab::Hex, s().tab_hex);
             ui.selectable_value(&mut state.tab, Tab::Editor, s().tab_editor);
@@ -1235,11 +1210,11 @@ fn draw_hex(ui: &mut egui::Ui, state: &mut ToolState, commands: &Sender<Command>
 
     // Keep the column header visible while a process/base/page is loading.
     // This is the fixed ImHex-style layout: address, two byte groups, ASCII.
-    egui::Frame::none()
+    egui::Frame::new()
         .fill(ui.visuals().faint_bg_color)
         // Keep horizontal origin identical to the data rows below. Only
         // vertical padding separates the header from the page content.
-        .inner_margin(egui::Margin::symmetric(0.0, 4.0))
+        .inner_margin(egui::Margin::symmetric(0, 4))
         .show(ui, |ui| {
             draw_hex_header(ui);
         });
@@ -1432,7 +1407,8 @@ fn draw_editor(ui: &mut egui::Ui, state: &mut ToolState) {
     });
 }
 
-fn lua_layouter(ui: &egui::Ui, text: &str, wrap_width: f32) -> Arc<egui::Galley> {
+fn lua_layouter(ui: &egui::Ui, text: &dyn egui::TextBuffer, wrap_width: f32) -> Arc<egui::Galley> {
+    let text = text.as_str();
     let normal = ui.visuals().text_color();
     let comment = egui::Color32::from_rgb(110, 150, 110);
     let string = egui::Color32::from_rgb(220, 170, 100);
@@ -1519,7 +1495,7 @@ fn lua_layouter(ui: &egui::Ui, text: &str, wrap_width: f32) -> Arc<egui::Galley>
         pos = end;
     }
     job.wrap.max_width = wrap_width;
-    ui.fonts(|fonts| fonts.layout_job(job))
+    ui.fonts_mut(|fonts| fonts.layout_job(job))
 }
 
 /// Value editor tab: manual address list with read/write/freeze.

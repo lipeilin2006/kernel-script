@@ -26,7 +26,7 @@ pub fn install_chinese_font(ctx: &egui::Context) -> Result<(), Box<dyn Error>> {
     let mut fonts = egui::FontDefinitions::default();
     fonts.font_data.insert(
         "kernel-script-cjk".to_owned(),
-        egui::FontData::from_owned(bytes),
+        egui::FontData::from_owned(bytes).into(),
     );
     for family in [FontFamily::Proportional, FontFamily::Monospace] {
         fonts

@@ -31,7 +31,7 @@
 There is no user-mode service: both apps talk to the driver directly through
 a shared-memory ring. For standalone driver diagnostics run `ks-test.exe`
 (full-suite mode) from an elevated terminal. Both apps require an
-interactive desktop session because they use OpenGL.
+interactive desktop session because they present through a D3D11 swap chain.
 
 Kernel Script is a Windows-only Rust workspace for running Luau scripts over
 a shared-memory ring transport and a WDM driver. The intended data flow is:
@@ -59,7 +59,9 @@ ks-gui Lua (synchronous call)      ks-inspector worker (synchronous call)
   one round trip; the worker thread replays entries between requests
   (polls the request event while locks are held so requests win, blocks on
   it when the table is empty so an idle driver burns no CPU).
-- EgUI transparent overlay with cached draw commands.
+- EgUI 0.36 transparent overlay rendered through a D3D11 swap chain, with
+  draw commands regenerated every frame, a 100 Hz display loop and a
+  top-right FPS readout.
 - Standalone `ks-inspector` memory tool: process list, paged hex viewer
   anchored at the module base, Lua script editor, value editor and the
   driver's whole lock table, with a `中文 / EN` switch that persists in
@@ -155,7 +157,8 @@ function OnDestroy() end
 
 - `OnStart` runs once after loading.
 - `OnUpdate` is the only per-frame callback. The whole overlay (rendering plus
-  OnUpdate) is capped at 60 Hz; a slow callback simply lowers the frame rate.
+  OnUpdate) runs at a 100 Hz display cadence; a slow callback simply lowers the
+  frame rate. The achieved rate is shown in the top-right FPS readout.
   Its `delta_time` argument is the elapsed time since the previous frame in
   seconds, or `0` while the engine is paused.
   It performs calculations, optional synchronous memory operations, UI calls,
@@ -229,8 +232,8 @@ itself and protected by a DACL that grants SYSTEM and Administrators, so
 both `ks-gui` and `ks-inspector` (each embeds a `requireAdministrator`
 manifest) run elevated.
 
-Run them from an interactive desktop session because OpenGL requires a
-window station. Lua scripts are loaded from the `scripts` directory beside
+Run them from an interactive desktop session because D3D11 needs a window
+station. Lua scripts are loaded from the `scripts` directory beside
 the `ks-gui` executable. Files whose stem begins with `_` are kept available
 for manual testing but are not loaded by default.
 

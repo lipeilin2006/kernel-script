@@ -1,12 +1,9 @@
 //! The `memory` module: synchronous driver round trips (and the window
 //! geometry helper) exposed to Lua.
 
-use std::sync::atomic::Ordering;
-
 use mlua::Lua;
 
 use super::types::Address;
-use super::CONTENT_SCALE;
 
 pub fn register_memory_api(lua: &Lua) -> mlua::Result<()> {
     let module = lua.create_table()?;
@@ -548,14 +545,15 @@ pub fn register_memory_api(lua: &Lua) -> mlua::Result<()> {
             if rects.is_empty() {
                 return Ok(None);
             }
-            let scale = CONTENT_SCALE.load(Ordering::Relaxed) as f32 / 100.0;
+            // `window_util` already converted physical pixels to logical
+            // units with the target window's own monitor DPI.
             let list = lua.create_table()?;
             for (i, r) in rects.into_iter().enumerate() {
                 let t = lua.create_table()?;
-                t.set("x", r.x as f32 / scale)?;
-                t.set("y", r.y as f32 / scale)?;
-                t.set("width", r.width as f32 / scale)?;
-                t.set("height", r.height as f32 / scale)?;
+                t.set("x", r.x as f32)?;
+                t.set("y", r.y as f32)?;
+                t.set("width", r.width as f32)?;
+                t.set("height", r.height as f32)?;
                 list.set(i + 1, t)?;
             }
             Ok(Some(list))

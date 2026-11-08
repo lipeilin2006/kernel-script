@@ -53,12 +53,15 @@
   driver. It never patches foreign code; a `0` result means the platform
   refused the write (HVCI). Release builds embed the elevation manifest.
 - `ks-gui`: the overlay application: user-mode egui overlay and Lua
-   runtime, hosted by the `egui_overlay`
-   stack (GLFW click-through window via `egui_window_glfw_passthrough`,
-   `three_d` OpenGL backend via `egui_render_three_d`, direct `glow` calls
-   for viewport management). It owns the
-   Lua VM, the draw command
-   pipeline and the Lua script hot reload. The memory tool is no longer
+   runtime, hosted by the vendored `egui_overlay`
+   stack (GLFW NoApi click-through window via
+   `egui_window_glfw_passthrough`, D3D11 swap chain via the vendored
+   `egui_render_d3d11` backend, DWM blur-behind transparency). The whole
+   stack is vendored under `vendor/` and patched to egui 0.36.2. It owns
+   the Lua VM, the draw command pipeline, the Lua script hot reload, the
+   fixed `UI_SCALE = 0.8` origin/zoom-aware painter, the region-based
+   pointer passthrough and a 100 Hz display loop with a top-right FPS
+   readout. The memory tool is no longer
    embedded here: its only chrome is a small control window showing the
    driver phase, the `中文 / EN` toggle and the `退出程序` button (which
    only closes the overlay; the driver shutdown runs after the render loop
@@ -67,7 +70,7 @@
     grants SYSTEM and Administrators.
 - `ks-inspector`: the standalone Cheat Engine-style memory tool (formerly
   the second window inside `ks-gui`). It owns a decorated GLFW window, its
-  own `egui::Context`, its own `ThreeDBackend` and its own event loop:
+  own `egui::Context`, its own `D3D11Backend` and its own event loop:
   process list on the left, a full-width driver log bar at the bottom
   (phase plus lifecycle/startup log) and a tabbed centre (`内存查看` /
   `Lua 脚本` / `修改`, Ctrl+1/2/3). Every driver round trip runs on its one
@@ -179,8 +182,8 @@ Rules:
   without Lua, and `ks-inspector` is a separate process anyway.
 - The Cheat Engine-style memory tool is the standalone `ks-inspector`
   executable (it used to be a second window inside `ks-gui`). It owns a
-  decorated GLFW window, its own `egui::Context`, its own `ThreeDBackend`
-  and its own event loop; it shares no egui state and no GL context with
+  decorated GLFW window, its own `egui::Context`, its own `D3D11Backend`
+  and its own event loop; it shares no egui state and no renderer with
   the overlay. Layout:
   the process list on the left, a full-width log bar at the bottom (driver
   phase plus lifecycle/startup
@@ -206,10 +209,10 @@ Rules:
     through the driver lock table; clicking an address jumps the hex tab
     to its page.
 
-  Each inspector frame makes its own GL context current **before any GL
-  call** (`resize_framebuffer` issues `glViewport` and `three_d` resets
-  the viewport) and re-asserts its full-window viewport for the presenter.
-  An iconified window skips all GL work (its framebuffer is empty) and
+  Each inspector frame feeds egui through one `run_ui` pass (egui 0.36's
+  panels grow inside the root `Ui`), resizes the D3D11 swap chain from
+  `resize_framebuffer`, then renders and presents the same frame. An
+  iconified window skips all rendering (its framebuffer is empty) and
   returns immediately. Every driver operation the window offers (process
   list, module base, hex reads, value reads/writes/locks) runs on its one
   worker thread through the gated `sync_ipc` facade — never on the render
@@ -915,14 +918,19 @@ Before considering a change complete:
 - Process names and process metadata are collected in user mode by
   Toolhelp in `ks-link`; a PID is not a permanent process identity because
   Windows can reuse PIDs.
-- `ks-gui`'s OpenGL host is the native GLFW window from the `egui_overlay`
-  stack (`egui_window_glfw_passthrough` + `egui_render_three_d`); direct GL
-  calls (viewport, clear) go through `glow`. `ks-inspector` also renders
-  through `egui_render_three_d`/`glow`, but on its own decorated GLFW
-  window, `egui::Context` and event loop. `egui` is pinned at 0.29 by
-  `egui_overlay` 0.9.0, whose upstream has been dormant since early 2025 —
-  a newer egui would require forking/vendoring the whole overlay stack
-  (egui_overlay is 0.9's `egui ^0.29` lockstep family), not a version bump.
+- Both desktop apps render through D3D11 (`vendor/egui_render_d3d11`): a
+  plain HWND `CreateSwapChainForHwnd` chain plus
+  `DwmEnableBlurBehindWindow`/`ExtendFrameIntoClientArea` transparency for
+  the overlay. GLFW stays as a NoApi window/input layer only — there is no
+  GL context, `three_d` or `glow` in either binary. `ks-gui`'s host is the
+  vendored `egui_overlay` + `egui_window_glfw_passthrough`;
+  `ks-inspector` uses the same two render pieces on its own decorated GLFW
+  window and `egui::Context`. `egui` is upgraded to 0.36.2 by the vendored
+  stack under `vendor/` (the workspace has `[patch.crates-io]` entries for
+  `egui_overlay` and `egui_window_glfw_passthrough`, so the transitive
+  requirements resolve to the local copies instead of the crates.io
+  0.9.0/egui 0.29 family). Keep the three vendored crates in lockstep with
+  `ks-td2`'s copies; a crates.io egui bump alone is not enough.
 - Both apps load the first available `msyh.ttc`, `simsun.ttc`, or
   `simhei.ttf` from `C:\Windows\Fonts` (shared installer in
   `ks-ui-common/src/font.rs`) so Chinese Lua/UI text renders on Windows.

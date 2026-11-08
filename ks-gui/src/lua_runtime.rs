@@ -1,6 +1,6 @@
 ﻿use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -13,7 +13,7 @@ mod execution;
 mod keyboard;
 mod memory_api;
 mod types;
-mod ui_api;
+pub(crate) mod ui_api;
 
 use crate::config_store::SharedConfigStore;
 use config_api::register_config_api;
@@ -23,16 +23,15 @@ use types::RuntimeControl;
 pub use types::{DrawCommand, DrawCommands};
 use ui_api::create_ui_module;
 
-static CONTENT_SCALE: AtomicU32 = AtomicU32::new(100);
-
+/// Refresh the overlay content scale used by `memory.get_window_rect`'s
+/// fallback path (the target window's own monitor DPI is preferred).
 pub fn set_content_scale(scale: f32) {
-    CONTENT_SCALE.store((scale * 100.0) as u32, Ordering::Relaxed);
+    crate::window_util::set_content_scale(scale);
 }
 
-// The whole overlay (render + OnUpdate) is capped at 60 frames per second by
-// the repaint interval in app.rs. OnUpdate runs once per rendered frame, which
-// keeps immediate-mode egui windows stable; a slow callback simply lowers the
-// achieved frequency.
+// The overlay repaints at 100 Hz (see `app::FRAME_INTERVAL`). OnUpdate runs
+// once per rendered frame, which keeps immediate-mode egui windows stable; a
+// slow callback simply lowers the achieved frequency.
 const MAX_FRAME_DELTA: Duration = Duration::from_millis(250);
 const RELOAD_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const LUA_MEMORY_LIMIT: usize = 64 * 1024 * 1024;
@@ -40,9 +39,6 @@ const START_BUDGET: Duration = Duration::from_millis(100);
 const UPDATE_BUDGET: Duration = Duration::from_millis(20);
 const DESTROY_BUDGET: Duration = Duration::from_millis(50);
 const UPDATE_HEALTHY_FRAMES_TO_CLEAR_ERROR: u32 = 30;
-
-/// Overlay frame interval: the maximum GUI frame rate (60 Hz).
-pub const FRAME_INTERVAL: Duration = Duration::from_nanos(16_666_667);
 
 pub struct LuaRuntime {
     lua: Lua,
@@ -59,10 +55,16 @@ pub struct LuaRuntime {
     keyboard: keyboard::SharedKeyboardState,
 }
 
+/// Union of every egui window the Lua UI (and the host chrome) painted this
+/// frame, in egui points. The overlay host uses it to decide where the
+/// transparent window must accept the mouse instead of clicking through.
+pub type UiRectHandle = std::rc::Rc<std::cell::Cell<Option<egui::Rect>>>;
+
 pub struct LuaRuntimeManager {
     runtimes: Vec<LuaRuntime>,
     draw_commands: DrawCommands,
     config: SharedConfigStore,
+    ui_rect: UiRectHandle,
 }
 
 impl LuaRuntimeManager {
@@ -107,6 +109,7 @@ impl LuaRuntimeManager {
             runtimes,
             draw_commands,
             config,
+            ui_rect: std::rc::Rc::new(std::cell::Cell::new(None)),
         })
     }
 
@@ -116,13 +119,22 @@ impl LuaRuntimeManager {
         Arc::clone(&self.config)
     }
 
+    /// Shared window-union handle (egui points). Cleared by [`Self::frame`]
+    /// at the start of every frame and recorded by `ui.window` and the Lua
+    /// error window.
+    pub fn ui_rect_handle(&self) -> UiRectHandle {
+        self.ui_rect.clone()
+    }
+
     pub fn frame(&mut self, ctx: &egui::Context, now: Instant, ui_visible: bool) {
         // Every rendered frame runs OnUpdate (immediate-mode egui requires it)
         // and regenerates the draw command snapshot.
+        self.ui_rect.set(None);
         self.draw_commands.lock().unwrap().clear();
+        let ui_rect = self.ui_rect.clone();
         for runtime in &mut self.runtimes {
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                runtime.frame(ctx, now, ui_visible);
+                runtime.frame(ctx, now, ui_visible, &ui_rect);
             }));
             if result.is_err() {
                 runtime.set_error("Lua runtime panicked; script disabled until reload".to_owned());
@@ -174,12 +186,18 @@ impl LuaRuntime {
         })
     }
 
-    fn frame(&mut self, ctx: &egui::Context, now: Instant, ui_visible: bool) {
+    fn frame(
+        &mut self,
+        ctx: &egui::Context,
+        now: Instant,
+        ui_visible: bool,
+        ui_rect: &UiRectHandle,
+    ) {
         self.check_hot_reload(now);
         // Snapshot all keys once per frame so is_key_press reports a stable
         // down-edge for the duration of OnUpdate.
         self.keyboard.lock().unwrap().begin_frame();
-        self.run_updates(ctx, now, ui_visible);
+        self.run_updates(ctx, now, ui_visible, ui_rect);
         if let Err(error) = self.lua.gc_step() {
             self.last_error = Some(format!("Lua GC error: {error}"));
         }
@@ -221,7 +239,13 @@ impl LuaRuntime {
         Ok((lua, deadline))
     }
 
-    fn run_updates(&mut self, ctx: &egui::Context, now: Instant, ui_visible: bool) {
+    fn run_updates(
+        &mut self,
+        ctx: &egui::Context,
+        now: Instant,
+        ui_visible: bool,
+        ui_rect: &UiRectHandle,
+    ) {
         let elapsed = now.duration_since(self.last_tick);
         self.last_tick = now;
 
@@ -229,7 +253,7 @@ impl LuaRuntime {
         // interval; a slow callback simply stretches it and lowers the
         // achieved frequency. Budget overruns are advisory warnings only.
         let result = self.lua.scope(|scope| {
-            let module = create_ui_module(&self.lua, scope, ctx, ui_visible)?;
+            let module = create_ui_module(&self.lua, scope, ctx, ui_visible, ui_rect)?;
             self.lua.globals().set("ui", module)?;
             let dt = if self.control.paused.load(Ordering::Relaxed) {
                 0.0
@@ -270,12 +294,15 @@ impl LuaRuntime {
 
         if let Some(error) = self.last_error.clone() {
             let mut reload = false;
-            egui::Window::new("Lua error").show(ctx, |ui| {
+            let response = egui::Window::new("Lua error").show(ctx, |ui| {
                 ui.label(error);
                 if ui.button("Reload script").clicked() {
                     reload = true;
                 }
             });
+            if let Some(response) = response {
+                ui_api::record_ui_rect(ui_rect, response.response.rect);
+            }
             if reload {
                 self.reload();
             }
