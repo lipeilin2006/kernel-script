@@ -65,7 +65,9 @@ ks-gui Lua (synchronous call)      ks-inspector worker (synchronous call)
 - Standalone `ks-inspector` memory tool: process list, paged hex viewer
   anchored at the module base, Lua script editor, value editor and the
   driver's whole lock table, with a `中文 / EN` switch that persists in
-  `config.json`. It reuses the same driver as `ks-gui` (the single-instance
+  `config.json`. It is an ordinary decorated, opaque window (D3D11, no
+  transparency or click-through — those belong to the overlay only). It
+  reuses the same driver as `ks-gui` (the single-instance
   guard makes the second app adopt the live instance).
 - User-mode process enumeration and process-name-to-PID lookup in `ks-link`
   (Toolhelp), re-exported by `ks-sdk`.

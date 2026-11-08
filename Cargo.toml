@@ -25,8 +25,11 @@ ks-ui-common = { path = "ks-ui-common" }
 dt-loader = { path = "../driver-toolkit/dt-loader" }
 
 egui_overlay = { path = "vendor/egui_overlay", default-features = false, features = ["egui_default", "glfw_default"] }
-egui_window_glfw_passthrough = { path = "vendor/egui_window_glfw_passthrough" }
 egui_render_d3d11 = { path = "vendor/egui_render_d3d11" }
+# Plain GLFW window/input layer for `ks-inspector` (an ordinary opaque
+# window, no overlay passthrough). Same fork the vendored egui stack uses, so
+# the workspace still builds a single GLFW.
+glfw = { package = "glfw-passthrough", version = "0.55" }
 egui = { version = "0.36.2", default-features = false }
 windows-sys = "0.61.2"
 mlua = { version = "0.12.0", features = ["luau-jit", "vendored", "send"] }

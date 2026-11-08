@@ -1,7 +1,7 @@
 //! Standalone Kernel Script inspector (the former memory-tool window).
 //!
 //! `ks-inspector` is a separate executable with its own decorated glfw
-//! window, `egui::Context` and D3D11 renderer; the overlay application
+//! window, `egui::Context` and opaque D3D11 renderer; the overlay application
 //! (`ks-gui`) no longer embeds or renders it. Both apps talk to the same
 //! driver: the single-instance guard makes the second one reuse the live
 //! instance, and [`ks_ui_common::driver::finish_on_exit`] only stops it
@@ -25,7 +25,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use egui_render_d3d11::D3D11Backend;
-use egui_window_glfw_passthrough::glfw::{
+use glfw::{
     self, Action, ClientApiHint, GlfwReceiver, Key, Modifiers as GlfwModifiers, MouseButton,
     PWindow, WindowEvent, WindowHint, WindowMode,
 };
@@ -597,7 +597,7 @@ impl Inspector {
         }
         let (fb_width, fb_height) = window.get_framebuffer_size();
         let framebuffer = [fb_width.max(1) as u32, fb_height.max(1) as u32];
-        let mut backend = D3D11Backend::new(window.get_win32_window(), framebuffer);
+        let mut backend = D3D11Backend::new_opaque(window.get_win32_window(), framebuffer);
         // The painter starts at a zero physical size and only learns it from
         // `resize_framebuffer`, which would otherwise never run because the
         // window has not changed size yet.

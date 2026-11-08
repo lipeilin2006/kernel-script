@@ -11,8 +11,6 @@ mod inspector;
 
 use std::error::Error;
 
-use egui_window_glfw_passthrough::glfw;
-
 use ks_ui_common::config_store::ConfigStore;
 use ks_ui_common::driver::{self, DriverControl};
 

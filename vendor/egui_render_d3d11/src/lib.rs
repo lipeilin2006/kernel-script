@@ -1,4 +1,5 @@
-//! 本地 vendor：egui 的 D3D11 渲染后端（覆盖层专用）。
+//! 本地 vendor：egui 的 D3D11 渲染后端（`ks-gui` 透明覆盖层 / `ks-inspector`
+//! 普通不透明窗口共用同一套 egui 管线）。
 //!
 //! 背景（2026-10-11）：旧 GPU / 旧显卡驱动上 three_d（OpenGL 3.3）路径的
 //! 覆盖层黑屏。本后端把呈现链换成：
@@ -151,15 +152,31 @@ struct GpuTexture {
 }
 
 impl D3D11Backend {
-    /// `hwnd` = 覆盖层窗口句柄（GLFW NoApi 窗口）。失败直接 panic（与
-    /// glow/ThreeD 后端创建失败的语义一致，错误串进 boot 日志）。
+    /// `hwnd` = the window handle. This is the transparent-overlay
+    /// constructor used by `ks-gui`: it installs the DWM blur-behind region
+    /// that turns the swap chain's per-pixel alpha into desktop transparency.
+    /// Ordinary windows must use [`Self::new_opaque`] instead.
     pub fn new(hwnd: *mut c_void, framebuffer_size: [u32; 2]) -> Self {
         unsafe {
-            Self::new_inner(hwnd, framebuffer_size).expect("failed to create d3d11 overlay backend")
+            Self::new_inner(hwnd, framebuffer_size, true)
+                .expect("failed to create d3d11 overlay backend")
         }
     }
 
-    unsafe fn new_inner(hwnd: *mut c_void, framebuffer_size: [u32; 2]) -> WinResult<Self> {
+    /// Same egui pipeline for an ordinary opaque window (`ks-inspector`):
+    /// the swap chain is not composited per-pixel, so no DWM blur-behind
+    /// region is installed. The window keeps its normal opaque background.
+    pub fn new_opaque(hwnd: *mut c_void, framebuffer_size: [u32; 2]) -> Self {
+        unsafe {
+            Self::new_inner(hwnd, framebuffer_size, false).expect("failed to create d3d11 backend")
+        }
+    }
+
+    unsafe fn new_inner(
+        hwnd: *mut c_void,
+        framebuffer_size: [u32; 2],
+        overlay_transparent: bool,
+    ) -> WinResult<Self> {
         // ── 设备：FL11_0 → 10_1 → 10_0 回退（TD2 最低配置即 DX11 硬件）──
         let levels = [
             D3D_FEATURE_LEVEL_11_0,
@@ -199,8 +216,9 @@ impl D3D11Backend {
             }
         }
 
-        // ── 普通 HWND 交换链（DISCARD）+ DWM BlurBehind 空区域透明
-        // （imgui_dx11 配方，= ImGui_ImplWin32_EnableAlphaCompositing Win8+）──
+        // ── 普通 HWND 交换链（DISCARD）；透明覆盖层额外挂 DWM BlurBehind
+        // 空区域（imgui_dx11 配方，= ImGui_ImplWin32_EnableAlphaCompositing
+        // Win8+），普通窗口不挂，保持完全不透明。──
         // 不用 SwapChainForComposition/DComp：与 WS_EX_LAYERED 组合在部分
         // 机器上整窗黑屏（rev3 实机复现）。
         let factory: IDXGIFactory2 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0))?;
@@ -223,17 +241,20 @@ impl D3D11Backend {
             Flags: 0,
         };
         let swapchain = factory.CreateSwapChainForHwnd(&device, HWND(hwnd), &desc, None, None)?;
-        // 逐像素透明：空区域 BlurBehind（参考 imgui_dx11 Win8+ 分支同款，
-        // 与参考一致：不额外做 ExtendFrame）。
-        let region: HRGN = CreateRectRgn(0, 0, -1, -1);
-        let bb = DWM_BLURBEHIND {
-            dwFlags: DWM_BB_ENABLE | DWM_BB_BLURREGION,
-            fEnable: TRUE,
-            hRgnBlur: region,
-            fTransitionOnMaximized: FALSE,
-        };
-        DwmEnableBlurBehindWindow(HWND(hwnd), &bb)?;
-        let _ = DeleteObject(region.into());
+        if overlay_transparent {
+            // Per-pixel transparency for the overlay: an empty-region
+            // BlurBehind (imgui_dx11 Win8+ recipe). An ordinary window skips
+            // this entirely and composites as an opaque surface.
+            let region: HRGN = CreateRectRgn(0, 0, -1, -1);
+            let bb = DWM_BLURBEHIND {
+                dwFlags: DWM_BB_ENABLE | DWM_BB_BLURREGION,
+                fEnable: TRUE,
+                hRgnBlur: region,
+                fTransitionOnMaximized: FALSE,
+            };
+            DwmEnableBlurBehindWindow(HWND(hwnd), &bb)?;
+            let _ = DeleteObject(region.into());
+        }
 
         let backend = Self {
             device: device.clone(),

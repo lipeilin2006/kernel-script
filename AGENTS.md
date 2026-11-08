@@ -70,7 +70,8 @@
     grants SYSTEM and Administrators.
 - `ks-inspector`: the standalone Cheat Engine-style memory tool (formerly
   the second window inside `ks-gui`). It owns a decorated GLFW window, its
-  own `egui::Context`, its own `D3D11Backend` and its own event loop:
+  own `egui::Context`, its own opaque `D3D11Backend` (no transparency) and
+  its own event loop:
   process list on the left, a full-width driver log bar at the bottom
   (phase plus lifecycle/startup log) and a tabbed centre (`内存查看` /
   `Lua 脚本` / `修改`, Ctrl+1/2/3). Every driver round trip runs on its one
@@ -182,9 +183,9 @@ Rules:
   without Lua, and `ks-inspector` is a separate process anyway.
 - The Cheat Engine-style memory tool is the standalone `ks-inspector`
   executable (it used to be a second window inside `ks-gui`). It owns a
-  decorated GLFW window, its own `egui::Context`, its own `D3D11Backend`
-  and its own event loop; it shares no egui state and no renderer with
-  the overlay. Layout:
+  decorated GLFW window, its own `egui::Context`, its own opaque
+  `D3D11Backend` (no transparency) and its own event loop; it shares no
+  egui state and no renderer with the overlay. Layout:
   the process list on the left, a full-width log bar at the bottom (driver
   phase plus lifecycle/startup
   log) and a tabbed centre (`内存查看` / `Lua 脚本` / `修改`, also
@@ -919,18 +920,24 @@ Before considering a change complete:
   Toolhelp in `ks-link`; a PID is not a permanent process identity because
   Windows can reuse PIDs.
 - Both desktop apps render through D3D11 (`vendor/egui_render_d3d11`): a
-  plain HWND `CreateSwapChainForHwnd` chain plus
-  `DwmEnableBlurBehindWindow`/`ExtendFrameIntoClientArea` transparency for
-  the overlay. GLFW stays as a NoApi window/input layer only — there is no
-  GL context, `three_d` or `glow` in either binary. `ks-gui`'s host is the
-  vendored `egui_overlay` + `egui_window_glfw_passthrough`;
-  `ks-inspector` uses the same two render pieces on its own decorated GLFW
-  window and `egui::Context`. `egui` is upgraded to 0.36.2 by the vendored
-  stack under `vendor/` (the workspace has `[patch.crates-io]` entries for
-  `egui_overlay` and `egui_window_glfw_passthrough`, so the transitive
-  requirements resolve to the local copies instead of the crates.io
-  0.9.0/egui 0.29 family). Keep the three vendored crates in lockstep with
-  `ks-td2`'s copies; a crates.io egui bump alone is not enough.
+  plain HWND `CreateSwapChainForHwnd` chain. Only `ks-gui`'s overlay is
+  transparent: it combines the vendored `egui_overlay` +
+  `egui_window_glfw_passthrough` NoApi window with
+  `DwmEnableBlurBehindWindow` (empty-region per-pixel alpha, installed by
+  the backend's transparent constructor) and
+  `ExtendFrameIntoClientArea` (installed by the host).
+  `ks-inspector` is an ordinary decorated GLFW window that uses the
+  backend's `new_opaque` path — no blur-behind, no passthrough — so it
+  composites as a normal opaque application; it depends on the plain
+  `glfw-passthrough` binding rather than the egui window backend. GLFW
+  stays as a NoApi window/input layer only — there is no GL context,
+  `three_d` or `glow` in either binary. `egui` is upgraded to 0.36.2 by
+  the vendored stack under `vendor/` (the workspace has
+  `[patch.crates-io]` entries for `egui_overlay` and
+  `egui_window_glfw_passthrough`, so the transitive requirements resolve
+  to the local copies instead of the crates.io 0.9.0/egui 0.29 family).
+  Keep the three vendored crates in lockstep with `ks-td2`'s copies; a
+  crates.io egui bump alone is not enough.
 - Both apps load the first available `msyh.ttc`, `simsun.ttc`, or
   `simhei.ttf` from `C:\Windows\Fonts` (shared installer in
   `ks-ui-common/src/font.rs`) so Chinese Lua/UI text renders on Windows.
