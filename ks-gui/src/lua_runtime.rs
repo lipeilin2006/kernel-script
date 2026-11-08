@@ -119,17 +119,18 @@ impl LuaRuntimeManager {
         Arc::clone(&self.config)
     }
 
-    /// Shared window-union handle (egui points). Cleared by [`Self::frame`]
-    /// at the start of every frame and recorded by `ui.window` and the Lua
-    /// error window.
+    /// Shared window-union handle (egui points). The display loop clears it
+    /// at the start of every frame; `ui.window`, the host control window and
+    /// the Lua error window union their rects into it.
     pub fn ui_rect_handle(&self) -> UiRectHandle {
         self.ui_rect.clone()
     }
 
     pub fn frame(&mut self, ctx: &egui::Context, now: Instant, ui_visible: bool) {
         // Every rendered frame runs OnUpdate (immediate-mode egui requires it)
-        // and regenerates the draw command snapshot.
-        self.ui_rect.set(None);
+        // and regenerates the draw command snapshot. The interactive-region
+        // union is owned by the display loop: it must survive the host
+        // control window drawn before this frame's Lua UI.
         self.draw_commands.lock().unwrap().clear();
         let ui_rect = self.ui_rect.clone();
         for runtime in &mut self.runtimes {

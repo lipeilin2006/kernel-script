@@ -329,6 +329,12 @@ impl DisplayLoop {
             let (origin_x, origin_y) = overlay.window.get_pos();
             let origin = (origin_x as f32, origin_y as f32);
 
+            // The interactive-region union belongs to the whole frame: the
+            // host control window records into it before the Lua UIs add
+            // theirs, so it must be reset here (not inside the Lua frame,
+            // which would drop the control window and leave it
+            // click-through).
+            ui_rect_handle.set(None);
             render_pass(&ctx, gfx, overlay, |ui| {
                 let ctx = ui.ctx();
                 if ui_visible {
